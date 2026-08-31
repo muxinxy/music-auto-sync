@@ -1,0 +1,11 @@
+{
+  "identifier": "com.muxinxy.music-auto-sync",
+  "description": "Permissions for Music Auto Sync",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:allow-open",
+    "notification:default",
+    "fs:default"
+  ]
+}

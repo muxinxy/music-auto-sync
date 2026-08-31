@@ -1,0 +1,7 @@
+[tools]
+node = "24.19.0"
+rust = "stable"
+
+[env]
+RUSTUP_TOOLCHAIN = "stable-x86_64-pc-windows-msvc"
+CARGO_BUILD_TARGET = "x86_64-pc-windows-msvc"
