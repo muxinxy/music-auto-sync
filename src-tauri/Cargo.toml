@@ -2,6 +2,7 @@
 name = "music-auto-sync"
 version = "0.1.0"
 description = "Portable NetEase Cloud Music playlist synchronizer"
+license = "MIT"
 authors = ["muxinxy"]
 edition = "2021"
 
