@@ -18,7 +18,9 @@ export const api = {
 
   getLoginQr: () => invoke<{ key: string; qrImg: string }>("get_login_qr"),
   checkLoginQr: (key: string) => invoke<QrCheckResult>("check_login_qr", { key }),
-  getLoginStatus: () => invoke<LoginStatus>("get_login_status"),
+  getLoginStatus: (verifyAttempt?: number, retryLimit?: number) =>
+    invoke<LoginStatus>("get_login_status", { verifyAttempt, retryLimit }),
+  openLoginLogDirectory: () => invoke<void>("open_login_log_directory"),
   logout: () => invoke<void>("logout"),
 
   listPlaylists: () => invoke<PlaylistInfo[]>("list_playlists"),

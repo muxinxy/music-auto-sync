@@ -25,7 +25,10 @@ pub struct DataPaths {
 impl DataPaths {
     pub fn discover() -> Result<Self> {
         let exe = env::current_exe().context("cannot resolve executable path")?;
-        let exe_dir = exe.parent().context("executable has no parent directory")?.to_path_buf();
+        let exe_dir = exe
+            .parent()
+            .context("executable has no parent directory")?
+            .to_path_buf();
 
         if let Some(path) = Self::arg_data_dir() {
             return Self::from_root(path, false, exe_dir);
@@ -53,7 +56,8 @@ impl DataPaths {
     }
 
     pub fn from_root(root: PathBuf, portable: bool, exe_dir: PathBuf) -> Result<Self> {
-        fs::create_dir_all(&root).with_context(|| format!("cannot create data directory: {}", root.display()))?;
+        fs::create_dir_all(&root)
+            .with_context(|| format!("cannot create data directory: {}", root.display()))?;
         let cache_dir = root.join("cache");
         let logs_dir = root.join("logs");
         fs::create_dir_all(&cache_dir)?;
@@ -70,8 +74,11 @@ impl DataPaths {
     }
 
     pub fn write_portable_marker(&self, root: &Path) -> Result<()> {
-        fs::write(self.exe_dir.join(PORTABLE_MARKER), root.to_string_lossy().as_bytes())
-            .context("cannot write portable.ini")
+        fs::write(
+            self.exe_dir.join(PORTABLE_MARKER),
+            root.to_string_lossy().as_bytes(),
+        )
+        .context("cannot write portable.ini")
     }
 
     fn arg_data_dir() -> Option<PathBuf> {
@@ -96,7 +103,8 @@ mod tests {
     #[test]
     fn creates_data_layout() {
         let temp = tempfile::tempdir().unwrap();
-        let p = DataPaths::from_root(temp.path().join("state"), true, temp.path().to_path_buf()).unwrap();
+        let p = DataPaths::from_root(temp.path().join("state"), true, temp.path().to_path_buf())
+            .unwrap();
         assert!(p.config_file.parent().unwrap().is_dir());
         assert!(p.cache_dir.is_dir());
         assert!(p.logs_dir.is_dir());

@@ -33,9 +33,9 @@ export default function App() {
   const [sync, setSync] = useState<SyncEventState>({ running: false });
   const [appReady, setAppReady] = useState(false);
 
-  const refreshLogin = useCallback(async () => {
+  const refreshLogin = useCallback(async (verifyAttempt?: number, retryLimit?: number) => {
     try {
-      const s = await api.getLoginStatus();
+      const s = await api.getLoginStatus(verifyAttempt, retryLimit);
       setLogin(s);
       return s;
     } catch {

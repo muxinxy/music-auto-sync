@@ -7,16 +7,38 @@ pub fn sanitize_component(input: &str) -> String {
     let invalid = Regex::new(r#"[<>:"/\\|?*\x00-\x1F]"#).unwrap();
     let space = Regex::new(r"\s+").unwrap();
     let mut result = invalid.replace_all(input, "_").to_string();
-    result = space.replace_all(&result, " ").trim().trim_end_matches('.').to_owned();
-    if result.is_empty() { "未命名".into() } else { result }
+    result = space
+        .replace_all(&result, " ")
+        .trim()
+        .trim_end_matches('.')
+        .to_owned();
+    if result.is_empty() {
+        "未命名".into()
+    } else {
+        result
+    }
 }
 
 pub fn artists(track: &Track) -> String {
-    let names = track.ar.iter().map(|a| a.name.as_str()).collect::<Vec<_>>().join(" / ");
-    if names.is_empty() { "未知歌手".into() } else { names }
+    let names = track
+        .ar
+        .iter()
+        .map(|a| a.name.as_str())
+        .collect::<Vec<_>>()
+        .join(" / ");
+    if names.is_empty() {
+        "未知歌手".into()
+    } else {
+        names
+    }
 }
 
-pub fn apply_template(template: &str, playlist_name: &str, track: &Track, position: usize) -> String {
+pub fn apply_template(
+    template: &str,
+    playlist_name: &str,
+    track: &Track,
+    position: usize,
+) -> String {
     let replacements = [
         ("{歌单名}", playlist_name.to_owned()),
         ("{音轨号}", format!("{:02}", position)),
@@ -25,11 +47,23 @@ pub fn apply_template(template: &str, playlist_name: &str, track: &Track, positi
         ("{专辑}", track.al.name.clone()),
         ("{网易云ID}", track.id.to_string()),
     ];
-    let output = replacements.into_iter().fold(template.to_owned(), |out, (key, val)| out.replace(key, &sanitize_component(&val)));
+    let output = replacements
+        .into_iter()
+        .fold(template.to_owned(), |out, (key, val)| {
+            out.replace(key, &sanitize_component(&val))
+        });
     sanitize_component(&output)
 }
 
-pub fn track_path(root: &Path, folder_template: &str, filename_template: &str, playlist_name: &str, track: &Track, position: usize, extension: &str) -> PathBuf {
+pub fn track_path(
+    root: &Path,
+    folder_template: &str,
+    filename_template: &str,
+    playlist_name: &str,
+    track: &Track,
+    position: usize,
+    extension: &str,
+) -> PathBuf {
     let folder = apply_template(folder_template, playlist_name, track, position);
     let name = apply_template(filename_template, playlist_name, track, position);
     root.join(folder).join(format!("{}.{}", name, extension))

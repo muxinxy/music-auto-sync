@@ -37,7 +37,9 @@ pub fn convert(input: &Path, output_dir: &Path) -> Result<NcmOutput> {
     let mut key_data = take(&bytes, &mut offset, key_len)?.to_vec();
     xor_all(&mut key_data, 0x64);
     let key_box = aes_decrypt(&key_data, CORE_KEY)?;
-    if key_box.len() <= 17 { return Err(anyhow!("invalid NCM key block")); }
+    if key_box.len() <= 17 {
+        return Err(anyhow!("invalid NCM key block"));
+    }
     let key = &key_box[17..];
     let key_stream = make_key_box(key);
 
@@ -45,11 +47,14 @@ pub fn convert(input: &Path, output_dir: &Path) -> Result<NcmOutput> {
     let mut meta_data = take(&bytes, &mut offset, meta_len)?.to_vec();
     xor_all(&mut meta_data, 0x63);
     let meta_text = String::from_utf8(aes_decrypt(&meta_data, META_KEY)?)?;
-    let encrypted_meta = meta_text.strip_prefix("163 key(Don't modify):").context("invalid NCM metadata")?;
+    let encrypted_meta = meta_text
+        .strip_prefix("163 key(Don't modify):")
+        .context("invalid NCM metadata")?;
     let mut meta_bytes = base64::engine::general_purpose::STANDARD.decode(encrypted_meta)?;
     xor_all(&mut meta_bytes, 0x63);
     let json_text = String::from_utf8(aes_decrypt(&meta_bytes, META_KEY)?)?;
-    let metadata: NcmMetadata = serde_json::from_str(json_text.strip_prefix("music:").unwrap_or(&json_text))?;
+    let metadata: NcmMetadata =
+        serde_json::from_str(json_text.strip_prefix("music:").unwrap_or(&json_text))?;
 
     let image_len = take_u32(&bytes, &mut offset)? as usize;
     let _image = take(&bytes, &mut offset, image_len)?;
@@ -63,7 +68,10 @@ pub fn convert(input: &Path, output_dir: &Path) -> Result<NcmOutput> {
     let file_name = format!("{}.{}", sanitize(&metadata.music_name), metadata.format);
     let target = unique_path(output_dir.join(file_name));
     fs::write(&target, decoded)?;
-    Ok(NcmOutput { path: target, metadata })
+    Ok(NcmOutput {
+        path: target,
+        metadata,
+    })
 }
 
 fn take<'a>(data: &'a [u8], offset: &mut usize, length: usize) -> Result<&'a [u8]> {
@@ -87,12 +95,16 @@ fn aes_decrypt(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>> {
 }
 
 fn xor_all(data: &mut [u8], value: u8) {
-    for byte in data { *byte ^= value; }
+    for byte in data {
+        *byte ^= value;
+    }
 }
 
 fn make_key_box(key: &[u8]) -> [u8; 256] {
     let mut box_ = [0u8; 256];
-    for (i, value) in box_.iter_mut().enumerate() { *value = i as u8; }
+    for (i, value) in box_.iter_mut().enumerate() {
+        *value = i as u8;
+    }
     let mut j = 0usize;
     for i in 0..256 {
         j = (box_[i] as usize + j + key[i % key.len()] as usize) & 0xff;
@@ -102,12 +114,22 @@ fn make_key_box(key: &[u8]) -> [u8; 256] {
 }
 
 fn sanitize(name: &str) -> String {
-    name.chars().map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect()
+    name.chars()
+        .map(|c| if "<>:\"/\\|?*".contains(c) { '_' } else { c })
+        .collect()
 }
 
 fn unique_path(mut path: PathBuf) -> PathBuf {
-    let stem = path.file_stem().and_then(|x| x.to_str()).unwrap_or("track").to_owned();
-    let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("mp3").to_owned();
+    let stem = path
+        .file_stem()
+        .and_then(|x| x.to_str())
+        .unwrap_or("track")
+        .to_owned();
+    let ext = path
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("mp3")
+        .to_owned();
     let mut counter = 2;
     while path.exists() {
         path.set_file_name(format!("{} ({counter}).{ext}", stem));

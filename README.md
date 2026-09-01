@@ -36,7 +36,7 @@ music-auto-sync_x64_portable/
 
 1. 运行 `Music Auto Sync.exe`。
 2. 在“设置”中选择音乐根目录；默认 API 地址为 `https://netease-api.muxinxy.com`。
-3. 在“账号登录”中扫码登录。
+3. 在“账号登录”中扫码登录。若公共 API 返回 HTTP 403，可在“设置”中更换兼容 API 地址，或填写 HTTP(S) 代理地址后刷新二维码。
 4. 在“歌单同步”中开启需要同步的歌单，点击“立即同步全部”或等待自动任务。
 5. 被歌单移除的文件会进入 `<音乐根目录>/.quarantine/`，可在“隔离区”恢复或删除。
 
@@ -47,7 +47,7 @@ music-auto-sync_x64_portable/
 3. exe 同级 `data/` 目录
 4. Windows AppData 目录
 
-应用数据包括 `config.json`、`library.db`、`cache/` 和 `logs/`。设置页中的“更改并迁移”会迁移现有数据并更新 `portable.ini`。
+应用数据包括 `config.json`、`library.db`、`cache/` 和 `logs/`。设置页中的“更改并迁移”会迁移现有数据并更新 `portable.ini`。二维码已授权但状态未确认时，可在“账号登录”页选择“打开登录日志目录”，查看 `logs/login-diagnostics.jsonl`。该日志只记录请求状态、状态码和 profile/account 是否存在，不包含 cookie、二维码或账号资料。
 
 ## 本地构建
 

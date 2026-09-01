@@ -8,7 +8,10 @@ pub fn start(app: AppHandle) {
     let state = app.state::<AppState>();
     let config = match store::config::load(&state.paths.get().config_file) {
         Ok(config) => config,
-        Err(error) => { tracing::error!(%error, "failed to load startup config"); return; }
+        Err(error) => {
+            tracing::error!(%error, "failed to load startup config");
+            return;
+        }
     };
 
     if config.auto_sync_on_startup && config.music_root.is_some() && config.cookie.is_some() {
@@ -30,7 +33,9 @@ pub fn start(app: AppHandle) {
             loop {
                 sleep(interval).await;
                 let state = app.state::<AppState>();
-                if state.sync_running.load(Ordering::SeqCst) { continue; }
+                if state.sync_running.load(Ordering::SeqCst) {
+                    continue;
+                }
                 if let Err(error) = sync::sync_enabled(&app, &state).await {
                     tracing::warn!(%error, "scheduled synchronization failed");
                 }

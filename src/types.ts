@@ -14,6 +14,7 @@ export interface PlaylistSyncSetting {
 
 export interface Config {
   apiBase: string;
+  httpProxy?: string | null;
   musicRoot?: string | null;
   folderTemplate: string;
   filenameTemplate: string;

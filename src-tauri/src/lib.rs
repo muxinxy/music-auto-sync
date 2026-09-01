@@ -16,7 +16,8 @@ pub struct AppState {
 }
 
 pub fn run() {
-    let paths = store::paths::DataPaths::discover().expect("failed to initialize application data directory");
+    let paths = store::paths::DataPaths::discover()
+        .expect("failed to initialize application data directory");
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
@@ -49,6 +50,7 @@ pub fn run() {
             commands::get_login_qr,
             commands::check_login_qr,
             commands::get_login_status,
+            commands::open_login_log_directory,
             commands::logout,
             commands::list_playlists,
             commands::set_playlist_enabled,

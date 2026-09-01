@@ -1,4 +1,8 @@
-use tauri::{menu::{Menu, MenuItem}, tray::TrayIconBuilder, AppHandle, Manager};
+use tauri::{
+    menu::{Menu, MenuItem},
+    tray::TrayIconBuilder,
+    AppHandle, Manager,
+};
 
 use crate::{core::sync, AppState};
 
@@ -8,7 +12,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &sync, &quit])?;
 
-    TrayIconBuilder::with_id("main-tray")
+    let mut tray = TrayIconBuilder::with_id("main-tray")
         .tooltip("音乐同步")
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
@@ -29,7 +33,11 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             }
             "quit" => app.exit(0),
             _ => {}
-        })
-        .build(app)?;
+        });
+
+    if let Some(icon) = app.default_window_icon() {
+        tray = tray.icon(icon.clone());
+    }
+    tray.build(app)?;
     Ok(())
 }

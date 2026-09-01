@@ -6,9 +6,12 @@ import type { LoginStatus } from "../types";
 
 interface Props {
   login: LoginStatus | null;
-  onLogin: () => Promise<LoginStatus | null>;
+  onLogin: (verifyAttempt?: number, retryLimit?: number) => Promise<LoginStatus | null>;
   onLogout: () => void;
 }
+
+const STATUS_RETRY_LIMIT = 5;
+const STATUS_RETRY_DELAY_MS = 1500;
 
 export default function LoginPage({ login, onLogin, onLogout }: Props) {
   const [qrImg, setQrImg] = useState<string | null>(null);
@@ -16,57 +19,88 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
   const [loading, setLoading] = useState(false);
   const keyRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const sessionRef = useRef(0);
 
-  const stopPolling = () => {
+  const stopPolling = useCallback(() => {
+    sessionRef.current += 1;
+    keyRef.current = null;
     if (timerRef.current) {
       clearTimeout(timerRef.current);
       timerRef.current = null;
     }
-  };
+  }, []);
+
+  const verifyLogin = useCallback(async (session: number) => {
+    for (let attempt = 0; attempt < STATUS_RETRY_LIMIT; attempt += 1) {
+      if (session !== sessionRef.current) return false;
+      const status = await onLogin(attempt + 1, STATUS_RETRY_LIMIT);
+      if (status?.loggedIn) return true;
+      if (attempt < STATUS_RETRY_LIMIT - 1) {
+        setQrState(`已授权，正在验证登录状态…（${attempt + 1}/${STATUS_RETRY_LIMIT}）`);
+        await new Promise<void>((resolve) => {
+          timerRef.current = setTimeout(resolve, STATUS_RETRY_DELAY_MS);
+        });
+      }
+    }
+    return false;
+  }, [onLogin]);
 
   const startQr = useCallback(async () => {
     stopPolling();
+    const session = sessionRef.current;
     setLoading(true);
+    setQrImg(null);
     setQrState("正在获取二维码…");
     try {
       const qr = await api.getLoginQr();
+      if (session !== sessionRef.current) return;
       setQrImg(qr.qrImg);
       keyRef.current = qr.key;
       setQrState("请用网易云音乐 App 扫码");
 
       const poll = async () => {
-        if (!keyRef.current) return;
+        if (session !== sessionRef.current || !keyRef.current) return;
         try {
-          const r = await api.checkLoginQr(keyRef.current);
-          setQrState(r.message);
-          if (r.state === "success") {
+          const result = await api.checkLoginQr(keyRef.current);
+          if (session !== sessionRef.current) return;
+          setQrState(result.message);
+          if (result.state === "success") {
             keyRef.current = null;
-            await onLogin();
-            setQrState("登录成功");
+            setQrState("已授权，正在验证登录状态…");
+            if (await verifyLogin(session)) {
+              setQrState("登录成功");
+              return;
+            }
+            setQrState("二维码已授权，但登录状态尚未确认。请稍候点击刷新二维码，或检查 API 地址和代理设置。");
             return;
           }
-          if (r.state === "expired") {
-            // 自动刷新二维码
-            setTimeout(startQr, 1500);
+          if (result.state === "expired") {
+            timerRef.current = setTimeout(startQr, 1500);
             return;
           }
-        } catch {
-          setQrState("网络异常，重试中…");
+        } catch (error) {
+          const detail = error instanceof Error ? error.message : String(error);
+          setQrState(`二维码状态检查失败：${detail}`);
         }
-        timerRef.current = setTimeout(poll, 2000);
+        if (session === sessionRef.current) {
+          timerRef.current = setTimeout(poll, 3000);
+        }
       };
       timerRef.current = setTimeout(poll, 2000);
-    } catch (e) {
-      setQrState(`获取二维码失败：${e}`);
+    } catch (error) {
+      if (session === sessionRef.current) {
+        const detail = error instanceof Error ? error.message : String(error);
+        setQrState(`获取二维码失败：${detail}`);
+      }
     } finally {
-      setLoading(false);
+      if (session === sessionRef.current) setLoading(false);
     }
-  }, [onLogin]);
+  }, [stopPolling, verifyLogin]);
 
   useEffect(() => {
     if (!login?.loggedIn) startQr();
     return stopPolling;
-  }, [login?.loggedIn, startQr]);
+  }, [login?.loggedIn, startQr, stopPolling]);
 
   if (login?.loggedIn) {
     return (
@@ -114,13 +148,16 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
           <Typography.Text type={qrState.includes("成功") ? "success" : "secondary"}>
             {qrState}
           </Typography.Text>
-          <Button size="small" type="text" onClick={startQr}>
+          <Button size="small" type="text" loading={loading} onClick={startQr}>
             刷新二维码
+          </Button>
+          <Button size="small" type="text" onClick={() => api.openLoginLogDirectory()}>
+            打开登录日志目录
           </Button>
           <Alert
             type="info"
             showIcon
-            message="登录仅用于获取你的歌单和下载地址，凭据保存在本地数据目录中。"
+            message="登录凭据仅保存在本地数据目录中。若验证超时，可在设置中检查 API 地址和 HTTP(S) 代理。"
           />
         </Space>
       </Card>

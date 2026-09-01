@@ -1,5 +1,6 @@
 pub mod config;
 pub mod database;
+pub mod login_diagnostics;
 pub mod paths;
 
 use std::sync::{Arc, RwLock};
@@ -11,7 +12,9 @@ pub struct AppPaths {
 
 impl AppPaths {
     pub fn new(paths: paths::DataPaths) -> Self {
-        Self { inner: Arc::new(RwLock::new(paths)) }
+        Self {
+            inner: Arc::new(RwLock::new(paths)),
+        }
     }
 
     pub fn get(&self) -> paths::DataPaths {

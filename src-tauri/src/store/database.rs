@@ -77,7 +77,7 @@ pub fn open(path: &Path) -> Result<Connection> {
             skipped INTEGER NOT NULL DEFAULT 0,
             errors TEXT NOT NULL DEFAULT '[]'
         );
-        "
+        ",
     )?;
     Ok(conn)
 }

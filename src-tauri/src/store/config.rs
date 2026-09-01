@@ -9,6 +9,8 @@ pub const DEFAULT_API_BASE: &str = "https://netease-api.muxinxy.com";
 #[serde(rename_all = "camelCase")]
 pub struct Config {
     pub api_base: String,
+    #[serde(default)]
+    pub http_proxy: Option<String>,
     pub music_root: Option<String>,
     pub folder_template: String,
     pub filename_template: String,
@@ -39,7 +41,7 @@ pub struct PlaylistSyncSetting {
     pub quality_override: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CookieUser {
     pub user_id: u64,
@@ -50,6 +52,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             api_base: DEFAULT_API_BASE.into(),
+            http_proxy: None,
             music_root: None,
             folder_template: "{歌单名}".into(),
             filename_template: "{音轨号}. {歌手} - {标题}".into(),
@@ -74,7 +77,8 @@ pub fn load(path: &Path) -> Result<Config> {
     if !path.exists() {
         return Ok(Config::default());
     }
-    let data = fs::read_to_string(path).with_context(|| format!("cannot read config {}", path.display()))?;
+    let data = fs::read_to_string(path)
+        .with_context(|| format!("cannot read config {}", path.display()))?;
     serde_json::from_str(&data).context("config.json is malformed")
 }
 

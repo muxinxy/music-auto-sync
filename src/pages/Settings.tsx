@@ -22,6 +22,7 @@ import type { AppInfo, Config } from "../types";
 
 const defaultConfig: Config = {
   apiBase: "https://netease-api.muxinxy.com",
+  httpProxy: null,
   musicRoot: null,
   folderTemplate: "{歌单名}",
   filenameTemplate: "{音轨号}. {歌手} - {标题}",
@@ -68,8 +69,16 @@ export default function SettingsPage() {
   };
 
   const chooseMusicRoot = async () => {
-    const path = await dirPicker("选择音乐根目录");
-    if (path) form.setFieldValue("musicRoot", path);
+    try {
+      const path = await dirPicker("选择音乐根目录");
+      if (path) {
+        form.setFieldValue("musicRoot", path);
+      } else {
+        antMessage.info("已取消选择目录");
+      }
+    } catch (e) {
+      antMessage.error(`选择音乐根目录失败：${e}`);
+    }
   };
 
   const chooseDataDir = async () => {
@@ -105,10 +114,16 @@ export default function SettingsPage() {
 
         <Card title="存储与命名" style={{ marginBottom: 16 }}>
           <Form.Item label="音乐根目录" name="musicRoot" extra="所有下载、歌单文件夹和 .quarantine 隔离目录都在此处。">
-            <Space.Compact style={{ width: "100%" }}>
-              <Input placeholder="请选择音乐根目录" readOnly />
-              <Button icon={<FolderOpenOutlined />} onClick={chooseMusicRoot}>选择</Button>
-            </Space.Compact>
+            <Input
+              readOnly
+              placeholder="请选择音乐根目录"
+              onClick={chooseMusicRoot}
+              addonAfter={
+                <Button icon={<FolderOpenOutlined />} onClick={chooseMusicRoot}>
+                  选择
+                </Button>
+              }
+            />
           </Form.Item>
           <Form.Item label="歌单文件夹模板" name="folderTemplate" extra="可用变量：{歌单名}、{歌手}、{专辑}">
             <Input />
@@ -156,8 +171,11 @@ export default function SettingsPage() {
             <InputNumber min={15} max={10080} style={{ width: 160 }} />
           </Form.Item>
           <Divider />
-          <Form.Item label="网易云 API 地址" name="apiBase" extra="使用兼容 NeteaseCloudMusicApi Enhanced 的服务器。">
+          <Form.Item label="网易云 API 地址" name="apiBase" extra="使用兼容 NeteaseCloudMusicApi Enhanced 的服务器。公共实例可能因网络或访问策略返回 403。">
             <Input />
+          </Form.Item>
+          <Form.Item label="HTTP(S) 代理地址" name="httpProxy" extra="仅用于访问已配置 API 服务；留空为直连。例如 http://127.0.0.1:7897。">
+            <Input placeholder="http://127.0.0.1:7897" />
           </Form.Item>
         </Card>
 
