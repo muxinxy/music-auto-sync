@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
-use std::{fs, path::Path, sync::atomic::Ordering};
+use std::{collections::HashMap, fs, path::Path, sync::atomic::Ordering};
 use tauri::{AppHandle, State};
 
 use crate::{
@@ -9,7 +9,10 @@ use crate::{
         ApiResponseMeta, LoginStatus, LoginStatusResponse, NeteaseApi, PlaylistInfo, QrCheckResult,
         QrSession,
     },
-    core::sync::{self, SyncReport},
+    core::{
+        naming,
+        sync::{self, SyncReport},
+    },
     store::{
         self,
         config::{Config, CookieUser, PlaylistSyncSetting},
@@ -299,11 +302,168 @@ pub async fn list_playlists(state: State<'_, AppState>) -> Result<Vec<PlaylistIn
         .as_ref()
         .context("请先登录")
         .map_err(command_error)?;
-    NeteaseApi::from_config(&config)
+    let mut playlists = NeteaseApi::from_config(&config)
         .map_err(command_error)?
         .user_playlists(user.user_id, &config)
         .await
+        .map_err(command_error)?;
+    fill_synced_counts(&state, &mut playlists);
+    fill_last_sync(&state, &mut playlists);
+    Ok(playlists)
+}
+
+fn fill_last_sync(state: &State<'_, AppState>, playlists: &mut [PlaylistInfo]) {
+    let Ok(conn) = database::open(&state.paths.get().database_file) else {
+        return;
+    };
+    let Ok(rows) = (|| -> Result<Vec<(u64, String, i64)>> {
+        let mut stmt = conn
+            .prepare("SELECT playlist_id, finished_at, failed FROM sync_runs ORDER BY id DESC")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })() else {
+        return;
+    };
+    let mut latest: HashMap<u64, (String, i64)> = HashMap::new();
+    for (playlist_id, finished_at, failed) in rows {
+        latest.entry(playlist_id).or_insert((finished_at, failed));
+    }
+    for playlist in playlists.iter_mut() {
+        if let Some((finished_at, failed)) = latest.get(&playlist.id) {
+            playlist.last_sync = Some(finished_at.clone());
+            playlist.last_result = if *failed == 0 {
+                Some("同步成功".into())
+            } else {
+                Some(format!("同步完成（{failed} 首失败）"))
+            };
+        }
+    }
+}
+
+fn fill_synced_counts(state: &State<'_, AppState>, playlists: &mut [PlaylistInfo]) {
+    let Ok(conn) = database::open(&state.paths.get().database_file) else {
+        return;
+    };
+    let Ok(rows) = (|| -> Result<Vec<(u64, String)>> {
+        let mut stmt = conn.prepare("SELECT playlist_id, local_path FROM track_files")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    })() else {
+        return;
+    };
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    for (playlist_id, local_path) in rows {
+        if Path::new(&local_path).is_file() {
+            *counts.entry(playlist_id).or_default() += 1;
+        }
+    }
+    for playlist in playlists.iter_mut() {
+        playlist.synced = counts.get(&playlist.id).copied().unwrap_or(0);
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistSong {
+    pub id: u64,
+    pub name: String,
+    pub artists: String,
+    pub album: String,
+    pub duration_ms: u64,
+    pub position: usize,
+    pub local_path: Option<String>,
+    pub synced: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaylistSongsResult {
+    pub playlist_id: u64,
+    pub playlist_name: String,
+    pub songs: Vec<PlaylistSong>,
+}
+
+#[tauri::command]
+pub async fn get_playlist_songs(
+    state: State<'_, AppState>,
+    id: u64,
+) -> Result<PlaylistSongsResult, String> {
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let playlist = NeteaseApi::from_config(&config)
+        .map_err(command_error)?
+        .playlist_tracks(id)
+        .await
+        .map_err(command_error)?;
+    let conn = database::open(&paths.database_file).map_err(command_error)?;
+    let mut songs = Vec::with_capacity(playlist.tracks.len());
+    for (index, track) in playlist.tracks.iter().enumerate() {
+        let local_path: Option<String> = conn
+            .query_row(
+                "SELECT local_path FROM track_files WHERE playlist_id=?1 AND track_id=?2",
+                rusqlite::params![playlist.id, track.id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(command_error)?;
+        songs.push(PlaylistSong {
+            id: track.id,
+            name: track.name.clone(),
+            artists: naming::artists(track),
+            album: track.al.name.clone(),
+            duration_ms: track.dt,
+            position: index + 1,
+            synced: local_path
+                .as_deref()
+                .is_some_and(|path| Path::new(path).is_file()),
+            local_path,
+        });
+    }
+    Ok(PlaylistSongsResult {
+        playlist_id: playlist.id,
+        playlist_name: playlist.name,
+        songs,
+    })
+}
+
+#[tauri::command]
+pub async fn download_song_with_options(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: u64,
+    track_id: u64,
+    options: sync::SingleDownloadOptions,
+) -> Result<String, String> {
+    sync::download_song_with_options(&app, &state, playlist_id, track_id, options)
+        .await
         .map_err(command_error)
+}
+
+#[tauri::command]
+pub fn set_playlist_overwrite(
+    state: State<'_, AppState>,
+    id: u64,
+    overwrite: bool,
+) -> Result<(), String> {
+    let paths = state.paths.get();
+    let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
+    if let Some(setting) = config.playlists.iter_mut().find(|p| p.id == id) {
+        setting.overwrite = overwrite;
+    } else {
+        config.playlists.push(PlaylistSyncSetting {
+            id,
+            name: format!("歌单 {id}"),
+            enabled: false,
+            folder_override: None,
+            quality_override: None,
+            overwrite,
+        });
+    }
+    store::config::save(&paths.config_file, &config).map_err(command_error)
 }
 
 #[tauri::command]
@@ -323,6 +483,7 @@ pub fn set_playlist_enabled(
             enabled,
             folder_override: None,
             quality_override: None,
+            overwrite: false,
         });
     }
     store::config::save(&paths.config_file, &config).map_err(command_error)

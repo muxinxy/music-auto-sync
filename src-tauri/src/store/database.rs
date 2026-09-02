@@ -86,6 +86,27 @@ pub fn now() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+pub fn record_sync_run(conn: &Connection, report: &crate::core::sync::SyncReport) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_runs(playlist_id,playlist_name,started_at,finished_at,added,updated,quarantined,ncm_converted,failed,skipped,errors)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+        params![
+            report.playlist_id as i64,
+            report.playlist_name,
+            report.started_at,
+            report.finished_at,
+            report.added as i64,
+            report.updated as i64,
+            report.quarantined as i64,
+            report.ncm_converted as i64,
+            report.failed as i64,
+            report.skipped as i64,
+            serde_json::to_string(&report.errors).unwrap_or_else(|_| "[]".into()),
+        ],
+    )?;
+    Ok(())
+}
+
 pub fn log(conn: &Connection, playlist_name: &str, status: &str, message: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO sync_logs(ts, playlist_name, status, message) VALUES (?1, ?2, ?3, ?4)",

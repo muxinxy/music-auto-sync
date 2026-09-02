@@ -5,6 +5,10 @@ use std::path::Path;
 
 pub const DEFAULT_API_BASE: &str = "https://netease-api.muxinxy.com";
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -20,6 +24,8 @@ pub struct Config {
     pub ncm_convert: bool,
     #[serde(default)]
     pub ncm_scan_dirs: Vec<String>,
+    #[serde(default = "default_true")]
+    pub ncm_keep_source: bool,
     pub embed_cover: bool,
     pub embed_lyrics: bool,
     pub write_lrc: bool,
@@ -39,6 +45,8 @@ pub struct PlaylistSyncSetting {
     pub enabled: bool,
     pub folder_override: Option<String>,
     pub quality_override: Option<String>,
+    #[serde(default)]
+    pub overwrite: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,12 +63,13 @@ impl Default for Config {
             http_proxy: None,
             music_root: None,
             folder_template: "{歌单名}".into(),
-            filename_template: "{音轨号}. {歌手} - {标题}".into(),
+            filename_template: "{歌手} - {标题}".into(),
             quality: "exhigh".into(),
             auto_sync_on_startup: true,
             sync_interval_minutes: Some(60),
             ncm_convert: true,
             ncm_scan_dirs: vec![],
+            ncm_keep_source: true,
             embed_cover: true,
             embed_lyrics: false,
             write_lrc: true,

@@ -10,6 +10,7 @@ export interface PlaylistSyncSetting {
   enabled: boolean;
   folderOverride?: string | null;
   qualityOverride?: string | null;
+  overwrite?: boolean;
 }
 
 export interface Config {
@@ -23,6 +24,7 @@ export interface Config {
   syncIntervalMinutes?: number | null;
   ncmConvert: boolean;
   ncmScanDirs?: string[];
+  ncmKeepSource: boolean;
   embedCover: boolean;
   embedLyrics: boolean;
   writeLrc: boolean;
@@ -60,8 +62,35 @@ export interface PlaylistInfo {
   trackCount: number;
   subscribed: boolean;
   enabled: boolean;
+  synced: number;
+  overwrite: boolean;
   lastSync?: string | null;
   lastResult?: string | null;
+}
+
+export interface PlaylistSong {
+  id: number;
+  name: string;
+  artists: string;
+  album: string;
+  durationMs: number;
+  position: number;
+  localPath?: string | null;
+  synced: boolean;
+}
+
+export interface PlaylistSongsResult {
+  playlistId: number;
+  playlistName: string;
+  songs: PlaylistSong[];
+}
+
+export interface SingleDownloadOptions {
+  targetDir?: string | null;
+  filenameTemplate?: string | null;
+  quality?: string | null;
+  writeLrc?: boolean | null;
+  overwrite: boolean;
 }
 
 export interface SyncProgress {

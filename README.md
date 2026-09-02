@@ -2,7 +2,7 @@
 
 面向 Windows 的便携网易云音乐歌单同步器，使用 Tauri 2、Rust 和 React 构建。
 
-它通过兼容 [NeteaseCloudMusicApi Enhanced](https://netease-api.muxinxy.com/) 的服务获取登录态、歌单和下载地址，将启用的歌单同步到本地音乐目录。
+它通过兼容 [NeteaseCloudMusicApi Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) 的服务获取登录态、歌单和下载地址，将启用的歌单同步到本地音乐目录。
 
 > 本工具仅用于同步你有权访问和保存的音乐内容。VIP、版权或区域限制导致 API 不返回下载地址时，应用会记录失败原因，不绕过服务端授权限制。
 
@@ -35,8 +35,8 @@ music-auto-sync_x64_portable/
 ## 使用
 
 1. 运行 `Music Auto Sync.exe`。
-2. 在“设置”中选择音乐根目录；默认 API 地址为 `https://netease-api.muxinxy.com`。
-3. 在“账号登录”中扫码登录。若公共 API 返回 HTTP 403，可在“设置”中更换兼容 API 地址，或填写 HTTP(S) 代理地址后刷新二维码。
+2. 在“设置”中选择音乐根目录；API 地址默认填写你的兼容服务，可替换为 [NeteaseCloudMusicApi Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) 的任意部署。
+3. 在“账号登录”中扫码登录。若 API 返回 HTTP 403，可在“设置”中更换 API 地址，或填写 HTTP(S) 代理地址后刷新二维码。
 4. 在“歌单同步”中开启需要同步的歌单，点击“立即同步全部”或等待自动任务。
 5. 被歌单移除的文件会进入 `<音乐根目录>/.quarantine/`，可在“隔离区”恢复或删除。
 

@@ -62,6 +62,8 @@ pub struct PlaylistInfo {
     pub track_count: u32,
     pub subscribed: bool,
     pub enabled: bool,
+    pub synced: u32,
+    pub overwrite: bool,
     pub last_sync: Option<String>,
     pub last_result: Option<String>,
 }
@@ -355,12 +357,27 @@ impl NeteaseApi {
             )
             .await
             .map_err(anyhow::Error::new)?;
-        ensure_success_code(&json).map_err(|_| {
-            anyhow::Error::new(ApiCallError {
+        let code = json.get("code").and_then(Value::as_i64).unwrap_or(200);
+        if code != 200 {
+            // 网易云会以 301 表示“需要登录/会话失效”，此时不当作错误，而是明确未登录，
+            // 让前端能正确切换登录态。
+            if code == 301 {
+                return Ok(LoginStatusResponse {
+                    status: LoginStatus {
+                        logged_in: false,
+                        nickname: None,
+                        user_id: None,
+                        avatar_url: None,
+                    },
+                    meta,
+                    account_present: false,
+                });
+            }
+            return Err(anyhow::Error::new(ApiCallError {
                 class: "api_business",
-                meta: meta.clone(),
-            })
-        })?;
+                meta,
+            }));
+        }
         let profile = json.pointer("/data/profile");
         let account_present = json
             .pointer("/data/account")
@@ -426,6 +443,8 @@ impl NeteaseApi {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     enabled: setting.is_some_and(|setting| setting.enabled),
+                    synced: 0,
+                    overwrite: setting.is_some_and(|setting| setting.overwrite),
                     last_sync: None,
                     last_result: None,
                 })
@@ -463,6 +482,17 @@ impl NeteaseApi {
                 break;
             }
             offset += count;
+        }
+        if name.is_empty() {
+            // /playlist/track/all 不返回歌单名，需从 /playlist/detail 取，否则模板会渲染成“未命名”。
+            let (json, _) = self
+                .get("/playlist/detail", &[("id", id.to_string())])
+                .await?;
+            name = json
+                .pointer("/playlist/name")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned();
         }
         Ok(PlaylistTracks { id, name, tracks })
     }

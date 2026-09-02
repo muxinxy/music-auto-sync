@@ -176,7 +176,7 @@ Stop the process using the port or change `server.port` in `vite.config.ts`. Vit
 
 ### QR login or playlist loading fails
 
-Confirm the configured API base URL is reachable and compatible with NeteaseCloudMusicApi Enhanced. The default is `https://netease-api.muxinxy.com`. The QR requests include a timestamp to avoid cached status responses, and normal QR states `801` (waiting), `802` (scanned), `803` (success), and `800` (expired) are handled by the client.
+Confirm the configured API base URL is reachable and compatible with [NeteaseCloudMusicApi Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced). The QR requests include a timestamp to avoid cached status responses, and normal QR states `801` (waiting), `802` (scanned), `803` (success), and `800` (expired) are handled by the client.
 
 An HTTP 403 means the configured API service or its CDN/WAF rejected the request. It is not a valid login state. Use a trusted compatible API instance, or configure an HTTP(S) proxy in Settings for API connectivity, for example `http://127.0.0.1:7897`. The proxy setting only controls the connection to the configured API service; it does not bypass music membership, copyright, regional, or other authorization restrictions.
 

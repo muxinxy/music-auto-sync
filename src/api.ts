@@ -4,8 +4,10 @@ import type {
   Config,
   LoginStatus,
   PlaylistInfo,
+  PlaylistSongsResult,
   QuarantineItem,
   QrCheckResult,
+  SingleDownloadOptions,
   SyncReport,
 } from "./types";
 
@@ -24,8 +26,18 @@ export const api = {
   logout: () => invoke<void>("logout"),
 
   listPlaylists: () => invoke<PlaylistInfo[]>("list_playlists"),
+  getPlaylistSongs: (id: number) =>
+    invoke<PlaylistSongsResult>("get_playlist_songs", { id }),
+  downloadSongWithOptions: (
+    playlistId: number,
+    trackId: number,
+    options: SingleDownloadOptions
+  ) =>
+    invoke<string>("download_song_with_options", { playlistId, trackId, options }),
   setPlaylistEnabled: (id: number, enabled: boolean) =>
     invoke<void>("set_playlist_enabled", { id, enabled }),
+  setPlaylistOverwrite: (id: number, overwrite: boolean) =>
+    invoke<void>("set_playlist_overwrite", { id, overwrite }),
 
   syncPlaylist: (id: number) => invoke<SyncReport>("sync_playlist", { id }),
   syncAll: () => invoke<SyncReport[]>("sync_all"),

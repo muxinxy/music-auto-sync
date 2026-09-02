@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
   Button,
@@ -15,7 +15,7 @@ import {
   Typography,
   message as antMessage,
 } from "antd";
-import { FolderOpenOutlined, SaveOutlined } from "@ant-design/icons";
+import { FolderOpenOutlined } from "@ant-design/icons";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import type { AppInfo, Config } from "../types";
@@ -25,12 +25,13 @@ const defaultConfig: Config = {
   httpProxy: null,
   musicRoot: null,
   folderTemplate: "{歌单名}",
-  filenameTemplate: "{音轨号}. {歌手} - {标题}",
+  filenameTemplate: "{歌手} - {标题}",
   quality: "exhigh",
   autoSyncOnStartup: true,
   syncIntervalMinutes: 60,
   ncmConvert: true,
   ncmScanDirs: [],
+  ncmKeepSource: true,
   embedCover: true,
   embedLyrics: false,
   writeLrc: true,
@@ -48,34 +49,55 @@ export default function SettingsPage() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [saving, setSaving] = useState(false);
   const [moving, setMoving] = useState(false);
+  const readyRef = useRef(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // 完整配置引用：包含 cookie、cookieUser、playlists 等不在表单里的字段，
+  // 自动保存时与表单值合并，避免把登录凭据和歌单配置清空。
+  const fullConfigRef = useRef<Config>({ ...defaultConfig });
 
   const load = useCallback(async () => {
     try {
       const [cfg, appInfo] = await Promise.all([api.getConfig(), api.getAppInfo()]);
-      form.setFieldsValue({ ...defaultConfig, ...cfg });
+      const merged = { ...defaultConfig, ...cfg };
+      fullConfigRef.current = merged;
+      form.setFieldsValue(merged);
       setInfo(appInfo);
+      readyRef.current = true;
     } catch (e) { antMessage.error(`加载设置失败：${e}`); }
   }, [form]);
 
   useEffect(() => { load(); }, [load]);
 
-  const save = async () => {
+  useEffect(() => () => {
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+  }, []);
+
+  const save = async (values?: Partial<Config>) => {
     setSaving(true);
     try {
-      await api.saveConfig({ ...defaultConfig, ...form.getFieldsValue(true) });
-      antMessage.success("设置已保存");
+      const merged = { ...fullConfigRef.current, ...values };
+      fullConfigRef.current = merged;
+      await api.saveConfig(merged);
+      antMessage.success("设置已自动保存");
     } catch (e) { antMessage.error(`保存失败：${e}`); }
     finally { setSaving(false); }
+  };
+
+  const scheduleAutoSave = (_changed: unknown, all: Partial<Config>) => {
+    if (!readyRef.current || moving) return;
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => save(all), 500);
   };
 
   const chooseMusicRoot = async () => {
     try {
       const path = await dirPicker("选择音乐根目录");
-      if (path) {
-        form.setFieldValue("musicRoot", path);
-      } else {
+      if (!path) {
         antMessage.info("已取消选择目录");
+        return;
       }
+      form.setFieldValue("musicRoot", path);
+      if (readyRef.current && !moving) save(form.getFieldsValue(true));
     } catch (e) {
       antMessage.error(`选择音乐根目录失败：${e}`);
     }
@@ -95,13 +117,13 @@ export default function SettingsPage() {
 
   return (
     <div style={{ padding: 24, maxWidth: 920 }}>
-      <Form form={form} layout="vertical" initialValues={defaultConfig}>
+      <Form form={form} layout="vertical" initialValues={defaultConfig} onValuesChange={scheduleAutoSave}>
         <Card title="便携数据目录" style={{ marginBottom: 16 }}>
           <Alert
             type={info?.dataDirPortable ? "success" : "info"}
             showIcon
             message={info?.dataDirPortable ? "便携模式已启用" : "当前使用系统应用数据目录"}
-            description="配置、登录凭据、数据库、日志和下载缓存都保存在此目录。便携版可直接将应用文件夹整体复制到其它电脑。"
+            description="配置、登录凭据、数据库、日志和下载缓存都保存在此目录。便携版可直接将应用文件夹整体复制到其它电脑。所有设置修改会自动保存。"
             style={{ marginBottom: 16 }}
           />
           <Space.Compact style={{ width: "100%" }}>
@@ -118,8 +140,13 @@ export default function SettingsPage() {
               readOnly
               placeholder="请选择音乐根目录"
               onClick={chooseMusicRoot}
-              addonAfter={
-                <Button icon={<FolderOpenOutlined />} onClick={chooseMusicRoot}>
+              suffix={
+                <Button
+                  size="small"
+                  type="text"
+                  icon={<FolderOpenOutlined />}
+                  onClick={chooseMusicRoot}
+                >
                   选择
                 </Button>
               }
@@ -152,6 +179,9 @@ export default function SettingsPage() {
           <Form.Item name="ncmConvert" valuePropName="checked">
             <Checkbox>检测到 .ncm 文件时自动转换为 mp3 / flac</Checkbox>
           </Form.Item>
+          <Form.Item name="ncmKeepSource" valuePropName="checked">
+            <Checkbox>转换后保留原始 .ncm 文件（取消勾选则转换成功后删除源文件）</Checkbox>
+          </Form.Item>
           <Form.Item name="embedCover" valuePropName="checked">
             <Checkbox>写入专辑封面</Checkbox>
           </Form.Item>
@@ -178,10 +208,6 @@ export default function SettingsPage() {
             <Input placeholder="http://127.0.0.1:7897" />
           </Form.Item>
         </Card>
-
-        <Button type="primary" icon={<SaveOutlined />} loading={saving} onClick={save}>
-          保存设置
-        </Button>
       </Form>
     </div>
   );

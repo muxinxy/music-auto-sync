@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::Local;
 use reqwest::Client;
 use rusqlite::{params, OptionalExtension};
@@ -165,6 +165,7 @@ async fn sync_one_inner(app: &AppHandle, state: &AppState, playlist_id: u64) -> 
             report.added, report.quarantined, report.failed
         ),
     )?;
+    database::record_sync_run(&conn, &report)?;
     Ok(report)
 }
 
@@ -181,6 +182,12 @@ async fn sync_tracks(
     report: &mut SyncReport,
 ) -> Result<()> {
     let mut expected = HashSet::new();
+    let overwrite = config
+        .playlists
+        .iter()
+        .find(|setting| setting.id == playlist.id)
+        .map(|setting| setting.overwrite)
+        .unwrap_or(false);
     for (index, track) in playlist.tracks.iter().enumerate() {
         if state.cancel_requested.load(Ordering::SeqCst) {
             return Err(anyhow!("同步已取消"));
@@ -195,66 +202,255 @@ async fn sync_tracks(
             playlist.tracks.len(),
             &track.name,
         );
+        match sync_one_track(
+            api,
+            config,
+            playlist,
+            root,
+            folder_template,
+            quality,
+            conn,
+            track,
+            index + 1,
+            overwrite,
+        )
+        .await
+        {
+            TrackOutcome::Skipped => report.skipped += 1,
+            TrackOutcome::Downloaded => report.added += 1,
+            TrackOutcome::Failed(message) => {
+                report.failed += 1;
+                report.errors.push(message);
+            }
+        }
+    }
+    Ok(())
+}
+
+enum TrackOutcome {
+    Skipped,
+    Downloaded,
+    Failed(String),
+}
+
+fn record_track_file(
+    conn: &mut rusqlite::Connection,
+    playlist: &PlaylistTracks,
+    track: &Track,
+    target: &Path,
+    extension: &str,
+) -> Result<()> {
+    let timestamp = database::now();
+    conn.execute(
+        "INSERT INTO track_files(playlist_id,track_id,local_path,source_format,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)
+         ON CONFLICT(playlist_id,track_id) DO UPDATE SET local_path=excluded.local_path,source_format=excluded.source_format,updated_at=excluded.updated_at",
+        params![playlist.id, track.id, target.to_string_lossy(), extension, timestamp],
+    )?;
+    Ok(())
+}
+
+async fn finalize_track(
+    api: &NeteaseApi,
+    playlist: &PlaylistTracks,
+    track: &Track,
+    position: usize,
+    target: &Path,
+    extension: &str,
+    write_lrc: bool,
+    conn: &mut rusqlite::Connection,
+) {
+    if let Err(error) = tags::write_basic_tags(target, track, position, track.id) {
+        tracing::warn!(%error, path = %target.display(), "metadata write failed");
+    }
+    if write_lrc {
+        if let Ok(Some(lyrics)) = api.lyric(track.id).await {
+            let _ = fs::write(target.with_extension("lrc"), lyrics);
+        }
+    }
+    let _ = record_track_file(conn, playlist, track, target, extension);
+    let _ = write_sidecar(target, playlist.id, track.id);
+    let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
+}
+
+async fn sync_one_track(
+    api: &NeteaseApi,
+    config: &Config,
+    playlist: &PlaylistTracks,
+    root: &Path,
+    folder_template: &str,
+    quality: &str,
+    conn: &mut rusqlite::Connection,
+    track: &Track,
+    position: usize,
+    overwrite: bool,
+) -> TrackOutcome {
+    if !overwrite {
         let known_path: Option<String> = conn
             .query_row(
                 "SELECT local_path FROM track_files WHERE playlist_id=?1 AND track_id=?2",
                 params![playlist.id, track.id],
                 |row| row.get(0),
             )
-            .optional()?;
+            .optional()
+            .unwrap_or(None);
         if known_path
             .as_deref()
-            .is_some_and(|p| Path::new(p).is_file())
+            .is_some_and(|path| Path::new(path).is_file())
         {
-            report.skipped += 1;
-            update_snapshot(conn, playlist.id, track.id, index)?;
-            continue;
+            let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
+            return TrackOutcome::Skipped;
         }
-        let song_url = api.song_url(track.id, quality).await?;
-        let Some(download_url) = song_url.url else {
-            report.failed += 1;
-            report
-                .errors
-                .push(format!("{}：没有可用下载地址（VIP/版权限制）", track.name));
-            continue;
-        };
-        let extension = song_url.file_type.as_deref().unwrap_or("mp3");
-        let target = naming::track_path(
-            root,
+    }
+
+    let song_url = match api.song_url(track.id, quality).await {
+        Ok(song_url) => song_url,
+        Err(error) => return TrackOutcome::Failed(format!("{}：{error}", track.name)),
+    };
+    let Some(download_url) = song_url.url else {
+        return TrackOutcome::Failed(format!("{}：没有可用下载地址（VIP/版权限制）", track.name));
+    };
+    let extension = song_url.file_type.as_deref().unwrap_or("mp3");
+    let target = naming::track_path(
+        root,
+        folder_template,
+        &config.filename_template,
+        &playlist.name,
+        track,
+        position,
+        extension,
+    );
+
+    if !overwrite && target.is_file() {
+        // 本地已存在按当前模板命名的文件：登记为已同步并跳过下载，避免覆盖用户文件。
+        let _ = record_track_file(conn, playlist, track, &target, extension);
+        let _ = write_sidecar(&target, playlist.id, track.id);
+        let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
+        return TrackOutcome::Skipped;
+    }
+
+    match download_track(&download_url, &target).await {
+        Ok(()) => {
+            finalize_track(
+                api,
+                playlist,
+                track,
+                position,
+                &target,
+                extension,
+                config.write_lrc,
+                conn,
+            )
+            .await;
+            TrackOutcome::Downloaded
+        }
+        Err(error) => TrackOutcome::Failed(format!("{}：{error}", track.name)),
+    }
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SingleDownloadOptions {
+    pub target_dir: Option<String>,
+    pub filename_template: Option<String>,
+    pub quality: Option<String>,
+    pub write_lrc: Option<bool>,
+    pub overwrite: bool,
+}
+
+pub async fn download_song_with_options(
+    app: &AppHandle,
+    state: &AppState,
+    playlist_id: u64,
+    track_id: u64,
+    options: SingleDownloadOptions,
+) -> Result<String> {
+    if state.sync_running.load(Ordering::SeqCst) {
+        return Err(anyhow!("已有同步任务正在运行，请稍后再试"));
+    }
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file)?;
+    let root = PathBuf::from(
+        config
+            .music_root
+            .as_deref()
+            .context("请先在设置中选择音乐根目录")?,
+    );
+    let api = NeteaseApi::from_config(&config)?;
+    let playlist = api.playlist_tracks(playlist_id).await?;
+    let (index, track) = playlist
+        .tracks
+        .iter()
+        .enumerate()
+        .find(|(_, track)| track.id == track_id)
+        .context("歌单中不存在该歌曲")?;
+    let setting = config
+        .playlists
+        .iter()
+        .find(|playlist| playlist.id == playlist_id);
+    let quality = options
+        .quality
+        .as_deref()
+        .or_else(|| setting.and_then(|setting| setting.quality_override.as_deref()))
+        .unwrap_or(&config.quality);
+    let folder_template = setting
+        .and_then(|setting| setting.folder_override.as_deref())
+        .unwrap_or(&config.folder_template);
+    let filename_template = options
+        .filename_template
+        .as_deref()
+        .unwrap_or(&config.filename_template);
+    let write_lrc = options.write_lrc.unwrap_or(config.write_lrc);
+    let mut conn = database::open(&paths.database_file)?;
+
+    let _ = app.emit(
+        "sync://progress",
+        SyncProgress {
+            playlist_id: Some(playlist_id),
+            playlist_name: playlist.name.clone(),
+            phase: "下载".into(),
+            current: index + 1,
+            total: playlist.tracks.len(),
+            message: track.name.clone(),
+        },
+    );
+
+    let song_url = api.song_url(track.id, quality).await?;
+    let Some(download_url) = song_url.url else {
+        bail!("{}：没有可用下载地址（VIP/版权限制）", track.name);
+    };
+    let extension = song_url.file_type.as_deref().unwrap_or("mp3");
+    let file_name = naming::apply_template(filename_template, &playlist.name, track, index + 1);
+    let target = match options.target_dir.as_deref().filter(|dir| !dir.is_empty()) {
+        Some(dir) => PathBuf::from(dir).join(format!("{file_name}.{extension}")),
+        None => naming::track_path(
+            &root,
             folder_template,
-            &config.filename_template,
+            filename_template,
             &playlist.name,
             track,
             index + 1,
             extension,
-        );
-        match download_track(&download_url, &target).await {
-            Ok(()) => {
-                if let Err(error) = tags::write_basic_tags(&target, track, index + 1, track.id) {
-                    tracing::warn!(%error, path = %target.display(), "metadata write failed");
-                }
-                if config.write_lrc {
-                    if let Ok(Some(lyrics)) = api.lyric(track.id).await {
-                        fs::write(target.with_extension("lrc"), lyrics)?;
-                    }
-                }
-                let timestamp = database::now();
-                conn.execute(
-                    "INSERT INTO track_files(playlist_id,track_id,local_path,source_format,created_at,updated_at) VALUES(?1,?2,?3,?4,?5,?5)
-                     ON CONFLICT(playlist_id,track_id) DO UPDATE SET local_path=excluded.local_path,source_format=excluded.source_format,updated_at=excluded.updated_at",
-                    params![playlist.id, track.id, target.to_string_lossy(), extension, timestamp],
-                )?;
-                write_sidecar(&target, playlist.id, track.id)?;
-                update_snapshot(conn, playlist.id, track.id, index)?;
-                report.added += 1;
-            }
-            Err(error) => {
-                report.failed += 1;
-                report.errors.push(format!("{}：{}", track.name, error));
-            }
-        }
+        ),
+    };
+    if target.exists() && !options.overwrite {
+        return Err(anyhow!(
+            "文件已存在：{}，勾选“覆盖已存在”可重新下载",
+            target.display()
+        ));
     }
-    Ok(())
+    download_track(&download_url, &target).await?;
+    finalize_track(
+        &api,
+        &playlist,
+        track,
+        index + 1,
+        &target,
+        extension,
+        write_lrc,
+        &mut conn,
+    )
+    .await;
+    Ok(target.to_string_lossy().into_owned())
 }
 
 async fn download_track(url: &str, target: &Path) -> Result<()> {
@@ -451,6 +647,9 @@ async fn convert_ncm_files(
                     });
                     fs::write(converted_marker, serde_json::to_vec_pretty(&marker)?)?;
                     report.ncm_converted += 1;
+                    if !config.ncm_keep_source && path.is_file() {
+                        let _ = fs::remove_file(path);
+                    }
                 }
                 Err(error) => {
                     report
