@@ -165,6 +165,28 @@ impl std::fmt::Display for ApiCallError {
 
 impl std::error::Error for ApiCallError {}
 
+impl ApiCallError {
+    pub fn ui(&self) -> crate::error::UiMessage {
+        let mut params = Vec::new();
+        if let Some(status) = self.meta.http_status {
+            params.push(status.to_string());
+        }
+        if let Some(retry_after) = &self.meta.retry_after {
+            params.push(retry_after.clone());
+        }
+        if let Some(server) = &self.meta.server {
+            params.push(server.clone());
+        }
+        if let Some(request_id) = &self.meta.request_id {
+            params.push(request_id.clone());
+        }
+        crate::error::UiMessage {
+            code: self.class.into(),
+            params,
+        }
+    }
+}
+
 impl NeteaseApi {
     pub fn from_config(config: &Config) -> Result<Self> {
         let mut headers = HeaderMap::new();

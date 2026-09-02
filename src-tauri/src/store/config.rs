@@ -9,6 +9,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_artist_separator() -> String {
+    "、".into()
+}
+
+fn default_language() -> String {
+    "zh-CN".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -18,9 +26,15 @@ pub struct Config {
     pub music_root: Option<String>,
     pub folder_template: String,
     pub filename_template: String,
+    #[serde(default = "default_artist_separator")]
+    pub artist_separator: String,
+    #[serde(default = "default_language")]
+    pub language: String,
     pub quality: String,
     pub auto_sync_on_startup: bool,
     pub sync_interval_minutes: Option<u64>,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
     pub ncm_convert: bool,
     #[serde(default)]
     pub ncm_scan_dirs: Vec<String>,
@@ -64,9 +78,12 @@ impl Default for Config {
             music_root: None,
             folder_template: "{歌单名}".into(),
             filename_template: "{歌手} - {标题}".into(),
+            artist_separator: "、".into(),
+            language: "zh-CN".into(),
             quality: "exhigh".into(),
             auto_sync_on_startup: true,
             sync_interval_minutes: Some(60),
+            close_to_tray: true,
             ncm_convert: true,
             ncm_scan_dirs: vec![],
             ncm_keep_source: true,

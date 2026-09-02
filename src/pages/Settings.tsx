@@ -17,8 +17,12 @@ import {
 } from "antd";
 import { FolderOpenOutlined } from "@ant-design/icons";
 import { open } from "@tauri-apps/plugin-dialog";
+import i18n, { normalizeLanguage } from "../i18n";
 import { api } from "../api";
+import { formatError } from "../errors";
 import type { AppInfo, Config } from "../types";
+
+const QUALITY_VALUES = ["standard", "higher", "exhigh", "lossless", "hires"] as const;
 
 const defaultConfig: Config = {
   apiBase: "https://netease-api.muxinxy.com",
@@ -26,9 +30,12 @@ const defaultConfig: Config = {
   musicRoot: null,
   folderTemplate: "{歌单名}",
   filenameTemplate: "{歌手} - {标题}",
+  artistSeparator: "、",
+  language: "zh-CN",
   quality: "exhigh",
   autoSyncOnStartup: true,
   syncIntervalMinutes: 60,
+  closeToTray: true,
   ncmConvert: true,
   ncmScanDirs: [],
   ncmKeepSource: true,
@@ -45,14 +52,13 @@ function dirPicker(title: string) {
 }
 
 export default function SettingsPage() {
+  const { t } = i18n;
   const [form] = Form.useForm<Config>();
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [saving, setSaving] = useState(false);
   const [moving, setMoving] = useState(false);
   const readyRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  // 完整配置引用：包含 cookie、cookieUser、playlists 等不在表单里的字段，
-  // 自动保存时与表单值合并，避免把登录凭据和歌单配置清空。
   const fullConfigRef = useRef<Config>({ ...defaultConfig });
 
   const load = useCallback(async () => {
@@ -63,82 +69,122 @@ export default function SettingsPage() {
       form.setFieldsValue(merged);
       setInfo(appInfo);
       readyRef.current = true;
-    } catch (e) { antMessage.error(`加载设置失败：${e}`); }
-  }, [form]);
+    } catch (e) {
+      antMessage.error(t("settings.loadFailed", { detail: formatError(e) }));
+    }
+  }, [form, t]);
 
-  useEffect(() => { load(); }, [load]);
+  useEffect(() => {
+    load();
+  }, [load]);
 
-  useEffect(() => () => {
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-  }, []);
+  useEffect(
+    () => () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    },
+    []
+  );
 
-  const save = async (values?: Partial<Config>) => {
-    setSaving(true);
-    try {
-      const merged = { ...fullConfigRef.current, ...values };
-      fullConfigRef.current = merged;
-      await api.saveConfig(merged);
-      antMessage.success("设置已自动保存");
-    } catch (e) { antMessage.error(`保存失败：${e}`); }
-    finally { setSaving(false); }
-  };
+  const save = useCallback(
+    async (values?: Partial<Config>) => {
+      setSaving(true);
+      try {
+        const merged = { ...fullConfigRef.current, ...values };
+        fullConfigRef.current = merged;
+        await api.saveConfig(merged);
+        antMessage.success(t("settings.saved"));
+      } catch (e) {
+        antMessage.error(t("settings.saveFailed", { detail: formatError(e) }));
+      } finally {
+        setSaving(false);
+      }
+    },
+    [t]
+  );
 
-  const scheduleAutoSave = (_changed: unknown, all: Partial<Config>) => {
+  const scheduleAutoSave = useCallback(
+    (_changed: unknown, all: Partial<Config>) => {
+      if (!readyRef.current || moving) return;
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = setTimeout(() => save(all), 500);
+    },
+    [moving, save]
+  );
+
+  const applyLanguage = useCallback(
+    async (language: string) => {
+      const normalized = normalizeLanguage(language);
+      i18n.changeLanguage(normalized);
+      await api.setLanguage(normalized);
+    },
+    []
+  );
+
+  const onLanguageChange = async (language: string) => {
+    form.setFieldValue("language", language);
     if (!readyRef.current || moving) return;
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => save(all), 500);
+    await applyLanguage(language);
+    await save(form.getFieldsValue(true));
   };
 
   const chooseMusicRoot = async () => {
     try {
-      const path = await dirPicker("选择音乐根目录");
+      const path = await dirPicker(t("settings.pickRootTitle"));
       if (!path) {
-        antMessage.info("已取消选择目录");
+        antMessage.info(t("settings.canceledPick"));
         return;
       }
       form.setFieldValue("musicRoot", path);
       if (readyRef.current && !moving) save(form.getFieldsValue(true));
     } catch (e) {
-      antMessage.error(`选择音乐根目录失败：${e}`);
+      antMessage.error(t("settings.pickFailed", { detail: formatError(e) }));
     }
   };
 
   const chooseDataDir = async () => {
-    const path = await dirPicker("选择应用数据目录");
+    const path = await dirPicker(t("settings.pickDataTitle"));
     if (!path || path === info?.dataDir) return;
     setMoving(true);
     try {
       const next = await api.setDataDir(path, true);
       setInfo(next);
-      antMessage.success("数据已迁移到新目录");
-    } catch (e) { antMessage.error(`迁移失败：${e}`); }
-    finally { setMoving(false); }
+      antMessage.success(t("settings.moved"));
+    } catch (e) {
+      antMessage.error(t("settings.moveFailed", { detail: formatError(e) }));
+    } finally {
+      setMoving(false);
+    }
   };
 
   return (
     <div style={{ padding: 24, maxWidth: 920 }}>
-      <Form form={form} layout="vertical" initialValues={defaultConfig} onValuesChange={scheduleAutoSave}>
-        <Card title="便携数据目录" style={{ marginBottom: 16 }}>
+      <Form
+        form={form}
+        layout="vertical"
+        initialValues={defaultConfig}
+        onValuesChange={scheduleAutoSave}
+      >
+        <Card title={t("settings.cardData")} style={{ marginBottom: 16 }}>
           <Alert
             type={info?.dataDirPortable ? "success" : "info"}
             showIcon
-            message={info?.dataDirPortable ? "便携模式已启用" : "当前使用系统应用数据目录"}
-            description="配置、登录凭据、数据库、日志和下载缓存都保存在此目录。便携版可直接将应用文件夹整体复制到其它电脑。所有设置修改会自动保存。"
+            message={info?.dataDirPortable ? t("settings.dataPortable") : t("settings.dataApp")}
+            description={t("settings.dataDesc")}
             style={{ marginBottom: 16 }}
           />
           <Space.Compact style={{ width: "100%" }}>
-            <Input value={info?.dataDir ?? "正在读取…"} readOnly />
+            <Input value={info?.dataDir ?? t("settings.placeholderData")} readOnly />
             <Button loading={moving} icon={<FolderOpenOutlined />} onClick={chooseDataDir}>
-              更改并迁移
+              {t("settings.changeData")}
             </Button>
           </Space.Compact>
         </Card>
 
-        <Card title="存储与命名" style={{ marginBottom: 16 }}>
-          <Form.Item label="音乐根目录" name="musicRoot" extra="所有下载、歌单文件夹和 .quarantine 隔离目录都在此处。">
+        <Card title={t("settings.cardStorage")} style={{ marginBottom: 16 }}>
+          <Form.Item label={t("settings.labelRoot")} name="musicRoot" extra={t("settings.rootExtra")}>
             <Input
               readOnly
-              placeholder="请选择音乐根目录"
+              placeholder={t("settings.placeholderRoot")}
               onClick={chooseMusicRoot}
               suffix={
                 <Button
@@ -147,65 +193,93 @@ export default function SettingsPage() {
                   icon={<FolderOpenOutlined />}
                   onClick={chooseMusicRoot}
                 >
-                  选择
+                  {t("settings.choose")}
                 </Button>
               }
             />
           </Form.Item>
-          <Form.Item label="歌单文件夹模板" name="folderTemplate" extra="可用变量：{歌单名}、{歌手}、{专辑}">
+          <Form.Item
+            label={t("settings.labelFolderTemplate")}
+            name="folderTemplate"
+            extra={t("settings.folderTemplateExtra")}
+          >
             <Input />
           </Form.Item>
-          <Form.Item label="文件名模板" name="filenameTemplate" extra="可用变量：{音轨号}、{歌手}、{标题}、{专辑}、{网易云ID}">
+          <Form.Item
+            label={t("settings.labelFilenameTemplate")}
+            name="filenameTemplate"
+            extra={t("settings.filenameTemplateExtra")}
+          >
             <Input />
+          </Form.Item>
+          <Form.Item
+            label={t("settings.labelSeparator")}
+            name="artistSeparator"
+            tooltip={t("settings.filenameTemplateExtra")}
+          >
+            <Input style={{ width: 160 }} placeholder="、" />
           </Form.Item>
           <Form.Item name="writeM3u8" valuePropName="checked">
-            <Checkbox>为每个歌单生成 playlist.m3u8</Checkbox>
+            <Checkbox>{t("settings.cbM3u8")}</Checkbox>
           </Form.Item>
         </Card>
 
-        <Card title="下载与元数据" style={{ marginBottom: 16 }}>
-          <Form.Item label="默认音质" name="quality">
+        <Card title={t("settings.cardDownload")} style={{ marginBottom: 16 }}>
+          <Form.Item label={t("settings.labelQuality")} name="quality">
             <Radio.Group>
-              <Radio.Button value="standard">标准</Radio.Button>
-              <Radio.Button value="higher">较高</Radio.Button>
-              <Radio.Button value="exhigh">极高 320k</Radio.Button>
-              <Radio.Button value="lossless">无损 FLAC</Radio.Button>
-              <Radio.Button value="hires">Hi-Res</Radio.Button>
+              {QUALITY_VALUES.map((value) => (
+                <Radio.Button key={value} value={value}>
+                  {t(`playlists.qualityOptions.${value}`)}
+                </Radio.Button>
+              ))}
             </Radio.Group>
           </Form.Item>
-          <Form.Item label="最大下载并发数" name="concurrency">
+          <Form.Item label={t("settings.labelConcurrency")} name="concurrency">
             <InputNumber min={1} max={5} />
           </Form.Item>
           <Form.Item name="ncmConvert" valuePropName="checked">
-            <Checkbox>检测到 .ncm 文件时自动转换为 mp3 / flac</Checkbox>
+            <Checkbox>{t("settings.cbNcm")}</Checkbox>
           </Form.Item>
           <Form.Item name="ncmKeepSource" valuePropName="checked">
-            <Checkbox>转换后保留原始 .ncm 文件（取消勾选则转换成功后删除源文件）</Checkbox>
+            <Checkbox>{t("settings.cbNcmKeep")}</Checkbox>
           </Form.Item>
           <Form.Item name="embedCover" valuePropName="checked">
-            <Checkbox>写入专辑封面</Checkbox>
+            <Checkbox>{t("settings.cbCover")}</Checkbox>
           </Form.Item>
           <Form.Item name="embedLyrics" valuePropName="checked">
-            <Checkbox>嵌入歌词标签</Checkbox>
+            <Checkbox>{t("settings.cbLyrics")}</Checkbox>
           </Form.Item>
           <Form.Item name="writeLrc" valuePropName="checked">
-            <Checkbox>保存同名 .lrc 歌词文件</Checkbox>
+            <Checkbox>{t("settings.cbLrc")}</Checkbox>
           </Form.Item>
         </Card>
 
-        <Card title="自动同步与服务" style={{ marginBottom: 16 }}>
-          <Form.Item name="autoSyncOnStartup" valuePropName="checked" label="启动后自动同步">
-            <Switch checkedChildren="开启" unCheckedChildren="关闭" />
+        <Card title={t("settings.cardAuto")} style={{ marginBottom: 16 }}>
+          <Form.Item name="autoSyncOnStartup" valuePropName="checked" label={t("settings.labelAutoSync")}>
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
           </Form.Item>
-          <Form.Item label="定时轮询间隔（分钟，留空则关闭）" name="syncIntervalMinutes">
+          <Form.Item label={t("settings.labelInterval")} name="syncIntervalMinutes">
             <InputNumber min={15} max={10080} style={{ width: 160 }} />
           </Form.Item>
+          <Form.Item name="closeToTray" valuePropName="checked" label={t("settings.cbCloseToTray")}>
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
+          </Form.Item>
+          <Form.Item label={t("settings.labelLanguage")} name="language">
+            <Select
+              style={{ width: 200 }}
+              options={[
+                { value: "zh-CN", label: t("settings.langZh") },
+                { value: "en", label: t("settings.langEn") },
+              ]}
+              onChange={onLanguageChange}
+            />
+          </Form.Item>
           <Divider />
-          <Form.Item label="网易云 API 地址" name="apiBase" extra="使用兼容 NeteaseCloudMusicApi Enhanced 的服务器。公共实例可能因网络或访问策略返回 403。">
+          <Form.Item label={t("settings.labelApi")} name="apiBase" extra={t("settings.apiExtra")}>
             <Input />
           </Form.Item>
-          <Form.Item label="HTTP(S) 代理地址" name="httpProxy" extra="仅用于访问已配置 API 服务；留空为直连。例如 http://127.0.0.1:7897。">
-            <Input placeholder="http://127.0.0.1:7897" />
+          <Form.Item label={t("settings.labelProxy")} name="httpProxy" extra={t("settings.proxyExtra")}>
+            <Input placeholder={t("settings.placeholderProxy")} />
           </Form.Item>
         </Card>
       </Form>

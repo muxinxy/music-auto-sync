@@ -19,9 +19,12 @@ export interface Config {
   musicRoot?: string | null;
   folderTemplate: string;
   filenameTemplate: string;
+  artistSeparator: string;
+  language: string;
   quality: string;
   autoSyncOnStartup: boolean;
   syncIntervalMinutes?: number | null;
+  closeToTray: boolean;
   ncmConvert: boolean;
   ncmScanDirs?: string[];
   ncmKeepSource: boolean;
@@ -85,6 +88,11 @@ export interface PlaylistSongsResult {
   songs: PlaylistSong[];
 }
 
+export interface UiMessage {
+  code: string;
+  params?: string[];
+}
+
 export interface SingleDownloadOptions {
   targetDir?: string | null;
   filenameTemplate?: string | null;
@@ -99,7 +107,7 @@ export interface SyncProgress {
   phase: string;
   current: number;
   total: number;
-  message: string;
+  message: UiMessage;
 }
 
 export interface SyncReport {
@@ -111,7 +119,7 @@ export interface SyncReport {
   ncmConverted: number;
   failed: number;
   skipped: number;
-  errors: string[];
+  errors: UiMessage[];
   startedAt: string;
   finishedAt: string;
 }

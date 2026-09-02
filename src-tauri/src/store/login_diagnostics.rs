@@ -106,21 +106,11 @@ pub fn cookie_kind(cookie: Option<&str>) -> &'static str {
     }
 }
 
-pub fn error_class(error: &str) -> &'static str {
-    if error.contains("HTTP 403") {
-        "http_403"
-    } else if error.contains("HTTP 429") {
-        "http_429"
-    } else if error.contains("HTTP 5") {
-        "http_5xx"
-    } else if error.contains("超时") || error.contains("timeout") {
-        "timeout"
-    } else if error.contains("JSON") {
-        "invalid_json"
-    } else if error.contains("API 业务错误") {
-        "api_business"
+pub fn error_class(code: &str) -> String {
+    if code.is_empty() {
+        "unknown".into()
     } else {
-        "connect"
+        code.to_owned()
     }
 }
 
@@ -154,7 +144,8 @@ mod tests {
 
     #[test]
     fn classifies_safe_error_categories() {
-        assert_eq!(error_class("request failed (HTTP 403)"), "http_403");
-        assert_eq!(error_class("请求超时"), "timeout");
+        assert_eq!(error_class("http_403"), "http_403");
+        assert_eq!(error_class("timeout"), "timeout");
+        assert_eq!(error_class(""), "unknown");
     }
 }

@@ -23,6 +23,7 @@ export const api = {
   getLoginStatus: (verifyAttempt?: number, retryLimit?: number) =>
     invoke<LoginStatus>("get_login_status", { verifyAttempt, retryLimit }),
   openLoginLogDirectory: () => invoke<void>("open_login_log_directory"),
+  setLanguage: (language: string) => invoke<void>("set_language", { language }),
   logout: () => invoke<void>("logout"),
 
   listPlaylists: () => invoke<PlaylistInfo[]>("list_playlists"),

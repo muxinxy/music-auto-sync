@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Local;
 use reqwest::Client;
 use rusqlite::{params, OptionalExtension};
@@ -15,6 +15,7 @@ use walkdir::WalkDir;
 use crate::{
     api::{NeteaseApi, PlaylistTracks, Track},
     core::naming,
+    error::UiMessage,
     store::{self, config::Config, database},
     tags::tags,
     AppState,
@@ -28,7 +29,7 @@ pub struct SyncProgress {
     pub phase: String,
     pub current: usize,
     pub total: usize,
-    pub message: String,
+    pub message: UiMessage,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -42,31 +43,38 @@ pub struct SyncReport {
     pub ncm_converted: usize,
     pub failed: usize,
     pub skipped: usize,
-    pub errors: Vec<String>,
+    pub errors: Vec<UiMessage>,
     pub started_at: String,
     pub finished_at: String,
 }
 
-pub async fn sync_one(app: &AppHandle, state: &AppState, playlist_id: u64) -> Result<SyncReport> {
+pub async fn sync_one(
+    app: &AppHandle,
+    state: &AppState,
+    playlist_id: u64,
+) -> Result<SyncReport, UiMessage> {
     if state.sync_running.swap(true, Ordering::SeqCst) {
-        return Err(anyhow!("已有同步任务正在运行"));
+        return Err(UiMessage::new("sync_busy"));
     }
     let _ = app.emit("sync://state", true);
-    let result = sync_one_inner(app, state, playlist_id).await;
+    let result = sync_one_inner(Some(app), state, playlist_id).await;
     state.sync_running.store(false, Ordering::SeqCst);
     let _ = app.emit("sync://state", false);
-    if let Ok(report) = &result {
-        let _ = app.emit("sync://report", report);
+    match result {
+        Ok(report) => {
+            let _ = app.emit("sync://report", &report);
+            Ok(report)
+        }
+        Err(error) => Err(ui_from_error(error)),
     }
-    result
 }
 
-pub async fn sync_enabled(app: &AppHandle, state: &AppState) -> Result<Vec<SyncReport>> {
+pub async fn sync_enabled(app: &AppHandle, state: &AppState) -> Result<Vec<SyncReport>, UiMessage> {
     if state.sync_running.swap(true, Ordering::SeqCst) {
-        return Err(anyhow!("已有同步任务正在运行"));
+        return Err(UiMessage::new("sync_busy"));
     }
     let _ = app.emit("sync://state", true);
-    let config = store::config::load(&state.paths.get().config_file)?;
+    let config = store::config::load(&state.paths.get().config_file).map_err(UiMessage::unknown)?;
     let ids: Vec<u64> = config
         .playlists
         .iter()
@@ -78,7 +86,7 @@ pub async fn sync_enabled(app: &AppHandle, state: &AppState) -> Result<Vec<SyncR
         if state.cancel_requested.load(Ordering::SeqCst) {
             break;
         }
-        match sync_one_inner(app, state, id).await {
+        match sync_one_inner(Some(app), state, id).await {
             Ok(report) => {
                 let _ = app.emit("sync://report", &report);
                 reports.push(report);
@@ -91,18 +99,43 @@ pub async fn sync_enabled(app: &AppHandle, state: &AppState) -> Result<Vec<SyncR
     Ok(reports)
 }
 
-async fn sync_one_inner(app: &AppHandle, state: &AppState, playlist_id: u64) -> Result<SyncReport> {
+fn ui_from_error(error: anyhow::Error) -> UiMessage {
+    error
+        .downcast_ref::<UiMessage>()
+        .cloned()
+        .unwrap_or_else(|| UiMessage::unknown(error))
+}
+
+/// CLI 无窗口模式：直接执行单个歌单同步，不发送事件。
+pub async fn cli_sync(state: &AppState, playlist_id: u64) -> Result<SyncReport, UiMessage> {
+    sync_one_inner(None, state, playlist_id)
+        .await
+        .map_err(ui_from_error)
+}
+
+async fn sync_one_inner(
+    app: Option<&AppHandle>,
+    state: &AppState,
+    playlist_id: u64,
+) -> Result<SyncReport> {
     state.cancel_requested.store(false, Ordering::SeqCst);
     let paths = state.paths.get();
     let config = store::config::load(&paths.config_file)?;
-    let root = PathBuf::from(
-        config
-            .music_root
-            .as_deref()
-            .context("请先在设置中选择音乐根目录")?,
-    );
+    let root = config
+        .music_root
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!(UiMessage::new("music_root_required")))?;
     let api = NeteaseApi::from_config(&config)?;
-    emit(app, playlist_id, "", "读取歌单", 0, 0, "正在拉取歌单曲目");
+    emit_progress(
+        app,
+        playlist_id,
+        "",
+        "phase_read_playlist",
+        0,
+        0,
+        UiMessage::new("read_playlist"),
+    );
     let playlist = api.playlist_tracks(playlist_id).await?;
     let setting = config.playlists.iter().find(|p| p.id == playlist_id);
     let quality = setting
@@ -111,6 +144,7 @@ async fn sync_one_inner(app: &AppHandle, state: &AppState, playlist_id: u64) -> 
     let folder_template = setting
         .and_then(|x| x.folder_override.as_deref())
         .unwrap_or(&config.folder_template);
+    let artist_separator = &config.artist_separator;
     let now = database::now();
     let mut report = SyncReport {
         playlist_id,
@@ -126,7 +160,12 @@ async fn sync_one_inner(app: &AppHandle, state: &AppState, playlist_id: u64) -> 
         finished_at: String::new(),
     };
     let mut conn = database::open(&paths.database_file)?;
-    database::log(&conn, &playlist.name, "running", "开始同步")?;
+    database::log(
+        &conn,
+        &playlist.name,
+        "running",
+        &UiMessage::new("sync_start").to_json(),
+    )?;
 
     convert_ncm_files(app, state, &config, &playlist, &mut report).await?;
     sync_tracks(
@@ -138,6 +177,7 @@ async fn sync_one_inner(app: &AppHandle, state: &AppState, playlist_id: u64) -> 
         &root,
         folder_template,
         quality,
+        artist_separator,
         &mut conn,
         &mut report,
     )
@@ -147,11 +187,12 @@ async fn sync_one_inner(app: &AppHandle, state: &AppState, playlist_id: u64) -> 
         &playlist,
         &root,
         folder_template,
+        artist_separator,
         &mut conn,
         &mut report,
     )?;
     if config.write_m3u8 {
-        write_m3u8(&playlist, &root, folder_template, &conn)?;
+        write_m3u8(&playlist, &root, folder_template, artist_separator, &conn)?;
     }
 
     report.finished_at = database::now();
@@ -160,17 +201,22 @@ async fn sync_one_inner(app: &AppHandle, state: &AppState, playlist_id: u64) -> 
         &conn,
         &playlist.name,
         status,
-        &format!(
-            "完成：新增 {}，隔离 {}，失败 {}",
-            report.added, report.quarantined, report.failed
-        ),
+        &UiMessage::with_params(
+            "sync_done",
+            vec![
+                report.added.to_string(),
+                report.quarantined.to_string(),
+                report.failed.to_string(),
+            ],
+        )
+        .to_json(),
     )?;
     database::record_sync_run(&conn, &report)?;
     Ok(report)
 }
 
 async fn sync_tracks(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     api: &NeteaseApi,
     config: &Config,
@@ -178,6 +224,7 @@ async fn sync_tracks(
     root: &Path,
     folder_template: &str,
     quality: &str,
+    artist_separator: &str,
     conn: &mut rusqlite::Connection,
     report: &mut SyncReport,
 ) -> Result<()> {
@@ -190,17 +237,17 @@ async fn sync_tracks(
         .unwrap_or(false);
     for (index, track) in playlist.tracks.iter().enumerate() {
         if state.cancel_requested.load(Ordering::SeqCst) {
-            return Err(anyhow!("同步已取消"));
+            return Err(anyhow!(UiMessage::new("sync_canceled")));
         }
         expected.insert(track.id);
-        emit(
+        emit_progress(
             app,
             playlist.id,
             &playlist.name,
-            "下载",
+            "phase_download",
             index + 1,
             playlist.tracks.len(),
-            &track.name,
+            UiMessage::with_params("track", vec![track.name.clone()]),
         );
         match sync_one_track(
             api,
@@ -209,6 +256,7 @@ async fn sync_tracks(
             root,
             folder_template,
             quality,
+            artist_separator,
             conn,
             track,
             index + 1,
@@ -230,7 +278,7 @@ async fn sync_tracks(
 enum TrackOutcome {
     Skipped,
     Downloaded,
-    Failed(String),
+    Failed(UiMessage),
 }
 
 fn record_track_file(
@@ -257,9 +305,11 @@ async fn finalize_track(
     target: &Path,
     extension: &str,
     write_lrc: bool,
+    artist_separator: &str,
     conn: &mut rusqlite::Connection,
 ) {
-    if let Err(error) = tags::write_basic_tags(target, track, position, track.id) {
+    if let Err(error) = tags::write_basic_tags(target, track, position, track.id, artist_separator)
+    {
         tracing::warn!(%error, path = %target.display(), "metadata write failed");
     }
     if write_lrc {
@@ -279,6 +329,7 @@ async fn sync_one_track(
     root: &Path,
     folder_template: &str,
     quality: &str,
+    artist_separator: &str,
     conn: &mut rusqlite::Connection,
     track: &Track,
     position: usize,
@@ -302,14 +353,18 @@ async fn sync_one_track(
         }
     }
 
-    let song_url = match api.song_url(track.id, quality).await {
-        Ok(song_url) => song_url,
-        Err(error) => return TrackOutcome::Failed(format!("{}：{error}", track.name)),
+    let (download_url, extension) = match fetch_download_url(api, track.id, quality).await {
+        Ok(Some(download)) => download,
+        Ok(None) => {
+            return TrackOutcome::Failed(UiMessage::with_params("no_url", vec![track.name.clone()]))
+        }
+        Err(error) => {
+            return TrackOutcome::Failed(UiMessage::with_params(
+                "song_url_failed",
+                vec![error.to_string()],
+            ))
+        }
     };
-    let Some(download_url) = song_url.url else {
-        return TrackOutcome::Failed(format!("{}：没有可用下载地址（VIP/版权限制）", track.name));
-    };
-    let extension = song_url.file_type.as_deref().unwrap_or("mp3");
     let target = naming::track_path(
         root,
         folder_template,
@@ -317,12 +372,13 @@ async fn sync_one_track(
         &playlist.name,
         track,
         position,
-        extension,
+        &extension,
+        artist_separator,
     );
 
     if !overwrite && target.is_file() {
         // 本地已存在按当前模板命名的文件：登记为已同步并跳过下载，避免覆盖用户文件。
-        let _ = record_track_file(conn, playlist, track, &target, extension);
+        let _ = record_track_file(conn, playlist, track, &target, &extension);
         let _ = write_sidecar(&target, playlist.id, track.id);
         let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
         return TrackOutcome::Skipped;
@@ -336,14 +392,18 @@ async fn sync_one_track(
                 track,
                 position,
                 &target,
-                extension,
+                &extension,
                 config.write_lrc,
+                artist_separator,
                 conn,
             )
             .await;
             TrackOutcome::Downloaded
         }
-        Err(error) => TrackOutcome::Failed(format!("{}：{error}", track.name)),
+        Err(error) => TrackOutcome::Failed(UiMessage::with_params(
+            "download_failed",
+            vec![error.to_string()],
+        )),
     }
 }
 
@@ -358,31 +418,27 @@ pub struct SingleDownloadOptions {
 }
 
 pub async fn download_song_with_options(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     state: &AppState,
     playlist_id: u64,
     track_id: u64,
     options: SingleDownloadOptions,
-) -> Result<String> {
+) -> Result<String, UiMessage> {
     if state.sync_running.load(Ordering::SeqCst) {
-        return Err(anyhow!("已有同步任务正在运行，请稍后再试"));
+        return Err(UiMessage::new("sync_busy"));
     }
     let paths = state.paths.get();
-    let config = store::config::load(&paths.config_file)?;
-    let root = PathBuf::from(
-        config
-            .music_root
-            .as_deref()
-            .context("请先在设置中选择音乐根目录")?,
-    );
-    let api = NeteaseApi::from_config(&config)?;
-    let playlist = api.playlist_tracks(playlist_id).await?;
+    let config = store::config::load(&paths.config_file).map_err(UiMessage::unknown)?;
+    let api = NeteaseApi::from_config(&config).map_err(UiMessage::unknown)?;
+    let playlist = api.playlist_tracks(playlist_id).await.map_err(|error| {
+        UiMessage::with_params("playlist_fetch_failed", vec![error.to_string()])
+    })?;
     let (index, track) = playlist
         .tracks
         .iter()
         .enumerate()
         .find(|(_, track)| track.id == track_id)
-        .context("歌单中不存在该歌曲")?;
+        .ok_or_else(|| UiMessage::new("track_missing"))?;
     let setting = config
         .playlists
         .iter()
@@ -400,53 +456,80 @@ pub async fn download_song_with_options(
         .as_deref()
         .unwrap_or(&config.filename_template);
     let write_lrc = options.write_lrc.unwrap_or(config.write_lrc);
-    let mut conn = database::open(&paths.database_file)?;
+    let artist_separator = &config.artist_separator;
+    let mut conn = database::open(&paths.database_file).map_err(UiMessage::unknown)?;
 
-    let _ = app.emit(
-        "sync://progress",
-        SyncProgress {
-            playlist_id: Some(playlist_id),
-            playlist_name: playlist.name.clone(),
-            phase: "下载".into(),
-            current: index + 1,
-            total: playlist.tracks.len(),
-            message: track.name.clone(),
-        },
-    );
+    if let Some(app) = app {
+        let _ = app.emit(
+            "sync://progress",
+            SyncProgress {
+                playlist_id: Some(playlist_id),
+                playlist_name: playlist.name.clone(),
+                phase: "phase_download".into(),
+                current: index + 1,
+                total: playlist.tracks.len(),
+                message: UiMessage::with_params("track", vec![track.name.clone()]),
+            },
+        );
+    }
 
-    let song_url = api.song_url(track.id, quality).await?;
-    let Some(download_url) = song_url.url else {
-        bail!("{}：没有可用下载地址（VIP/版权限制）", track.name);
+    let (download_url, extension) = match fetch_download_url(&api, track.id, quality).await {
+        Ok(Some(download)) => download,
+        Ok(None) => return Err(UiMessage::with_params("no_url", vec![track.name.clone()])),
+        Err(error) => {
+            return Err(UiMessage::with_params(
+                "song_url_failed",
+                vec![error.to_string()],
+            ))
+        }
     };
-    let extension = song_url.file_type.as_deref().unwrap_or("mp3");
-    let file_name = naming::apply_template(filename_template, &playlist.name, track, index + 1);
+    let file_name = naming::apply_template(
+        filename_template,
+        &playlist.name,
+        track,
+        index + 1,
+        artist_separator,
+    );
     let target = match options.target_dir.as_deref().filter(|dir| !dir.is_empty()) {
         Some(dir) => PathBuf::from(dir).join(format!("{file_name}.{extension}")),
-        None => naming::track_path(
-            &root,
-            folder_template,
-            filename_template,
-            &playlist.name,
-            track,
-            index + 1,
-            extension,
-        ),
+        None => {
+            // 未指定保存目录时才要求音乐根目录。
+            let root = PathBuf::from(
+                config
+                    .music_root
+                    .as_deref()
+                    .ok_or_else(|| UiMessage::new("music_root_required"))?,
+            );
+            naming::track_path(
+                &root,
+                folder_template,
+                filename_template,
+                &playlist.name,
+                track,
+                index + 1,
+                &extension,
+                artist_separator,
+            )
+        }
     };
     if target.exists() && !options.overwrite {
-        return Err(anyhow!(
-            "文件已存在：{}，勾选“覆盖已存在”可重新下载",
-            target.display()
+        return Err(UiMessage::with_params(
+            "file_exists",
+            vec![target.to_string_lossy().into_owned()],
         ));
     }
-    download_track(&download_url, &target).await?;
+    download_track(&download_url, &target)
+        .await
+        .map_err(|error| UiMessage::with_params("download_failed", vec![error.to_string()]))?;
     finalize_track(
         &api,
         &playlist,
         track,
         index + 1,
         &target,
-        extension,
+        &extension,
         write_lrc,
+        artist_separator,
         &mut conn,
     )
     .await;
@@ -464,7 +547,7 @@ async fn download_track(url: &str, target: &Path) -> Result<()> {
     let response = client.get(url).send().await?.error_for_status()?;
     let bytes = response.bytes().await?;
     if bytes.len() < 1024 {
-        return Err(anyhow!("下载内容异常，文件过小"));
+        return Err(anyhow!(UiMessage::new("download_small_file")));
     }
     fs::write(&part, bytes)?;
     if target.exists() {
@@ -486,11 +569,41 @@ fn update_snapshot(
     Ok(())
 }
 
+async fn fetch_download_url(
+    api: &NeteaseApi,
+    track_id: u64,
+    quality: &str,
+) -> Result<Option<(String, String)>> {
+    for level in quality_fallback_chain(quality) {
+        if let Ok(song_url) = api.song_url(track_id, level).await {
+            if let Some(url) = song_url.url {
+                return Ok(Some((
+                    url,
+                    song_url.file_type.unwrap_or_else(|| "mp3".into()),
+                )));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn quality_fallback_chain(quality: &str) -> &'static [&'static str] {
+    match quality {
+        "hires" => &["hires", "lossless", "exhigh", "higher", "standard"],
+        "lossless" => &["lossless", "exhigh", "higher", "standard"],
+        "exhigh" => &["exhigh", "higher", "standard"],
+        "higher" => &["higher", "standard"],
+        _ => &["standard"],
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn quarantine_removed(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     playlist: &PlaylistTracks,
     root: &Path,
     folder_template: &str,
+    artist_separator: &str,
     conn: &mut rusqlite::Connection,
     report: &mut SyncReport,
 ) -> Result<()> {
@@ -506,6 +619,7 @@ fn quarantine_removed(
         &playlist.name,
         &playlist.tracks.first().cloned().unwrap_or_else(empty_track),
         1,
+        artist_separator,
     ));
     for (track_id, local_path) in stale {
         if ids.contains(&track_id) {
@@ -513,14 +627,21 @@ fn quarantine_removed(
         }
         let source = PathBuf::from(&local_path);
         if source.is_file() {
-            emit(
+            emit_progress(
                 app,
                 playlist.id,
                 &playlist.name,
-                "隔离",
+                "phase_quarantine",
                 report.quarantined,
                 0,
-                source.file_name().and_then(|v| v.to_str()).unwrap_or(""),
+                UiMessage::with_params(
+                    "track",
+                    vec![source
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .unwrap_or_default()
+                        .to_owned()],
+                ),
             );
             let quarantine_dir = root.join(".quarantine").join(&playlist_folder);
             fs::create_dir_all(&quarantine_dir)?;
@@ -541,7 +662,7 @@ fn quarantine_removed(
                 source
                     .file_name()
                     .and_then(|x| x.to_str())
-                    .unwrap_or("未命名"),
+                    .unwrap_or_default(),
                 &local_path,
                 &target.to_string_lossy(),
             )?;
@@ -563,6 +684,7 @@ fn write_m3u8(
     playlist: &PlaylistTracks,
     root: &Path,
     folder_template: &str,
+    artist_separator: &str,
     conn: &rusqlite::Connection,
 ) -> Result<()> {
     let folder = root.join(naming::apply_template(
@@ -570,6 +692,7 @@ fn write_m3u8(
         &playlist.name,
         &playlist.tracks.first().cloned().unwrap_or_else(empty_track),
         1,
+        artist_separator,
     ));
     fs::create_dir_all(&folder)?;
     let mut out = String::from("#EXTM3U\n");
@@ -590,7 +713,7 @@ fn write_m3u8(
 }
 
 async fn convert_ncm_files(
-    app: &AppHandle,
+    app: Option<&AppHandle>,
     _state: &AppState,
     config: &Config,
     playlist: &PlaylistTracks,
@@ -627,14 +750,21 @@ async fn convert_ncm_files(
             if converted_marker.exists() {
                 continue;
             }
-            emit(
+            emit_progress(
                 app,
                 playlist.id,
                 &playlist.name,
-                "转换 NCM",
+                "phase_convert_ncm",
                 report.ncm_converted,
                 0,
-                path.file_name().and_then(|x| x.to_str()).unwrap_or(""),
+                UiMessage::with_params(
+                    "track",
+                    vec![path
+                        .file_name()
+                        .and_then(|x| x.to_str())
+                        .unwrap_or_default()
+                        .to_owned()],
+                ),
             );
             let output_dir = path.parent().context("NCM 文件缺少上级目录")?;
             match crate::ncm::ncm::convert(path, output_dir) {
@@ -652,9 +782,10 @@ async fn convert_ncm_files(
                     }
                 }
                 Err(error) => {
-                    report
-                        .errors
-                        .push(format!("NCM 转换失败 {}：{}", path.display(), error));
+                    report.errors.push(UiMessage::with_params(
+                        "ncm_convert_failed",
+                        vec![path.to_string_lossy().into_owned(), error.to_string()],
+                    ));
                     tracing::warn!(%error, path = %path.display(), "NCM conversion failed");
                 }
             }
@@ -663,26 +794,28 @@ async fn convert_ncm_files(
     Ok(())
 }
 
-fn emit(
-    app: &AppHandle,
+fn emit_progress(
+    app: Option<&AppHandle>,
     playlist_id: u64,
     playlist_name: &str,
     phase: &str,
     current: usize,
     total: usize,
-    message: &str,
+    message: UiMessage,
 ) {
-    let _ = app.emit(
-        "sync://progress",
-        SyncProgress {
-            playlist_id: Some(playlist_id),
-            playlist_name: playlist_name.to_owned(),
-            phase: phase.to_owned(),
-            current,
-            total,
-            message: message.to_owned(),
-        },
-    );
+    if let Some(app) = app {
+        let _ = app.emit(
+            "sync://progress",
+            SyncProgress {
+                playlist_id: Some(playlist_id),
+                playlist_name: playlist_name.to_owned(),
+                phase: phase.to_owned(),
+                current,
+                total,
+                message,
+            },
+        );
+    }
 }
 
 fn write_sidecar(path: &Path, playlist_id: u64, track_id: u64) -> Result<()> {
@@ -715,7 +848,7 @@ fn unique_quarantine_path(dir: &Path, source: &Path) -> PathBuf {
 fn empty_track() -> Track {
     Track {
         id: 0,
-        name: "".into(),
+        name: String::new(),
         ar: vec![],
         al: Default::default(),
         dt: 0,

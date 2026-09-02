@@ -3,6 +3,8 @@ use std::path::{Path, PathBuf};
 
 use crate::api::Track;
 
+pub const DEFAULT_ARTIST_SEPARATOR: &str = "、";
+
 pub fn sanitize_component(input: &str) -> String {
     let invalid = Regex::new(r#"[<>:"/\\|?*\x00-\x1F]"#).unwrap();
     let space = Regex::new(r"\s+").unwrap();
@@ -13,24 +15,28 @@ pub fn sanitize_component(input: &str) -> String {
         .trim_end_matches('.')
         .to_owned();
     if result.is_empty() {
-        "未命名".into()
+        "unnamed".into()
     } else {
         result
     }
 }
 
-pub fn artists(track: &Track) -> String {
+pub fn artists_with(track: &Track, separator: &str) -> String {
     let names = track
         .ar
         .iter()
         .map(|a| a.name.as_str())
         .collect::<Vec<_>>()
-        .join(" / ");
+        .join(separator);
     if names.is_empty() {
-        "未知歌手".into()
+        "unknown_artist".into()
     } else {
         names
     }
+}
+
+pub fn artists(track: &Track) -> String {
+    artists_with(track, DEFAULT_ARTIST_SEPARATOR)
 }
 
 pub fn apply_template(
@@ -38,11 +44,12 @@ pub fn apply_template(
     playlist_name: &str,
     track: &Track,
     position: usize,
+    artist_separator: &str,
 ) -> String {
     let replacements = [
         ("{歌单名}", playlist_name.to_owned()),
         ("{音轨号}", format!("{:02}", position)),
-        ("{歌手}", artists(track)),
+        ("{歌手}", artists_with(track, artist_separator)),
         ("{标题}", track.name.clone()),
         ("{专辑}", track.al.name.clone()),
         ("{网易云ID}", track.id.to_string()),
@@ -63,9 +70,22 @@ pub fn track_path(
     track: &Track,
     position: usize,
     extension: &str,
+    artist_separator: &str,
 ) -> PathBuf {
-    let folder = apply_template(folder_template, playlist_name, track, position);
-    let name = apply_template(filename_template, playlist_name, track, position);
+    let folder = apply_template(
+        folder_template,
+        playlist_name,
+        track,
+        position,
+        artist_separator,
+    );
+    let name = apply_template(
+        filename_template,
+        playlist_name,
+        track,
+        position,
+        artist_separator,
+    );
     root.join(folder).join(format!("{}.{}", name, extension))
 }
 
@@ -76,5 +96,22 @@ mod tests {
     #[test]
     fn strips_windows_invalid_characters() {
         assert_eq!(sanitize_component("A:B / C?"), "A_B _ C_");
+    }
+
+    #[test]
+    fn joins_artists_with_configured_separator() {
+        let track = Track {
+            id: 1,
+            name: "song".into(),
+            ar: vec![
+                crate::api::Artist { name: "A".into() },
+                crate::api::Artist { name: "B".into() },
+            ],
+            al: Default::default(),
+            dt: 0,
+            no: 0,
+        };
+        assert_eq!(artists_with(&track, "、"), "A、B");
+        assert_eq!(artists_with(&track, " / "), "A / B");
     }
 }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::{collections::HashMap, fs, path::Path, sync::atomic::Ordering};
-use tauri::{AppHandle, State};
+use tauri::{AppHandle, Manager, State};
 
 use crate::{
     api::{
@@ -13,6 +13,7 @@ use crate::{
         naming,
         sync::{self, SyncReport},
     },
+    error::UiMessage,
     store::{
         self,
         config::{Config, CookieUser, PlaylistSyncSetting},
@@ -31,7 +32,22 @@ pub struct AppInfo {
 }
 
 fn command_error(error: impl std::fmt::Display) -> String {
-    error.to_string()
+    UiMessage::unknown(error).to_json()
+}
+
+fn api_error_class(error: &anyhow::Error) -> String {
+    error
+        .downcast_ref::<crate::api::ApiCallError>()
+        .map(|api_error| api_error.class.to_string())
+        .unwrap_or_else(|| "unknown".into())
+}
+
+fn anyhow_to_ui(error: anyhow::Error) -> String {
+    if let Some(api_error) = error.downcast_ref::<crate::api::ApiCallError>() {
+        api_error.ui().to_json()
+    } else {
+        UiMessage::unknown(error).to_json()
+    }
 }
 
 #[tauri::command]
@@ -111,7 +127,7 @@ pub async fn check_login_qr(
                     Some(error.class),
                 ),
             );
-            return Err(command_error(error));
+            return Err(error.ui().to_json());
         }
     };
 
@@ -136,9 +152,7 @@ pub async fn check_login_qr(
     log_login(&paths.logs_dir, qr_diagnostic);
 
     if result.state == "success" {
-        let cookie = cookie
-            .context("登录成功但服务未返回 Cookie")
-            .map_err(command_error)?;
+        let cookie = cookie.ok_or_else(|| UiMessage::new("cookie_missing").to_json())?;
         let mut config = config;
         config.cookie = Some(cookie);
         config.cookie_user = None;
@@ -198,9 +212,7 @@ pub async fn check_login_qr(
                 log_login(
                     &paths.logs_dir,
                     LoginDiagnostic {
-                        error_class: Some(
-                            login_diagnostics::error_class(&error.to_string()).into(),
-                        ),
+                        error_class: Some(api_error_class(&error)),
                         ..LoginDiagnostic::new(
                             "status_failed",
                             "/login/status",
@@ -236,7 +248,7 @@ pub async fn get_login_status(
                 LoginDiagnostic {
                     verify_attempt,
                     retry_limit,
-                    error_class: Some(login_diagnostics::error_class(&error.to_string()).into()),
+                    error_class: Some(api_error_class(&error)),
                     ..LoginDiagnostic::new(
                         "status_failed",
                         "/login/status",
@@ -245,7 +257,7 @@ pub async fn get_login_status(
                     )
                 },
             );
-            return Err(command_error(error));
+            return Err(anyhow_to_ui(error));
         }
     };
     let status = status_response.status.clone();
@@ -334,9 +346,9 @@ fn fill_last_sync(state: &State<'_, AppState>, playlists: &mut [PlaylistInfo]) {
         if let Some((finished_at, failed)) = latest.get(&playlist.id) {
             playlist.last_sync = Some(finished_at.clone());
             playlist.last_result = if *failed == 0 {
-                Some("同步成功".into())
+                Some(UiMessage::new("sync_ok").to_json())
             } else {
-                Some(format!("同步完成（{failed} 首失败）"))
+                Some(UiMessage::with_params("sync_done_failed", vec![failed.to_string()]).to_json())
             };
         }
     }
@@ -413,7 +425,7 @@ pub async fn get_playlist_songs(
         songs.push(PlaylistSong {
             id: track.id,
             name: track.name.clone(),
-            artists: naming::artists(track),
+            artists: naming::artists_with(track, &config.artist_separator),
             album: track.al.name.clone(),
             duration_ms: track.dt,
             position: index + 1,
@@ -438,9 +450,9 @@ pub async fn download_song_with_options(
     track_id: u64,
     options: sync::SingleDownloadOptions,
 ) -> Result<String, String> {
-    sync::download_song_with_options(&app, &state, playlist_id, track_id, options)
+    sync::download_song_with_options(Some(&app), &state, playlist_id, track_id, options)
         .await
-        .map_err(command_error)
+        .map_err(|message| message.to_json())
 }
 
 #[tauri::command]
@@ -497,7 +509,7 @@ pub async fn sync_playlist(
 ) -> Result<SyncReport, String> {
     sync::sync_one(&app, &state, id)
         .await
-        .map_err(command_error)
+        .map_err(|message| message.to_json())
 }
 
 #[tauri::command]
@@ -507,7 +519,7 @@ pub async fn sync_all(
 ) -> Result<Vec<SyncReport>, String> {
     sync::sync_enabled(&app, &state)
         .await
-        .map_err(command_error)
+        .map_err(|message| message.to_json())
 }
 
 #[tauri::command]
@@ -550,10 +562,10 @@ pub fn restore_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), Str
     let original = Path::new(&item.0);
     let quarantined = Path::new(&item.1);
     if !quarantined.is_file() {
-        return Err("隔离文件已不存在".into());
+        return Err(UiMessage::new("quarantine_missing").to_json());
     }
     if original.exists() {
-        return Err("原路径已有同名文件，不能覆盖".into());
+        return Err(UiMessage::new("quarantine_conflict").to_json());
     }
     if let Some(parent) = original.parent() {
         fs::create_dir_all(parent).map_err(command_error)?;
@@ -575,7 +587,7 @@ pub fn delete_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), Stri
         )
         .optional()
         .map_err(command_error)?;
-    let path = path.context("隔离记录不存在").map_err(command_error)?;
+    let path = path.ok_or_else(|| UiMessage::new("quarantine_record_missing").to_json())?;
     if Path::new(&path).is_file() {
         fs::remove_file(&path).map_err(command_error)?;
     }
@@ -591,7 +603,36 @@ pub fn open_login_log_directory(state: State<'_, AppState>) -> Result<(), String
     std::process::Command::new("explorer")
         .arg(&paths.logs_dir)
         .spawn()
-        .map_err(|_| "无法打开登录日志目录".to_owned())?;
+        .map_err(|_| UiMessage::new("log_open_failed").to_json())?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_language(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    language: String,
+) -> Result<(), String> {
+    let paths = state.paths.get();
+    let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let language: String = if language.starts_with("en") {
+        "en".into()
+    } else {
+        "zh-CN".into()
+    };
+    if config.language != language {
+        config.language = language.clone();
+        store::config::save(&paths.config_file, &config).map_err(command_error)?;
+    }
+    crate::runtime::tray::install(&app).map_err(command_error)?;
+    let title = if language == "en" {
+        "Music Auto Sync"
+    } else {
+        "音乐同步"
+    };
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.set_title(title);
+    }
     Ok(())
 }
 

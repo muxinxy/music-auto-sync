@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { Card, List, Progress, Tag, Typography, message as antMessage } from "antd";
 import { listen } from "@tauri-apps/api/event";
+import { useTranslation } from "react-i18next";
 import { api } from "../api";
-import type { SyncProgress, SyncReport } from "../types";
+import { translateUi } from "../errors";
+import type { SyncProgress, SyncReport, UiMessage } from "../types";
 
 interface LogEntry {
   id: number;
@@ -12,13 +14,19 @@ interface LogEntry {
   message: string;
 }
 
-function statusTag(s: string) {
-  if (s === "ok") return <Tag color="success">成功</Tag>;
-  if (s === "error") return <Tag color="error">失败</Tag>;
-  return <Tag color="processing">{s}</Tag>;
+function renderMessage(raw: string): string {
+  if (raw.startsWith("{")) {
+    try {
+      return translateUi(JSON.parse(raw) as UiMessage);
+    } catch {
+      return raw;
+    }
+  }
+  return raw;
 }
 
 export default function SyncPage() {
+  const { t } = useTranslation();
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [reports, setReports] = useState<SyncReport[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
@@ -27,9 +35,9 @@ export default function SyncPage() {
     try {
       setLogs(await api.getSyncLogs(100));
     } catch (e) {
-      antMessage.error(`加载日志失败：${e}`);
+      antMessage.error(t("syncPage.loadLogsFailed", { detail: String(e) }));
     }
-  }, []);
+  }, [t]);
 
   useEffect(() => {
     loadLogs();
@@ -44,14 +52,24 @@ export default function SyncPage() {
     };
   }, [loadLogs]);
 
+  const phaseLabel = progress
+    ? t(`phases.${progress.phase}`, { defaultValue: progress.phase })
+    : "";
+  const progressMessage =
+    progress?.message.code === "track" && progress.message.params?.[0]
+      ? progress.message.params[0]
+      : progress?.message
+        ? translateUi(progress.message)
+        : "";
+
   return (
     <div style={{ padding: 24 }}>
-      <Card title="当前任务" style={{ marginBottom: 16 }}>
+      <Card title={t("syncPage.currentTask")} style={{ marginBottom: 16 }}>
         {progress ? (
           <>
             <Typography.Paragraph>
-              <Tag color="processing">{progress.phase}</Tag>
-              {progress.playlistName} —— {progress.message}
+              <Tag color="processing">{phaseLabel}</Tag>
+              {progress.playlistName} —— {progressMessage}
             </Typography.Paragraph>
             <Progress
               percent={progress.total ? Math.round((progress.current / progress.total) * 100) : 0}
@@ -59,22 +77,27 @@ export default function SyncPage() {
             />
           </>
         ) : (
-          <Typography.Text type="secondary">暂无正在进行的同步任务</Typography.Text>
+          <Typography.Text type="secondary">{t("syncPage.noTask")}</Typography.Text>
         )}
       </Card>
 
       {reports.length > 0 && (
-        <Card title="最近结果" style={{ marginBottom: 16 }} size="small">
+        <Card title={t("syncPage.recentResults")} style={{ marginBottom: 16 }} size="small">
           <List
             size="small"
             dataSource={reports}
             renderItem={(r) => (
               <List.Item>
                 <Typography.Text>
-                  {r.playlistName}：新增 {r.added} · 转换 {r.ncmConverted} · 隔离{" "}
-                  {r.quarantined} · 失败 {r.failed}
+                  {t("syncPage.resultLine", {
+                    name: r.playlistName,
+                    added: r.added,
+                    converted: r.ncmConverted,
+                    quarantined: r.quarantined,
+                    failed: r.failed,
+                  })}
                   {r.errors.length > 0 && (
-                    <Typography.Text type="danger">（{r.errors[0]}）</Typography.Text>
+                    <Typography.Text type="danger">（{translateUi(r.errors[0])}）</Typography.Text>
                   )}
                 </Typography.Text>
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -86,26 +109,36 @@ export default function SyncPage() {
         </Card>
       )}
 
-      <Card title="同步日志" styles={{ body: { padding: 0 } }}>
+      <Card title={t("syncPage.syncLogs")} styles={{ body: { padding: 0 } }}>
         <List
           size="small"
           dataSource={logs}
-          locale={{ emptyText: "暂无日志" }}
-          renderItem={(l) => (
-            <List.Item style={{ paddingLeft: 24, paddingRight: 24 }}>
-              <List.Item.Meta
-                title={
-                  <Typography.Text style={{ fontSize: 13 }}>
-                    {statusTag(l.status)} {l.playlistName || "-"}
-                  </Typography.Text>
-                }
-                description={l.message}
-              />
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                {l.ts}
-              </Typography.Text>
-            </List.Item>
-          )}
+          locale={{ emptyText: t("syncPage.noLogs") }}
+          renderItem={(l) => {
+            const tag =
+              l.status === "ok" ? (
+                <Tag color="success">{t("syncPage.statusSuccess")}</Tag>
+              ) : l.status === "error" ? (
+                <Tag color="error">{t("syncPage.statusFailed")}</Tag>
+              ) : (
+                <Tag color="processing">{t("syncPage.statusRunning")}</Tag>
+              );
+            return (
+              <List.Item style={{ paddingLeft: 24, paddingRight: 24 }}>
+                <List.Item.Meta
+                  title={
+                    <Typography.Text style={{ fontSize: 13 }}>
+                      {tag} {l.playlistName || "-"}
+                    </Typography.Text>
+                  }
+                  description={renderMessage(l.message)}
+                />
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {l.ts}
+                </Typography.Text>
+              </List.Item>
+            );
+          }}
         />
       </Card>
     </div>

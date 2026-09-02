@@ -1,6 +1,8 @@
 pub mod api;
+pub mod cli;
 pub mod commands;
 pub mod core;
+pub mod error;
 pub mod ncm;
 pub mod runtime;
 pub mod store;
@@ -40,6 +42,23 @@ pub fn run() {
         .setup(|app| {
             runtime::tray::install(app.handle())?;
             runtime::scheduler::start(app.handle().clone());
+
+            // 关闭窗口时默认隐藏到托盘；可通过设置关闭。
+            if let Some(window) = app.get_webview_window("main") {
+                let win = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        let state = win.state::<AppState>();
+                        let close_to_tray = store::config::load(&state.paths.get().config_file)
+                            .map(|config| config.close_to_tray)
+                            .unwrap_or(true);
+                        if close_to_tray {
+                            api.prevent_close();
+                            let _ = win.hide();
+                        }
+                    }
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -51,6 +70,7 @@ pub fn run() {
             commands::check_login_qr,
             commands::get_login_status,
             commands::open_login_log_directory,
+            commands::set_language,
             commands::logout,
             commands::list_playlists,
             commands::get_playlist_songs,

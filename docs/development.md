@@ -1,5 +1,7 @@
 # Development Guide
 
+> [中文](development.zh-CN.md) · [English](development.md)
+
 ## Architecture
 
 Music Auto Sync is a Windows desktop application built with Tauri 2. The React frontend handles the interactive workflow, while Rust owns local storage, filesystem changes, background synchronization, audio conversion, and API access.

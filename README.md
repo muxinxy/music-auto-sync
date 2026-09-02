@@ -1,5 +1,7 @@
 # Music Auto Sync
 
+> [English](README.en.md)
+
 面向 Windows 的便携网易云音乐歌单同步器，使用 Tauri 2、Rust 和 React 构建。
 
 它通过兼容 [NeteaseCloudMusicApi Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced) 的服务获取登录态、歌单和下载地址，将启用的歌单同步到本地音乐目录。

@@ -4,16 +4,36 @@ use tauri::{
     AppHandle, Manager,
 };
 
-use crate::{core::sync, AppState};
+use crate::{core::sync, store, AppState};
+
+fn language(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    match store::config::load(&state.paths.get().config_file) {
+        Ok(config) => config.language.starts_with("en"),
+        Err(_) => false,
+    }
+}
 
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
-    let show = MenuItem::with_id(app, "show", "打开主窗口", true, None::<&str>)?;
-    let sync = MenuItem::with_id(app, "sync", "立即同步", true, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
+    // 重建前移除旧托盘图标，避免重复图标（例如切换语言后重装）。
+    let _ = app.remove_tray_by_id("main-tray");
+    let en = language(app);
+    let show_label = if en { "Show window" } else { "打开主窗口" };
+    let sync_label = if en { "Sync now" } else { "立即同步" };
+    let quit_label = if en { "Quit" } else { "退出" };
+    let tooltip = if en {
+        "Music Auto Sync"
+    } else {
+        "音乐同步"
+    };
+
+    let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
+    let sync = MenuItem::with_id(app, "sync", sync_label, true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
     let menu = Menu::with_items(app, &[&show, &sync, &quit])?;
 
     let mut tray = TrayIconBuilder::with_id("main-tray")
-        .tooltip("音乐同步")
+        .tooltip(tooltip)
         .menu(&menu)
         .on_menu_event(|app, event| match event.id.as_ref() {
             "show" => {

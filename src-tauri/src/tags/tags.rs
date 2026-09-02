@@ -7,19 +7,21 @@ use lofty::{
 };
 use std::path::Path;
 
-use crate::{api::Track, core::naming::artists};
+use crate::{api::Track, core::naming::artists_with};
 
 pub fn write_basic_tags(
     path: &Path,
     track: &Track,
     position: usize,
     netease_id: u64,
+    artist_separator: &str,
 ) -> Result<()> {
+    let artist = artists_with(track, artist_separator);
     let mut tagged_file = Probe::open(path)?.read()?;
     let tag_type = tagged_file.primary_tag_type();
     if let Some(tag) = tagged_file.primary_tag_mut() {
         tag.set_title(track.name.clone());
-        tag.set_artist(artists(track));
+        tag.set_artist(artist.clone());
         tag.set_album(track.al.name.clone());
         tag.set_track(position as u32);
         tag.insert_text(ItemKey::Comment, format!("netease-id:{netease_id}"));
@@ -31,7 +33,7 @@ pub fn write_basic_tags(
             TagType::Id3v2
         });
         tag.set_title(track.name.clone());
-        tag.set_artist(artists(track));
+        tag.set_artist(artist);
         tag.set_album(track.al.name.clone());
         tag.set_track(position as u32);
         tag.insert_text(ItemKey::Comment, format!("netease-id:{netease_id}"));
