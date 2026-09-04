@@ -507,9 +507,36 @@ pub async fn sync_playlist(
     state: State<'_, AppState>,
     id: u64,
 ) -> Result<SyncReport, String> {
+    let paths = state.paths.get();
+    let _ = store::app_log::log(
+        &paths.logs_dir,
+        "info",
+        "sync",
+        format!("开始同步歌单 {id}"),
+    );
     sync::sync_one(&app, &state, id)
         .await
-        .map_err(|message| message.to_json())
+        .map(|report| {
+            let _ = store::app_log::log(
+                &paths.logs_dir,
+                "info",
+                "sync",
+                format!(
+                    "歌单 {} 同步完成：新增 {} 失败 {}",
+                    id, report.added, report.failed
+                ),
+            );
+            report
+        })
+        .map_err(|message| {
+            let _ = store::app_log::log(
+                &paths.logs_dir,
+                "error",
+                "sync",
+                format!("歌单 {id} 同步失败：{message:?}"),
+            );
+            message.to_json()
+        })
 }
 
 #[tauri::command]
@@ -517,9 +544,17 @@ pub async fn sync_all(
     app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<Vec<SyncReport>, String> {
-    sync::sync_enabled(&app, &state)
-        .await
-        .map_err(|message| message.to_json())
+    let paths = state.paths.get();
+    let _ = store::app_log::log(&paths.logs_dir, "info", "sync", "开始同步全部歌单");
+    sync::sync_enabled(&app, &state).await.map_err(|message| {
+        let _ = store::app_log::log(
+            &paths.logs_dir,
+            "error",
+            "sync",
+            format!("同步全部失败：{message:?}"),
+        );
+        message.to_json()
+    })
 }
 
 #[tauri::command]

@@ -4,6 +4,28 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-09-04
+
+### Fixed
+
+- Member songs downloaded as preview clips: all requests now carry the session through the `cookie` parameter (the channel Enhanced forwards to NetEase), so quality follows your account entitlement.
+- QR login stuck at "state not confirmed": removed the duplicate `cookie` parameter on `/login/status` that broke server-side parsing.
+- Error toasts showing raw JSON: the frontend now parses and translates backend error codes.
+- 88VIP member songs returning a 705KB/45s preview: URL endpoints no longer get `randomCNIP`, keeping membership checks intact.
+- Downloading a single song into a custom directory outside the music root no longer marks it as synced.
+
+### Added
+
+- Per-track download log `logs/track-downloads.jsonl` (downloaded/skipped/failed, bytes, quality, error).
+- General log `logs/app.log.jsonl` covering sync start/end/failure and command errors; logs rotate and are pruned by size.
+- Settings option to choose the download-URL source: auto (song/url/v1 first) or prefer the song/download/url family.
+- The app opens on the account login page by default; signed-in users are routed to the playlists page.
+- 60-second cache for the playlist list to avoid lag when switching pages; manual refresh or mutations force a reload.
+
+### Changed
+
+- "Use random China IP" now defaults to off to avoid breaking membership-based quality decisions.
+
 ## [0.3.0] - 2026-09-02
 
 ### Added

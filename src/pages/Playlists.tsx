@@ -1,4 +1,4 @@
-﻿import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   Alert,
   Avatar,
@@ -45,9 +45,6 @@ interface Props {
   sync: SyncEventState;
 }
 
-const QUALITY_OPTIONS = ["standard", "higher", "exhigh", "lossless", "hires"] as const;
-const VARIABLE_HINT = "{音轨号} {歌手} {标题} {专辑} {网易云ID}";
-
 function formatDuration(millis: number): string {
   if (!millis) return "-";
   const total = Math.round(millis / 1000);
@@ -68,6 +65,11 @@ function displayLastResult(raw?: string | null): string {
   return raw;
 }
 
+const QUALITY_OPTIONS = ["standard", "higher", "exhigh", "lossless", "hires"] as const;
+const VARIABLE_HINT = "{音轨号} {歌手} {标题} {专辑} {网易云ID}";
+const CACHE_TTL_MS = 60_000;
+const playlistCache: { at: number; data: PlaylistInfo[] } = { at: 0, data: [] };
+
 export default function PlaylistsPage({ login, sync }: Props) {
   const { t } = useTranslation();
   const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
@@ -77,21 +79,37 @@ export default function PlaylistsPage({ login, sync }: Props) {
   const [songs, setSongs] = useState<PlaylistSongsResult | null>(null);
   const [songsLoading, setSongsLoading] = useState(false);
 
-  const [dlTarget, setDlTarget] = useState<{ playlistId: number; song: PlaylistSong } | null>(null);
+  const [selectedPlaylists, setSelectedPlaylists] = useState<Set<number>>(new Set());
+  const [selectedSongs, setSelectedSongs] = useState<number[]>([]);
+
+  const [dlTarget, setDlTarget] = useState<{
+    playlistId: number;
+    songs: PlaylistSong[];
+  } | null>(null);
   const [dlOptions, setDlOptions] = useState<SingleDownloadOptions>({ overwrite: false });
   const [dlDownloading, setDlDownloading] = useState(false);
 
-  const load = useCallback(async () => {
-    if (!login?.loggedIn) return;
-    setLoading(true);
-    try {
-      setPlaylists(await api.listPlaylists());
-    } catch (e) {
-      antMessage.error(t("playlists.loadFailed", { detail: formatError(e) }));
-    } finally {
-      setLoading(false);
-    }
-  }, [login?.loggedIn, t]);
+  const load = useCallback(
+    async (force = false) => {
+      if (!login?.loggedIn) return;
+      if (!force && Date.now() - playlistCache.at < CACHE_TTL_MS && playlistCache.data.length > 0) {
+        setPlaylists(playlistCache.data);
+        return;
+      }
+      setLoading(true);
+      try {
+        const data = await api.listPlaylists();
+        playlistCache.at = Date.now();
+        playlistCache.data = data;
+        setPlaylists(data);
+      } catch (e) {
+        antMessage.error(t("playlists.loadFailed", { detail: formatError(e) }));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [login?.loggedIn, t]
+  );
 
   useEffect(() => {
     load();
@@ -111,9 +129,12 @@ export default function PlaylistsPage({ login, sync }: Props) {
     }
   }, [t]);
 
-  const openDownloadDialog = (playlistId: number, song: PlaylistSong) => {
-    setDlTarget({ playlistId, song });
-    setDlOptions({ overwrite: song.synced, writeLrc: false });
+  const openDownloadDialog = (playlistId: number, songs: PlaylistSong[]) => {
+    setDlTarget({ playlistId, songs });
+    setDlOptions({
+      overwrite: songs.length === 1 ? songs[0].synced : false,
+      writeLrc: false,
+    });
   };
 
   const pickDownloadDir = async () => {
@@ -125,25 +146,33 @@ export default function PlaylistsPage({ login, sync }: Props) {
 
   const confirmDownload = async () => {
     if (!dlTarget) return;
-    const { playlistId, song } = dlTarget;
+    const { playlistId, songs: targets } = dlTarget;
     setDlDownloading(true);
+    let succeeded = 0;
+    let failed = 0;
     try {
-      const path = await api.downloadSongWithOptions(playlistId, song.id, {
-        ...dlOptions,
-        writeLrc: dlOptions.writeLrc ?? false,
-      });
-      antMessage.success(t("playlists.downloaded", { name: song.name }));
+      for (const song of targets) {
+        try {
+          await api.downloadSongWithOptions(playlistId, song.id, {
+            ...dlOptions,
+            writeLrc: dlOptions.writeLrc ?? false,
+          });
+          succeeded += 1;
+        } catch {
+          failed += 1;
+        }
+      }
+      if (succeeded > 0) {
+        antMessage.success(t("playlists.downloaded", { name: `${succeeded} 首` }));
+      }
       setDlTarget(null);
+      setSelectedSongs([]);
       setSongs(await api.getPlaylistSongs(playlistId));
-      load();
-    } catch (e) {
-      const ui = uiMessage(e);
-      antMessage.error(
-        ui.code === "fileExists"
-          ? translateUi(ui)
-          : t("playlists.downloadFailed", { detail: formatError(e) })
-      );
+      load(true);
     } finally {
+      if (failed > 0) {
+        antMessage.error(t("playlists.downloadFailed", { detail: `${failed} 首失败` }));
+      }
       setDlDownloading(false);
     }
   };
@@ -153,7 +182,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
       await api.syncPlaylist(id);
       antMessage.success(t("playlists.playlistSynced", { name: messageName }));
       setSongs(await api.getPlaylistSongs(id));
-      load();
+      load(true);
     } catch (e) {
       antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
     }
@@ -203,7 +232,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
           size="small"
           icon={<DownloadOutlined />}
           disabled={dlDownloading}
-          onClick={() => detailId && openDownloadDialog(detailId, song)}
+          onClick={() => detailId && openDownloadDialog(detailId, [song])}
         >
           {t("playlists.download")}
         </Button>
@@ -211,11 +240,75 @@ export default function PlaylistsPage({ login, sync }: Props) {
     },
   ];
 
+  const allOverwrite = playlists.length > 0 && playlists.every((p) => p.overwrite);
+
+  const togglePlaylist = (id: number) => {
+    setSelectedPlaylists((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const toggleAllPlaylists = () => {
+    setSelectedPlaylists((prev) =>
+      prev.size === shown.length && shown.every((p) => prev.has(p.id))
+        ? new Set()
+        : new Set(shown.map((p) => p.id))
+    );
+  };
+
+  const batchPlaylists = async (
+    operation: "enabled" | "disabled" | "overwrite" | "noOverwrite" | "sync"
+  ) => {
+    const ids = [...selectedPlaylists];
+    try {
+      for (const id of ids) {
+        if (operation === "sync") {
+          await api.syncPlaylist(id);
+        } else if (operation === "enabled" || operation === "disabled") {
+          await api.setPlaylistEnabled(id, operation === "enabled");
+        } else {
+          await api.setPlaylistOverwrite(id, operation === "overwrite");
+        }
+      }
+      antMessage.success(`${ids.length} 个歌单已处理`);
+      setSelectedPlaylists(new Set());
+      load(true);
+    } catch (e) {
+      antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
+    }
+  };
+
+  const openBatchDownloadSongs = () => {
+    if (!detailId) return;
+    const targets = (songs?.songs ?? []).filter((song) => selectedSongs.includes(song.id));
+    if (targets.length === 0) return;
+    setSelectedSongs([]);
+    openDownloadDialog(detailId, targets);
+  };
+
   return (
     <div style={{ padding: 24 }}>
       <Card style={{ marginBottom: 16 }}>
         <Space style={{ width: "100%", justifyContent: "space-between" }}>
           <Space>
+            <Space size={4}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {t("playlists.overwriteAll")}
+              </Typography.Text>
+              <Switch
+                size="small"
+                checked={allOverwrite}
+                onChange={async (value) => {
+                  for (const playlist of playlists) {
+                    await api.setPlaylistOverwrite(playlist.id, value);
+                  }
+                  load(true);
+                }}
+              />
+            </Space>
             <Input.Search
               placeholder={t("playlists.searchPlaceholder")}
               allowClear
@@ -228,7 +321,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
             </Typography.Text>
           </Space>
           <Space>
-            <Button icon={<ReloadOutlined />} onClick={load} disabled={sync.running}>
+            <Button icon={<ReloadOutlined />} onClick={() => load(true)} disabled={sync.running}>
               {t("playlists.refresh")}
             </Button>
             <Button
@@ -239,7 +332,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
                 try {
                   await api.syncAll();
                   antMessage.success(t("playlists.allSynced"));
-                  load();
+                  load(true);
                 } catch (e) {
                   antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
                 }
@@ -250,6 +343,43 @@ export default function PlaylistsPage({ login, sync }: Props) {
           </Space>
         </Space>
       </Card>
+
+      {selectedPlaylists.size > 0 && (
+        <Card size="small" style={{ marginBottom: 16 }}>
+          <Space wrap>
+            <Checkbox checked={selectedPlaylists.size === shown.length} indeterminate={selectedPlaylists.size > 0 && selectedPlaylists.size < shown.length} onChange={toggleAllPlaylists}>
+              {t("playlists.selectAll")}
+            </Checkbox>
+            <Typography.Text type="secondary">
+              {t("playlists.selectedCount", { count: selectedPlaylists.size })}
+            </Typography.Text>
+            <Button size="small" onClick={() => batchPlaylists("enabled")}>
+              {t("settings.on")}
+            </Button>
+            <Button size="small" onClick={() => batchPlaylists("disabled")}>
+              {t("settings.off")}
+            </Button>
+            <Button size="small" onClick={() => batchPlaylists("overwrite")}>
+              {t("playlists.overwriteShort")}
+            </Button>
+            <Button size="small" onClick={() => batchPlaylists("noOverwrite")}>
+              {t("playlists.noOverwriteShort")}
+            </Button>
+            <Button
+              size="small"
+              type="primary"
+              icon={<SyncOutlined />}
+              disabled={sync.running}
+              onClick={() => batchPlaylists("sync")}
+            >
+              {t("playlists.syncNow")}
+            </Button>
+            <Button size="small" type="text" onClick={() => setSelectedPlaylists(new Set())}>
+              {t("playlists.cancelSelect")}
+            </Button>
+          </Space>
+        </Card>
+      )}
 
       <Card styles={{ body: { padding: 0 } }}>
         <List
@@ -267,7 +397,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
                     checked={p.overwrite}
                     onChange={async (v) => {
                       await api.setPlaylistOverwrite(p.id, v);
-                      load();
+                      load(true);
                     }}
                     checkedChildren={t("playlists.overwriteShort")}
                     unCheckedChildren={t("playlists.overwriteShort")}
@@ -287,7 +417,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
                     unCheckedChildren={t("settings.off")}
                     onChange={async (v) => {
                       await api.setPlaylistEnabled(p.id, v);
-                      load();
+                      load(true);
                     }}
                   />,
                   <Button
@@ -300,6 +430,11 @@ export default function PlaylistsPage({ login, sync }: Props) {
                   </Button>,
                 ]}
               >
+                <Checkbox
+                  checked={selectedPlaylists.has(p.id)}
+                  onChange={() => togglePlaylist(p.id)}
+                  style={{ marginRight: 8, alignSelf: "center" }}
+                />
                 <List.Item.Meta
                   avatar={<Avatar shape="square" size={48} src={p.coverImgUrl} />}
                   title={
@@ -343,14 +478,23 @@ export default function PlaylistsPage({ login, sync }: Props) {
         open={detailId !== null}
         onClose={() => setDetailId(null)}
         extra={
-          <Button
-            type="primary"
-            icon={<SyncOutlined />}
-            disabled={sync.running}
-            onClick={() => detailId && runSync(detailId, songs?.playlistName ?? "")}
-          >
-            {t("playlists.syncMissing")}
-          </Button>
+          <Space>
+            <Button
+              icon={<DownloadOutlined />}
+              disabled={selectedSongs.length === 0}
+              onClick={openBatchDownloadSongs}
+            >
+              {t("playlists.downloadBatch", { count: selectedSongs.length })}
+            </Button>
+            <Button
+              type="primary"
+              icon={<SyncOutlined />}
+              disabled={sync.running}
+              onClick={() => detailId && runSync(detailId, songs?.playlistName ?? "")}
+            >
+              {t("playlists.syncMissing")}
+            </Button>
+          </Space>
         }
       >
         <Table<PlaylistSong>
@@ -359,12 +503,20 @@ export default function PlaylistsPage({ login, sync }: Props) {
           loading={songsLoading}
           dataSource={songs?.songs ?? []}
           columns={columns}
+          rowSelection={{
+            selectedRowKeys: selectedSongs,
+            onChange: (keys) => setSelectedSongs(keys as number[]),
+          }}
           pagination={{ pageSize: 50, showSizeChanger: false }}
         />
       </Drawer>
 
       <Modal
-        title={t("playlists.downloadTitle", { name: dlTarget?.song.name ?? "" })}
+        title={
+          dlTarget && dlTarget.songs.length > 1
+            ? t("playlists.downloadTitleBatch", { count: dlTarget.songs.length })
+            : t("playlists.downloadTitle", { name: dlTarget?.songs[0]?.name ?? "" })
+        }
         open={dlTarget !== null}
         onCancel={() => !dlDownloading && setDlTarget(null)}
         onOk={confirmDownload}

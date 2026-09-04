@@ -20,6 +20,8 @@ pub struct NeteaseApi {
     client: Client,
     base: String,
     cookie: Option<String>,
+    random_cn_ip: bool,
+    download_source: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -188,6 +190,10 @@ impl ApiCallError {
 }
 
 impl NeteaseApi {
+    pub fn download_source(&self) -> &str {
+        &self.download_source
+    }
+
     pub fn from_config(config: &Config) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
@@ -212,6 +218,8 @@ impl NeteaseApi {
             client: client.build()?,
             base: config.api_base.trim_end_matches('/').to_owned(),
             cookie: config.cookie.clone(),
+            random_cn_ip: config.use_random_cn_ip,
+            download_source: config.download_source.clone(),
         })
     }
 
@@ -221,9 +229,23 @@ impl NeteaseApi {
         params: &[(&str, String)],
     ) -> std::result::Result<(Value, Option<String>, ApiResponseMeta), ApiCallError> {
         let url = format!("{}{}", self.base, path);
-        let mut request = self.client.get(&url).query(params);
+        let mut query: Vec<(&str, String)> = params.to_vec();
+        // 登录/验证码/下载地址路由保持 IP 一致性：随机 IP 会让会员权益判定失效，
+        // 服务端会对歌曲地址接口返回试听片段。其余请求可选使用随机中国 IP。
+        let stable_ip_path = path.starts_with("/login")
+            || path.starts_with("/captcha")
+            || path.starts_with("/song/url")
+            || path.starts_with("/song/download");
+        if self.random_cn_ip && !stable_ip_path {
+            query.push(("randomCNIP", "true".into()));
+        }
+        let mut request = self.client.get(&url).query(&query);
         if let Some(cookie) = &self.cookie {
-            request = request.header("Cookie", cookie);
+            // Enhanced 只把 query/body 的 cookie 参数转发给网易上游认证；
+            // HTTP Cookie 头不会生效。因此必须同时以 cookie 参数携带会话。
+            request = request
+                .header("Cookie", cookie)
+                .query(&[("cookie", cookie.clone())]);
         }
 
         let started = Instant::now();
@@ -360,7 +382,7 @@ impl NeteaseApi {
     }
 
     pub async fn login_status(&self) -> Result<LoginStatusResponse> {
-        let Some(cookie) = self.cookie.as_deref() else {
+        if self.cookie.is_none() {
             return Ok(LoginStatusResponse {
                 status: LoginStatus {
                     logged_in: false,
@@ -371,12 +393,9 @@ impl NeteaseApi {
                 meta: ApiResponseMeta::default(),
                 account_present: false,
             });
-        };
+        }
         let (json, _, meta) = self
-            .get_value(
-                "/login/status",
-                &[("cookie", cookie.to_owned()), ("timestamp", cache_buster())],
-            )
+            .get_value("/login/status", &[("timestamp", cache_buster())])
             .await
             .map_err(anyhow::Error::new)?;
         let code = json.get("code").and_then(Value::as_i64).unwrap_or(200);
@@ -549,6 +568,29 @@ impl NeteaseApi {
             .and_then(Value::as_str)
             .map(str::to_owned))
     }
+
+    /// 当 /song/url/v1 拿不到地址时的兜底候选：依次尝试
+    /// /song/download/url/v1 与 /song/download/url?br=320000。
+    pub async fn song_download_url_candidate(&self, id: u64) -> Option<(String, String)> {
+        let attempts: [(&str, Vec<(&str, String)>); 2] = [
+            (
+                "/song/download/url/v1",
+                vec![("id", id.to_string()), ("level", "exhigh".into())],
+            ),
+            (
+                "/song/download/url",
+                vec![("id", id.to_string()), ("br", "320000".into())],
+            ),
+        ];
+        for (path, params) in attempts {
+            if let Ok((json, _)) = self.get(path, &params).await {
+                if let Some(candidate) = parse_download_url(&json) {
+                    return Some(candidate);
+                }
+            }
+        }
+        None
+    }
 }
 
 fn ensure_success_code(json: &Value) -> Result<()> {
@@ -586,6 +628,21 @@ fn cache_buster() -> String {
         .unwrap_or_default()
         .as_millis()
         .to_string()
+}
+
+fn parse_download_url(json: &Value) -> Option<(String, String)> {
+    let data = json.get("data")?;
+    if let Some(array) = data.as_array() {
+        let first = array.first()?;
+        let url = first.get("url")?.as_str()?;
+        let format = first.get("type").and_then(Value::as_str).unwrap_or("mp3");
+        return Some((url.to_owned(), format.to_owned()));
+    }
+    if let Some(url) = data.as_str() {
+        return Some((url.to_owned(), "mp3".into()));
+    }
+    let url = data.get("url")?.as_str()?;
+    Some((url.to_owned(), "mp3".into()))
 }
 
 fn safe_header(value: Option<&str>) -> Option<String> {

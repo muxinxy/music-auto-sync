@@ -32,7 +32,7 @@ export interface SyncEventState {
 export default function App() {
   const { message } = AntApp.useApp();
   const { t } = useTranslation();
-  const [page, setPage] = useState<PageKey>("playlists");
+  const [page, setPage] = useState<PageKey>("login");
   const [login, setLogin] = useState<LoginStatus | null>(null);
   const [sync, setSync] = useState<SyncEventState>({ running: false });
   const [appReady, setAppReady] = useState(false);
@@ -60,7 +60,9 @@ export default function App() {
 
   useEffect(() => {
     applyLanguage();
-    refreshLogin().finally(() => setAppReady(true));
+    refreshLogin().then((status) => {
+      if (status?.loggedIn) setPage((prev) => (prev === "login" ? "playlists" : prev));
+    }).finally(() => setAppReady(true));
 
     const unlistenProgress = listen<SyncProgress>("sync://progress", (e) => {
       setSync((s) => ({ ...s, progress: e.payload }));

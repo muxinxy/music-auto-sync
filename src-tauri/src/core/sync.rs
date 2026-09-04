@@ -179,6 +179,7 @@ async fn sync_one_inner(
         quality,
         artist_separator,
         &mut conn,
+        &paths.logs_dir,
         &mut report,
     )
     .await?;
@@ -226,6 +227,7 @@ async fn sync_tracks(
     quality: &str,
     artist_separator: &str,
     conn: &mut rusqlite::Connection,
+    logs_dir: &Path,
     report: &mut SyncReport,
 ) -> Result<()> {
     let mut expected = HashSet::new();
@@ -258,6 +260,7 @@ async fn sync_tracks(
             quality,
             artist_separator,
             conn,
+            logs_dir,
             track,
             index + 1,
             overwrite,
@@ -331,10 +334,17 @@ async fn sync_one_track(
     quality: &str,
     artist_separator: &str,
     conn: &mut rusqlite::Connection,
+    logs_dir: &Path,
     track: &Track,
     position: usize,
     overwrite: bool,
 ) -> TrackOutcome {
+    let mut log_entry = store::track_log::TrackLogEntry::new(
+        Some(playlist.id),
+        &playlist.name,
+        track.id,
+        &track.name,
+    );
     if !overwrite {
         let known_path: Option<String> = conn
             .query_row(
@@ -349,6 +359,8 @@ async fn sync_one_track(
             .is_some_and(|path| Path::new(path).is_file())
         {
             let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
+            log_entry.outcome("skipped", &UiMessage::new("track_exists"));
+            let _ = store::track_log::append(logs_dir, &log_entry);
             return TrackOutcome::Skipped;
         }
     }
@@ -356,13 +368,16 @@ async fn sync_one_track(
     let (download_url, extension) = match fetch_download_url(api, track.id, quality).await {
         Ok(Some(download)) => download,
         Ok(None) => {
-            return TrackOutcome::Failed(UiMessage::with_params("no_url", vec![track.name.clone()]))
+            let message = UiMessage::with_params("no_url", vec![track.name.clone()]);
+            log_entry.outcome("failed", &message);
+            let _ = store::track_log::append(logs_dir, &log_entry);
+            return TrackOutcome::Failed(message);
         }
         Err(error) => {
-            return TrackOutcome::Failed(UiMessage::with_params(
-                "song_url_failed",
-                vec![error.to_string()],
-            ))
+            let message = UiMessage::with_params("song_url_failed", vec![error.to_string()]);
+            log_entry.outcome("failed", &message);
+            let _ = store::track_log::append(logs_dir, &log_entry);
+            return TrackOutcome::Failed(message);
         }
     };
     let target = naming::track_path(
@@ -381,11 +396,13 @@ async fn sync_one_track(
         let _ = record_track_file(conn, playlist, track, &target, &extension);
         let _ = write_sidecar(&target, playlist.id, track.id);
         let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
+        log_entry.outcome("skipped", &UiMessage::new("track_exists"));
+        let _ = store::track_log::append(logs_dir, &log_entry);
         return TrackOutcome::Skipped;
     }
 
     match download_track(&download_url, &target).await {
-        Ok(()) => {
+        Ok(bytes) => {
             finalize_track(
                 api,
                 playlist,
@@ -398,12 +415,16 @@ async fn sync_one_track(
                 conn,
             )
             .await;
+            log_entry.done(&target, bytes, quality);
+            let _ = store::track_log::append(logs_dir, &log_entry);
             TrackOutcome::Downloaded
         }
-        Err(error) => TrackOutcome::Failed(UiMessage::with_params(
-            "download_failed",
-            vec![error.to_string()],
-        )),
+        Err(error) => {
+            let message = UiMessage::with_params("download_failed", vec![error.to_string()]);
+            log_entry.outcome("failed", &message);
+            let _ = store::track_log::append(logs_dir, &log_entry);
+            TrackOutcome::Failed(message)
+        }
     }
 }
 
@@ -490,8 +511,12 @@ pub async fn download_song_with_options(
         index + 1,
         artist_separator,
     );
+    let mut in_music_root = true;
     let target = match options.target_dir.as_deref().filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir).join(format!("{file_name}.{extension}")),
+        Some(dir) => {
+            in_music_root = false;
+            PathBuf::from(dir).join(format!("{file_name}.{extension}"))
+        }
         None => {
             // 未指定保存目录时才要求音乐根目录。
             let root = PathBuf::from(
@@ -518,25 +543,52 @@ pub async fn download_song_with_options(
             vec![target.to_string_lossy().into_owned()],
         ));
     }
-    download_track(&download_url, &target)
-        .await
-        .map_err(|error| UiMessage::with_params("download_failed", vec![error.to_string()]))?;
-    finalize_track(
-        &api,
-        &playlist,
-        track,
-        index + 1,
-        &target,
-        &extension,
-        write_lrc,
-        artist_separator,
-        &mut conn,
-    )
-    .await;
+    let mut log_entry = store::track_log::TrackLogEntry::new(
+        Some(playlist_id),
+        &playlist.name,
+        track.id,
+        &track.name,
+    );
+    match download_track(&download_url, &target).await {
+        Ok(bytes) => {
+            log_entry.done(&target, bytes, quality);
+            let _ = store::track_log::append(&paths.logs_dir, &log_entry);
+        }
+        Err(error) => {
+            let message = UiMessage::with_params("download_failed", vec![error.to_string()]);
+            log_entry.outcome("failed", &message);
+            let _ = store::track_log::append(&paths.logs_dir, &log_entry);
+            return Err(message);
+        }
+    }
+    if in_music_root {
+        // 只有下载到音乐根目录下才登记为“已同步”。
+        finalize_track(
+            &api,
+            &playlist,
+            track,
+            index + 1,
+            &target,
+            &extension,
+            write_lrc,
+            artist_separator,
+            &mut conn,
+        )
+        .await;
+    } else if write_lrc {
+        if let Ok(Some(lyrics)) = api.lyric(track.id).await {
+            let _ = fs::write(target.with_extension("lrc"), lyrics);
+        }
+    }
+    if let Err(error) =
+        tags::write_basic_tags(&target, track, index + 1, track.id, artist_separator)
+    {
+        tracing::warn!(%error, path = %target.display(), "metadata write failed");
+    }
     Ok(target.to_string_lossy().into_owned())
 }
 
-async fn download_track(url: &str, target: &Path) -> Result<()> {
+async fn download_track(url: &str, target: &Path) -> Result<u64> {
     let parent = target.parent().context("target has no parent")?;
     fs::create_dir_all(parent)?;
     let part = target.with_extension(format!(
@@ -549,12 +601,12 @@ async fn download_track(url: &str, target: &Path) -> Result<()> {
     if bytes.len() < 1024 {
         return Err(anyhow!(UiMessage::new("download_small_file")));
     }
-    fs::write(&part, bytes)?;
+    fs::write(&part, &bytes)?;
     if target.exists() {
         fs::remove_file(target)?;
     }
     fs::rename(part, target)?;
-    Ok(())
+    Ok(bytes.len() as u64)
 }
 
 fn update_snapshot(
@@ -574,17 +626,28 @@ async fn fetch_download_url(
     track_id: u64,
     quality: &str,
 ) -> Result<Option<(String, String)>> {
-    for level in quality_fallback_chain(quality) {
-        if let Ok(song_url) = api.song_url(track_id, level).await {
-            if let Some(url) = song_url.url {
-                return Ok(Some((
-                    url,
-                    song_url.file_type.unwrap_or_else(|| "mp3".into()),
-                )));
+    let mut picked: Option<(String, String)> = None;
+    // 依据设置决定优先使用哪个接口家族。
+    let prefer_download_api = matches!(api.download_source(), "download" | "download-first");
+    if prefer_download_api {
+        picked = api.song_download_url_candidate(track_id).await;
+    }
+    if picked.is_none() {
+        for level in quality_fallback_chain(quality) {
+            if let Ok(song_url) = api.song_url(track_id, level).await {
+                if let Some(url) = song_url.url {
+                    picked = Some((url, song_url.file_type.unwrap_or_else(|| "mp3".into())));
+                    break;
+                }
             }
         }
     }
-    Ok(None)
+    if picked.is_none() && !prefer_download_api {
+        // 兜底：个别实例 /song/url/v1 拿不到地址时，尝试下载接口候选。
+        picked = api.song_download_url_candidate(track_id).await;
+    }
+    // 网易 CDN 支持 https，明文 http 直链在部分网络/代理下会被拒绝，统一升级。
+    Ok(picked.map(|(url, format)| (url.replace("http://", "https://"), format)))
 }
 
 fn quality_fallback_chain(quality: &str) -> &'static [&'static str] {

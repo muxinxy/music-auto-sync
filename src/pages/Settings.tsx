@@ -33,9 +33,11 @@ const defaultConfig: Config = {
   artistSeparator: "、",
   language: "zh-CN",
   quality: "exhigh",
+  downloadSource: "auto",
   autoSyncOnStartup: true,
   syncIntervalMinutes: 60,
   closeToTray: true,
+  useRandomCnIp: false,
   ncmConvert: true,
   ncmScanDirs: [],
   ncmKeepSource: true,
@@ -215,7 +217,7 @@ export default function SettingsPage() {
           <Form.Item
             label={t("settings.labelSeparator")}
             name="artistSeparator"
-            tooltip={t("settings.filenameTemplateExtra")}
+            tooltip={t("settings.separatorTip")}
           >
             <Input style={{ width: 160 }} placeholder="、" />
           </Form.Item>
@@ -233,6 +235,15 @@ export default function SettingsPage() {
                 </Radio.Button>
               ))}
             </Radio.Group>
+          </Form.Item>
+          <Form.Item label={t("settings.labelDownloadSource")} name="downloadSource" extra={t("settings.downloadSourceExtra")}>
+            <Select
+              style={{ width: 240 }}
+              options={[
+                { value: "auto", label: t("settings.downloadSourceAuto") },
+                { value: "download", label: t("settings.downloadSourceDownload") },
+              ]}
+            />
           </Form.Item>
           <Form.Item label={t("settings.labelConcurrency")} name="concurrency">
             <InputNumber min={1} max={5} />
@@ -262,6 +273,9 @@ export default function SettingsPage() {
             <InputNumber min={15} max={10080} style={{ width: 160 }} />
           </Form.Item>
           <Form.Item name="closeToTray" valuePropName="checked" label={t("settings.cbCloseToTray")}>
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
+          </Form.Item>
+          <Form.Item name="useRandomCnIp" valuePropName="checked" label={t("settings.cbRandomCnIp")}>
             <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
           </Form.Item>
           <Form.Item label={t("settings.labelLanguage")} name="language">

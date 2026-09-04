@@ -1,7 +1,9 @@
+pub mod app_log;
 pub mod config;
 pub mod database;
 pub mod login_diagnostics;
 pub mod paths;
+pub mod track_log;
 
 use std::sync::{Arc, RwLock};
 

@@ -22,9 +22,11 @@ export interface Config {
   artistSeparator: string;
   language: string;
   quality: string;
+  downloadSource: string;
   autoSyncOnStartup: boolean;
   syncIntervalMinutes?: number | null;
   closeToTray: boolean;
+  useRandomCnIp: boolean;
   ncmConvert: boolean;
   ncmScanDirs?: string[];
   ncmKeepSource: boolean;

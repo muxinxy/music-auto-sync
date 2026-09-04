@@ -17,6 +17,10 @@ fn default_language() -> String {
     "zh-CN".into()
 }
 
+fn default_download_source() -> String {
+    "auto".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -31,10 +35,14 @@ pub struct Config {
     #[serde(default = "default_language")]
     pub language: String,
     pub quality: String,
+    #[serde(default = "default_download_source")]
+    pub download_source: String,
     pub auto_sync_on_startup: bool,
     pub sync_interval_minutes: Option<u64>,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
+    #[serde(default = "default_true")]
+    pub use_random_cn_ip: bool,
     pub ncm_convert: bool,
     #[serde(default)]
     pub ncm_scan_dirs: Vec<String>,
@@ -81,9 +89,11 @@ impl Default for Config {
             artist_separator: "、".into(),
             language: "zh-CN".into(),
             quality: "exhigh".into(),
+            download_source: "auto".into(),
             auto_sync_on_startup: true,
             sync_interval_minutes: Some(60),
             close_to_tray: true,
+            use_random_cn_ip: false,
             ncm_convert: true,
             ncm_scan_dirs: vec![],
             ncm_keep_source: true,
