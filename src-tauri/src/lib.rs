@@ -8,13 +8,13 @@ pub mod runtime;
 pub mod store;
 pub mod tags;
 
-use std::sync::atomic::AtomicBool;
+use std::sync::{atomic::AtomicBool, Arc};
 use tauri::Manager;
 
 pub struct AppState {
     pub paths: store::AppPaths,
     pub sync_running: AtomicBool,
-    pub cancel_requested: AtomicBool,
+    pub cancel_requested: Arc<AtomicBool>,
 }
 
 pub fn run() {
@@ -37,7 +37,7 @@ pub fn run() {
         .manage(AppState {
             paths: store::AppPaths::new(paths),
             sync_running: AtomicBool::new(false),
-            cancel_requested: AtomicBool::new(false),
+            cancel_requested: Arc::new(AtomicBool::new(false)),
         })
         .setup(|app| {
             runtime::tray::install(app.handle())?;
@@ -72,6 +72,8 @@ pub fn run() {
             commands::open_login_log_directory,
             commands::set_language,
             commands::logout,
+            commands::send_login_captcha,
+            commands::login_with_captcha,
             commands::list_playlists,
             commands::get_playlist_songs,
             commands::download_song_with_options,
@@ -84,6 +86,13 @@ pub fn run() {
             commands::list_quarantine,
             commands::restore_quarantine,
             commands::delete_quarantine,
+            commands::manual_prune,
+            commands::get_liked_songs,
+            commands::get_purchased_songs,
+            commands::backup_songs,
+            commands::preflight_playlist,
+            commands::show_in_folder,
+            commands::check_for_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Music Auto Sync");

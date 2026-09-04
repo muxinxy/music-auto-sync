@@ -21,6 +21,9 @@ export interface Config {
   filenameTemplate: string;
   artistSeparator: string;
   language: string;
+  ua: string;
+  preflight: boolean;
+  retry: number;
   quality: string;
   downloadSource: string;
   autoSyncOnStartup: boolean;
@@ -82,6 +85,18 @@ export interface PlaylistSong {
   position: number;
   localPath?: string | null;
   synced: boolean;
+  fileSize?: number | null;
+  fileModified?: string | null;
+}
+
+export interface TrackAvailability {
+  id: number;
+  downloadable: boolean;
+  downloadLevel?: string | null;
+  playLevel?: string | null;
+  fee?: number | null;
+  locked: boolean;
+  reason?: string | null;
 }
 
 export interface PlaylistSongsResult {
@@ -122,8 +137,26 @@ export interface SyncReport {
   failed: number;
   skipped: number;
   errors: UiMessage[];
+  errorDetails?: SyncErrorDetail[];
   startedAt: string;
   finishedAt: string;
+}
+
+export interface SyncErrorDetail {
+  trackId: number;
+  trackName: string;
+  message: UiMessage;
+}
+
+export type BatchItemStatus = "downloaded" | "skipped" | "failed";
+
+export interface BatchItemResult {
+  trackId: number;
+  trackName: string;
+  outcome:
+    | { status: "downloaded"; data: string }
+    | { status: "skipped" }
+    | { status: "failed"; data: UiMessage };
 }
 
 export interface QuarantineItem {

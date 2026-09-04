@@ -10,12 +10,17 @@ It talks to any service compatible with [NeteaseCloudMusicApi Enhanced](https://
 
 ## Features
 
-- NetEase QR code login; credentials are stored only in the local data directory
+- NetEase QR code or SMS verification-code login; credentials are stored only in the local data directory
 - Manual, startup and scheduled sync, plus a system tray
 - Missing songs are downloaded; removed songs are moved to quarantine where you can restore or delete them
-- Configurable playlist folder/filename templates, quality, concurrency, and an artist separator used consistently in filenames and ID3 tags
+- Pre-flight availability/quality check: the song table shows per-song downloadability and the best quality your account can get before you download
+- Concurrent downloads with batch pre-fetched URLs; per-track automatic retry and “retry failed only” for batch downloads
+- Configurable playlist folder/filename templates, quality, concurrency, retry count, download URL source, and an artist separator used consistently in filenames and ID3 tags
+- One-click backup of all Liked songs or all Purchased songs to a local folder
 - Writes title, artist, album, track number and NetEase ID; optional LRC, cover and M3U8
 - Scans and converts `.ncm` files, keeping or deleting the source as configured
+- Song rows show local-file state (synced / missing / size) with “show in folder”
+- Silent update check on startup with an in-app banner
 - SQLite local index, sync logs, single instance and sync cancellation
 - Portable mode with a customizable data directory; the app folder can be moved as a whole
 - UI is available in Chinese and English; switching language takes effect immediately
@@ -39,8 +44,8 @@ music-auto-sync_x64_portable/
 
 1. Run `Music Auto Sync.exe`.
 2. In “Settings”, choose the music root directory and, if needed, your API address (defaults to a compatible service of [NeteaseCloudMusicApi Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)).
-3. Sign in on the “Account Login” page with the QR code.
-4. On the “Playlists” page, enable the playlists you want to sync, then click “Sync all” or wait for the auto task. Open a playlist to browse its songs, download individual songs, or sync them.
+3. Sign in on the “Account Login” page with the QR code or an SMS verification code.
+4. On the “Playlists” page, enable the playlists you want to sync, then click “Sync all” or wait for the auto task. Open a playlist to browse its songs (with availability/local-file status), download individual songs, clean files no longer in the playlist, or back up Liked/Purchased songs from the top bar.
 5. Files removed from a playlist go to `<music root>/.quarantine/`; manage them in “Quarantine”.
 
 The app data directory is resolved in this order:

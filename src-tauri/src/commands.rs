@@ -7,11 +7,11 @@ use tauri::{AppHandle, Manager, State};
 use crate::{
     api::{
         ApiResponseMeta, LoginStatus, LoginStatusResponse, NeteaseApi, PlaylistInfo, QrCheckResult,
-        QrSession,
+        QrSession, Track,
     },
     core::{
         naming,
-        sync::{self, SyncReport},
+        sync::{self, BatchItemResult, SyncReport},
     },
     error::UiMessage,
     store::{
@@ -389,6 +389,8 @@ pub struct PlaylistSong {
     pub position: usize,
     pub local_path: Option<String>,
     pub synced: bool,
+    pub file_size: Option<u64>,
+    pub file_modified: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -422,6 +424,21 @@ pub async fn get_playlist_songs(
             )
             .optional()
             .map_err(command_error)?;
+        let exists = local_path
+            .as_deref()
+            .is_some_and(|path| Path::new(path).is_file());
+        let file_size = local_path
+            .as_deref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map(|meta| meta.len());
+        let file_modified = local_path
+            .as_deref()
+            .and_then(|path| fs::metadata(path).ok())
+            .and_then(|meta| meta.modified().ok())
+            .map(|time| {
+                let datetime: chrono::DateTime<chrono::Local> = time.into();
+                datetime.format("%Y-%m-%d %H:%M:%S").to_string()
+            });
         songs.push(PlaylistSong {
             id: track.id,
             name: track.name.clone(),
@@ -429,10 +446,10 @@ pub async fn get_playlist_songs(
             album: track.al.name.clone(),
             duration_ms: track.dt,
             position: index + 1,
-            synced: local_path
-                .as_deref()
-                .is_some_and(|path| Path::new(path).is_file()),
+            synced: exists,
             local_path,
+            file_size,
+            file_modified,
         });
     }
     Ok(PlaylistSongsResult {
@@ -803,4 +820,236 @@ fn copy_dir_contents(from: &Path, to: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// 发送手机验证码（短信登录第一步）。
+#[tauri::command]
+pub async fn send_login_captcha(state: State<'_, AppState>, phone: String) -> Result<(), String> {
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let phone = phone.trim().to_owned();
+    if phone.is_empty() {
+        return Err(UiMessage::new("phone_required").to_json());
+    }
+    NeteaseApi::from_config(&config)
+        .map_err(command_error)?
+        .send_captcha(&phone, "86")
+        .await
+        .map_err(command_error)
+}
+
+/// 用验证码登录并保存会话。
+#[tauri::command]
+pub async fn login_with_captcha(
+    state: State<'_, AppState>,
+    phone: String,
+    captcha: String,
+) -> Result<LoginStatus, String> {
+    let paths = state.paths.get();
+    let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let phone = phone.trim().to_owned();
+    let captcha = captcha.trim().to_owned();
+    if phone.is_empty() || captcha.is_empty() {
+        return Err(UiMessage::new("phone_or_code_required").to_json());
+    }
+    let (cookie, status) = NeteaseApi::from_config(&config)
+        .map_err(command_error)?
+        .login_cellphone(&phone, &captcha)
+        .await
+        .map_err(command_error)?;
+    config.cookie = Some(cookie);
+    config.cookie_user = status.as_ref().and_then(|s| cookie_user_from_status(s));
+    store::config::save(&paths.config_file, &config).map_err(command_error)?;
+    Ok(status.unwrap_or(LoginStatus {
+        logged_in: true,
+        nickname: None,
+        user_id: None,
+        avatar_url: None,
+    }))
+}
+
+/// 获取“我喜欢”的歌曲详情列表。
+#[tauri::command]
+pub async fn get_liked_songs(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let user = config
+        .cookie_user
+        .as_ref()
+        .context("请先登录")
+        .map_err(command_error)?;
+    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    let ids = api
+        .liked_song_ids(user.user_id)
+        .await
+        .map_err(command_error)?;
+    let details = api.song_detail_batch(&ids).await.map_err(command_error)?;
+    let mut out: Vec<serde_json::Value> = details.into_values().collect();
+    out.sort_by_key(|v| v.get("id").and_then(|x| x.as_u64()).unwrap_or(0));
+    Ok(out)
+}
+
+/// 获取已购单曲详情列表。
+#[tauri::command]
+pub async fn get_purchased_songs(
+    state: State<'_, AppState>,
+) -> Result<Vec<serde_json::Value>, String> {
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    let ids = api.purchased_songs().await.map_err(command_error)?;
+    let details = api.song_detail_batch(&ids).await.map_err(command_error)?;
+    let mut out: Vec<serde_json::Value> = details.into_values().collect();
+    out.sort_by_key(|v| v.get("id").and_then(|x| x.as_u64()).unwrap_or(0));
+    Ok(out)
+}
+
+/// 备份“我喜欢 / 已购”到指定目录（不纳入任何歌单的已同步状态）。
+#[tauri::command]
+pub async fn backup_songs(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    kind: String,
+    label: String,
+    target_dir: String,
+    quality: Option<String>,
+    write_lrc: Option<bool>,
+    overwrite: bool,
+) -> Result<Vec<BatchItemResult>, String> {
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    let ids: Vec<u64> = match kind.as_str() {
+        "liked" => {
+            let user = config
+                .cookie_user
+                .as_ref()
+                .context("请先登录")
+                .map_err(command_error)?;
+            api.liked_song_ids(user.user_id)
+                .await
+                .map_err(command_error)?
+        }
+        "purchased" => api.purchased_songs().await.map_err(command_error)?,
+        other => {
+            return Err(UiMessage::with_params("invalid_kind", vec![other.to_owned()]).to_json())
+        }
+    };
+    if ids.is_empty() {
+        return Err(UiMessage::new("no_songs_to_backup").to_json());
+    }
+    // 批量详情一次拿全（避免逐首 /playlist/track/all）。
+    let details = api.song_detail_batch(&ids).await.map_err(command_error)?;
+    let tracks: Vec<Track> = ids
+        .iter()
+        .filter_map(|id| details.get(id))
+        .filter_map(|v| serde_json::from_value(v.clone()).ok())
+        .collect();
+    let dir = Path::new(&target_dir);
+    sync::download_track_ids(
+        Some(&app),
+        &state,
+        dir,
+        &label,
+        quality.as_deref(),
+        write_lrc,
+        overwrite,
+        tracks,
+    )
+    .await
+    .map_err(|m| m.to_json())
+}
+
+/// 手动把“不在歌单里的本地文件”隔离进 .quarantine。
+#[tauri::command]
+pub async fn manual_prune(state: State<'_, AppState>, id: u64) -> Result<usize, String> {
+    if state.sync_running.load(Ordering::SeqCst) {
+        return Err(UiMessage::new("sync_busy").to_json());
+    }
+    sync::prune_playlist_removed(&state, id)
+        .await
+        .map_err(|message| message.to_json())
+}
+
+/// 预检歌单歌曲可用性与最高音质（供歌曲列表标注）。
+#[tauri::command]
+pub async fn preflight_playlist(
+    state: State<'_, AppState>,
+    id: u64,
+) -> Result<Vec<serde_json::Value>, String> {
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    let playlist = api.playlist_tracks(id).await.map_err(command_error)?;
+    let preflight = api
+        .preflight_tracks(&playlist.tracks)
+        .await
+        .map_err(command_error)?;
+    Ok(preflight
+        .into_iter()
+        .map(|entry| serde_json::to_value(entry).unwrap_or(serde_json::json!({})))
+        .collect())
+}
+
+/// 在系统文件管理器中显示某个文件/目录。
+#[tauri::command]
+pub fn show_in_folder(state: State<'_, AppState>, path: String) -> Result<(), String> {
+    let p = Path::new(&path);
+    if !p.exists() {
+        return Err(UiMessage::with_params("path_missing", vec![path]).to_json());
+    }
+    let _ = state;
+    #[cfg(windows)]
+    {
+        let mut cmd = std::process::Command::new("explorer");
+        cmd.arg("/select,");
+        if p.is_dir() {
+            // explorer /select, 对目录会退化为打开其父目录；直接打开该目录更符合预期。
+            cmd = std::process::Command::new("explorer");
+            cmd.arg(&path);
+        } else {
+            cmd.arg(&path);
+        }
+        cmd.spawn()
+            .map_err(|_| UiMessage::new("explorer_failed").to_json())?;
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        return Err(UiMessage::new("unsupported_platform").to_json());
+    }
+}
+
+/// 检查 GitHub Releases 是否有新版本（静默失败）。
+#[tauri::command]
+pub async fn check_for_update(state: State<'_, AppState>) -> Result<Option<String>, String> {
+    let _ = state;
+    let current = env!("CARGO_PKG_VERSION");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .map_err(command_error)?;
+    let url = "https://api.github.com/repos/muxinxy/music-auto-sync/releases/latest";
+    let response = client
+        .get(url)
+        .header("User-Agent", "MusicAutoSync")
+        .send()
+        .await
+        .map_err(|error| {
+            UiMessage::with_params("update_check_failed", vec![error.to_string()]).to_json()
+        })?;
+    let json: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|_| UiMessage::new("update_check_failed").to_json())?;
+    let latest = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
+    let latest_clean = latest.trim_start_matches('v');
+    let is_newer = latest_clean
+        .split('.')
+        .map(|part| part.parse::<u32>().unwrap_or(0))
+        .collect::<Vec<_>>()
+        .cmp(
+            &current
+                .split('.')
+                .map(|part| part.parse::<u32>().unwrap_or(0))
+                .collect::<Vec<_>>(),
+        )
+        == std::cmp::Ordering::Greater;
+    Ok((is_newer && !latest.is_empty()).then(|| latest.to_string()))
 }

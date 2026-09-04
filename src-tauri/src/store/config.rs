@@ -17,6 +17,18 @@ fn default_language() -> String {
     "zh-CN".into()
 }
 
+fn default_ua() -> String {
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36".into()
+}
+
+fn default_preflight() -> bool {
+    true
+}
+
+fn default_retry() -> usize {
+    3
+}
+
 fn default_download_source() -> String {
     "auto".into()
 }
@@ -34,6 +46,12 @@ pub struct Config {
     pub artist_separator: String,
     #[serde(default = "default_language")]
     pub language: String,
+    #[serde(default = "default_ua")]
+    pub ua: String,
+    #[serde(default = "default_preflight")]
+    pub preflight: bool,
+    #[serde(default = "default_retry")]
+    pub retry: usize,
     pub quality: String,
     #[serde(default = "default_download_source")]
     pub download_source: String,
@@ -88,6 +106,9 @@ impl Default for Config {
             filename_template: "{歌手} - {标题}".into(),
             artist_separator: "、".into(),
             language: "zh-CN".into(),
+            ua: default_ua(),
+            preflight: true,
+            retry: 3,
             quality: "exhigh".into(),
             download_source: "auto".into(),
             auto_sync_on_startup: true,

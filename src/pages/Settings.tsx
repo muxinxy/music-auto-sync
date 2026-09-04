@@ -32,6 +32,9 @@ const defaultConfig: Config = {
   filenameTemplate: "{歌手} - {标题}",
   artistSeparator: "、",
   language: "zh-CN",
+  ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  preflight: true,
+  retry: 3,
   quality: "exhigh",
   downloadSource: "auto",
   autoSyncOnStartup: true,
@@ -247,6 +250,15 @@ export default function SettingsPage() {
           </Form.Item>
           <Form.Item label={t("settings.labelConcurrency")} name="concurrency">
             <InputNumber min={1} max={5} />
+          </Form.Item>
+          <Form.Item label={t("settings.labelRetry")} name="retry">
+            <InputNumber min={0} max={5} />
+          </Form.Item>
+          <Form.Item name="preflight" valuePropName="checked" label={t("settings.cbPreflight")}>
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
+          </Form.Item>
+          <Form.Item label={t("settings.labelUa")} name="ua" tooltip={t("settings.uaTip")}>
+            <Input />
           </Form.Item>
           <Form.Item name="ncmConvert" valuePropName="checked">
             <Checkbox>{t("settings.cbNcm")}</Checkbox>

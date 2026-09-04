@@ -4,6 +4,24 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-09-05
+
+### Added
+
+- Pre-flight availability/quality check before downloading: song details (`/song/detail` privilege) are fetched in batch so the song table can show per-song downloadability and the best quality your account can get; no-right / grey / purchase / region-limited tracks are flagged before you download.
+- Concurrent downloads: tracks are downloaded in parallel up to the configured concurrency (semaphore limited) with batch pre-fetched URLs; each failed track is retried automatically (configurable count, exponential backoff).
+- Batch failures no longer abort the run: the download dialog collects failures and offers "retry failed only"; sync results can be expanded to show each failed track and the reason.
+- SMS verification-code login as an alternative to QR code login.
+- "Back up to a local directory": download all Liked songs or all Purchased songs into a chosen folder (not counted as synced for any playlist).
+- New "Clean removed files" action per playlist: files on disk that are no longer in the playlist are moved to quarantine.
+- Song rows show local-file state: synced / missing / size, plus "show in folder".
+- Silent update check against GitHub Releases on startup; a banner appears when a new version exists.
+- New settings: request User-Agent, enable pre-flight before download, retry count per track.
+
+### Changed
+
+- Song-detail preflight degrades gracefully when an API instance does not support it, without blocking sync.
+
 ## [0.4.0] - 2026-09-04
 
 ### Fixed

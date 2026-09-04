@@ -4,16 +4,18 @@ use reqwest::Client;
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    sync::atomic::Ordering,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
 };
 use tauri::{AppHandle, Emitter};
+use tokio::sync::Semaphore;
 use walkdir::WalkDir;
 
 use crate::{
-    api::{NeteaseApi, PlaylistTracks, Track},
+    api::{NeteaseApi, PlaylistTracks, Track, TrackAvailability},
     core::naming,
     error::UiMessage,
     store::{self, config::Config, database},
@@ -32,6 +34,15 @@ pub struct SyncProgress {
     pub message: UiMessage,
 }
 
+/// 单曲失败明细：包含曲目标识，便于前端展示“哪些歌失败、为什么、能否重试”。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncErrorDetail {
+    pub track_id: u64,
+    pub track_name: String,
+    pub message: UiMessage,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncReport {
@@ -44,6 +55,7 @@ pub struct SyncReport {
     pub failed: usize,
     pub skipped: usize,
     pub errors: Vec<UiMessage>,
+    pub error_details: Vec<SyncErrorDetail>,
     pub started_at: String,
     pub finished_at: String,
 }
@@ -156,6 +168,7 @@ async fn sync_one_inner(
         failed: 0,
         skipped: 0,
         errors: vec![],
+        error_details: vec![],
         started_at: now,
         finished_at: String::new(),
     };
@@ -174,11 +187,11 @@ async fn sync_one_inner(
         &api,
         &config,
         &playlist,
+        &paths.database_file,
         &root,
         folder_template,
         quality,
         artist_separator,
-        &mut conn,
         &paths.logs_dir,
         &mut report,
     )
@@ -216,64 +229,132 @@ async fn sync_one_inner(
     Ok(report)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn sync_tracks(
     app: Option<&AppHandle>,
     state: &AppState,
     api: &NeteaseApi,
     config: &Config,
     playlist: &PlaylistTracks,
+    db_file: &Path,
     root: &Path,
     folder_template: &str,
     quality: &str,
     artist_separator: &str,
-    conn: &mut rusqlite::Connection,
     logs_dir: &Path,
     report: &mut SyncReport,
 ) -> Result<()> {
-    let mut expected = HashSet::new();
     let overwrite = config
         .playlists
         .iter()
         .find(|setting| setting.id == playlist.id)
         .map(|setting| setting.overwrite)
         .unwrap_or(false);
+
+    // 并发下载：并发度取配置（>=1），由信号量限流；每个 worker 自带数据库连接，
+    // 写入互不阻塞（WAL + busy_timeout）。
+    let concurrency = config.concurrency.max(1);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+
+    // 预检：一次 /song/detail 批量拿到每首歌可下载性与最高音质，失败不阻塞同步。
+    let mut availability: HashMap<u64, TrackAvailability> = HashMap::new();
+    if config.preflight {
+        match api.preflight_tracks(&playlist.tracks).await {
+            Ok(list) => {
+                for entry in list {
+                    availability.insert(entry.id, entry);
+                }
+            }
+            Err(error) => tracing::warn!(%error, "song preflight skipped"),
+        }
+    }
+
+    // 批量预取直链（auto 源且非“优先下载接口”时才使用；失败则逐首兜底）。
+    let prefer_download_api = matches!(api.download_source(), "download" | "download-first");
+    let mut prewarmed: Option<HashMap<u64, crate::api::SongUrl>> = None;
+    if !prefer_download_api {
+        let pending_ids: Vec<u64> = playlist
+            .tracks
+            .iter()
+            .filter(|t| !availability.get(&t.id).is_some_and(|a| !a.downloadable))
+            .map(|t| t.id)
+            .collect();
+        match api.song_url_batch(&pending_ids, quality).await {
+            Ok(map) => prewarmed = Some(map),
+            Err(error) => tracing::warn!(%error, "batch url prewarm skipped"),
+        }
+    }
+
+    let mut handles = Vec::new();
+    let total = playlist.tracks.len();
     for (index, track) in playlist.tracks.iter().enumerate() {
         if state.cancel_requested.load(Ordering::SeqCst) {
-            return Err(anyhow!(UiMessage::new("sync_canceled")));
+            break;
         }
-        expected.insert(track.id);
-        emit_progress(
-            app,
-            playlist.id,
-            &playlist.name,
-            "phase_download",
-            index + 1,
-            playlist.tracks.len(),
-            UiMessage::with_params("track", vec![track.name.clone()]),
-        );
-        match sync_one_track(
-            api,
-            config,
-            playlist,
-            root,
-            folder_template,
-            quality,
-            artist_separator,
-            conn,
-            logs_dir,
-            track,
-            index + 1,
-            overwrite,
-        )
-        .await
-        {
+        let position = index + 1;
+        let availability = availability.get(&track.id).cloned();
+        let prewarmed_song = prewarmed
+            .as_ref()
+            .and_then(|map| map.get(&track.id))
+            .cloned();
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| anyhow!(UiMessage::new("sync_canceled")))?;
+        let app = app.cloned();
+        let api = api.clone();
+        let config = config.clone();
+        let playlist = playlist.clone();
+        let db_file = db_file.to_path_buf();
+        let root = root.to_path_buf();
+        let logs_dir = logs_dir.to_path_buf();
+        let folder_template = folder_template.to_owned();
+        let quality = quality.to_owned();
+        let artist_separator = artist_separator.to_owned();
+        let track = track.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            sync_one_track_worker(
+                app.as_ref(),
+                &api,
+                &config,
+                &playlist,
+                &db_file,
+                &root,
+                &folder_template,
+                &quality,
+                &artist_separator,
+                &logs_dir,
+                &track,
+                position,
+                total,
+                overwrite,
+                availability,
+                prewarmed_song,
+            )
+            .await
+        }));
+    }
+
+    for handle in handles {
+        let outcome = handle
+            .await
+            .map_err(|error| anyhow!(UiMessage::unknown(error)))?;
+        match outcome {
             TrackOutcome::Skipped => report.skipped += 1,
             TrackOutcome::Downloaded => report.added += 1,
-            TrackOutcome::Failed(message) => {
+            TrackOutcome::Failed(message, detail) => {
                 report.failed += 1;
                 report.errors.push(message);
+                if let Some(detail) = detail {
+                    report.error_details.push(detail);
+                }
             }
         }
+    }
+    if state.cancel_requested.load(Ordering::SeqCst) {
+        return Err(anyhow!(UiMessage::new("sync_canceled")));
     }
     Ok(())
 }
@@ -281,7 +362,72 @@ async fn sync_tracks(
 enum TrackOutcome {
     Skipped,
     Downloaded,
-    Failed(UiMessage),
+    Failed(UiMessage, Option<SyncErrorDetail>),
+}
+
+fn is_transient_download_error(error: &anyhow::Error) -> bool {
+    // 网络/超时/服务端瞬态错误值得重试；“文件过小”往往意味着版权/试听限制，不重试。
+    match error.downcast_ref::<UiMessage>() {
+        Some(message) => message.code != "download_small_file",
+        None => true,
+    }
+}
+
+async fn fetch_download_url_for_track(
+    api: &NeteaseApi,
+    track_id: u64,
+    quality: &str,
+    prewarmed: Option<crate::api::SongUrl>,
+) -> std::result::Result<(String, String), UiMessage> {
+    if let Some(song_url) = prewarmed {
+        if let Some(url) = song_url.url {
+            let extension = song_url.file_type.unwrap_or_else(|| "mp3".into());
+            return Ok((url, extension));
+        }
+    }
+    match fetch_download_url_with_retry(api, track_id, quality).await {
+        Ok(Some(download)) => Ok(download),
+        Ok(None) => Err(UiMessage::with_params("no_url", vec![track_id.to_string()])),
+        Err(error) => Err(UiMessage::with_params(
+            "song_url_failed",
+            vec![error.to_string()],
+        )),
+    }
+}
+
+async fn download_track_with_retry(url: &str, target: &Path, attempts: usize) -> Result<u64> {
+    let mut last_error = None;
+    for attempt in 0..attempts.max(1) {
+        match download_track(url, target).await {
+            Ok(bytes) => return Ok(bytes),
+            Err(error) if attempt + 1 < attempts.max(1) && is_transient_download_error(&error) => {
+                last_error = Some(error);
+                // 简单退避：0.6s / 1.2s / 2.4s…
+                tokio::time::sleep(Duration::from_millis(600 * 2u64.pow(attempt as u32))).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!(UiMessage::new("download_failed"))))
+}
+
+async fn fetch_download_url_with_retry(
+    api: &NeteaseApi,
+    track_id: u64,
+    quality: &str,
+) -> Result<Option<(String, String)>> {
+    let mut last_error = None;
+    for attempt in 0..2 {
+        match fetch_download_url(api, track_id, quality).await {
+            Ok(result) => return Ok(result),
+            Err(error) if attempt == 0 => {
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(800)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!(UiMessage::new("song_url_failed"))))
 }
 
 fn record_track_file(
@@ -325,19 +471,24 @@ async fn finalize_track(
     let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
 }
 
-async fn sync_one_track(
+#[allow(clippy::too_many_arguments)]
+async fn sync_one_track_worker(
+    app: Option<&AppHandle>,
     api: &NeteaseApi,
     config: &Config,
     playlist: &PlaylistTracks,
+    db_file: &Path,
     root: &Path,
     folder_template: &str,
     quality: &str,
     artist_separator: &str,
-    conn: &mut rusqlite::Connection,
     logs_dir: &Path,
     track: &Track,
     position: usize,
+    total: usize,
     overwrite: bool,
+    availability: Option<TrackAvailability>,
+    prewarmed: Option<crate::api::SongUrl>,
 ) -> TrackOutcome {
     let mut log_entry = store::track_log::TrackLogEntry::new(
         Some(playlist.id),
@@ -345,6 +496,39 @@ async fn sync_one_track(
         track.id,
         &track.name,
     );
+    let mut conn = match database::open(db_file) {
+        Ok(conn) => conn,
+        Err(error) => {
+            let message = UiMessage::with_params("download_failed", vec![error.to_string()]);
+            log_entry.outcome("failed", &message);
+            let _ = store::track_log::append(logs_dir, &log_entry);
+            return TrackOutcome::Failed(message, None);
+        }
+    };
+    conn.busy_timeout(std::time::Duration::from_secs(10))
+        .unwrap_or_default();
+
+    // 预检拦截：给出明确原因码（无版权 / 灰色 / 需购买 / 区域限制），不再发 URL 请求。
+    if let Some(availability) = &availability {
+        if !availability.downloadable {
+            let reason = availability
+                .reason
+                .clone()
+                .unwrap_or_else(|| "no_right".into());
+            let message = UiMessage::with_params(reason, vec![track.name.clone()]);
+            log_entry.outcome("failed", &message);
+            let _ = store::track_log::append(logs_dir, &log_entry);
+            return TrackOutcome::Failed(
+                message.clone(),
+                Some(SyncErrorDetail {
+                    track_id: track.id,
+                    track_name: track.name.clone(),
+                    message,
+                }),
+            );
+        }
+    }
+
     if !overwrite {
         let known_path: Option<String> = conn
             .query_row(
@@ -358,28 +542,31 @@ async fn sync_one_track(
             .as_deref()
             .is_some_and(|path| Path::new(path).is_file())
         {
-            let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
+            let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
             log_entry.outcome("skipped", &UiMessage::new("track_exists"));
             let _ = store::track_log::append(logs_dir, &log_entry);
             return TrackOutcome::Skipped;
         }
     }
 
-    let (download_url, extension) = match fetch_download_url(api, track.id, quality).await {
-        Ok(Some(download)) => download,
-        Ok(None) => {
-            let message = UiMessage::with_params("no_url", vec![track.name.clone()]);
-            log_entry.outcome("failed", &message);
-            let _ = store::track_log::append(logs_dir, &log_entry);
-            return TrackOutcome::Failed(message);
-        }
-        Err(error) => {
-            let message = UiMessage::with_params("song_url_failed", vec![error.to_string()]);
-            log_entry.outcome("failed", &message);
-            let _ = store::track_log::append(logs_dir, &log_entry);
-            return TrackOutcome::Failed(message);
-        }
-    };
+    // 优先用批量预取到的直链；没有再逐首请求（带重试）。
+    let (download_url, extension) =
+        match fetch_download_url_for_track(api, track.id, quality, prewarmed).await {
+            Ok(download) => download,
+            Err(message) => {
+                log_entry.outcome("failed", &message);
+                let _ = store::track_log::append(logs_dir, &log_entry);
+                return TrackOutcome::Failed(
+                    message.clone(),
+                    Some(SyncErrorDetail {
+                        track_id: track.id,
+                        track_name: track.name.clone(),
+                        message,
+                    }),
+                );
+            }
+        };
+
     let target = naming::track_path(
         root,
         folder_template,
@@ -393,28 +580,39 @@ async fn sync_one_track(
 
     if !overwrite && target.is_file() {
         // 本地已存在按当前模板命名的文件：登记为已同步并跳过下载，避免覆盖用户文件。
-        let _ = record_track_file(conn, playlist, track, &target, &extension);
+        let _ = record_track_file(&mut conn, playlist, track, &target, &extension);
         let _ = write_sidecar(&target, playlist.id, track.id);
-        let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
+        let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
         log_entry.outcome("skipped", &UiMessage::new("track_exists"));
         let _ = store::track_log::append(logs_dir, &log_entry);
         return TrackOutcome::Skipped;
     }
 
-    match download_track(&download_url, &target).await {
+    emit_progress(
+        app,
+        playlist.id,
+        &playlist.name,
+        "phase_download",
+        position,
+        total,
+        UiMessage::with_params("track", vec![track.name.clone()]),
+    );
+
+    match download_track_with_retry(&download_url, &target, config.retry).await {
         Ok(bytes) => {
-            finalize_track(
-                api,
-                playlist,
-                track,
-                position,
-                &target,
-                &extension,
-                config.write_lrc,
-                artist_separator,
-                conn,
-            )
-            .await;
+            if let Err(error) =
+                tags::write_basic_tags(&target, track, position, track.id, artist_separator)
+            {
+                tracing::warn!(%error, path = %target.display(), "metadata write failed");
+            }
+            if config.write_lrc {
+                if let Ok(Some(lyrics)) = api.lyric(track.id).await {
+                    let _ = fs::write(target.with_extension("lrc"), lyrics);
+                }
+            }
+            let _ = record_track_file(&mut conn, playlist, track, &target, &extension);
+            let _ = write_sidecar(&target, playlist.id, track.id);
+            let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
             log_entry.done(&target, bytes, quality);
             let _ = store::track_log::append(logs_dir, &log_entry);
             TrackOutcome::Downloaded
@@ -423,7 +621,14 @@ async fn sync_one_track(
             let message = UiMessage::with_params("download_failed", vec![error.to_string()]);
             log_entry.outcome("failed", &message);
             let _ = store::track_log::append(logs_dir, &log_entry);
-            TrackOutcome::Failed(message)
+            TrackOutcome::Failed(
+                message.clone(),
+                Some(SyncErrorDetail {
+                    track_id: track.id,
+                    track_name: track.name.clone(),
+                    message,
+                }),
+            )
         }
     }
 }
@@ -494,16 +699,17 @@ pub async fn download_song_with_options(
         );
     }
 
-    let (download_url, extension) = match fetch_download_url(&api, track.id, quality).await {
-        Ok(Some(download)) => download,
-        Ok(None) => return Err(UiMessage::with_params("no_url", vec![track.name.clone()])),
-        Err(error) => {
-            return Err(UiMessage::with_params(
-                "song_url_failed",
-                vec![error.to_string()],
-            ))
-        }
-    };
+    let (download_url, extension) =
+        match fetch_download_url_with_retry(&api, track.id, quality).await {
+            Ok(Some(download)) => download,
+            Ok(None) => return Err(UiMessage::with_params("no_url", vec![track.name.clone()])),
+            Err(error) => {
+                return Err(UiMessage::with_params(
+                    "song_url_failed",
+                    vec![error.to_string()],
+                ))
+            }
+        };
     let file_name = naming::apply_template(
         filename_template,
         &playlist.name,
@@ -549,7 +755,7 @@ pub async fn download_song_with_options(
         track.id,
         &track.name,
     );
-    match download_track(&download_url, &target).await {
+    match download_track_with_retry(&download_url, &target, config.retry).await {
         Ok(bytes) => {
             log_entry.done(&target, bytes, quality);
             let _ = store::track_log::append(&paths.logs_dir, &log_entry);
@@ -586,6 +792,223 @@ pub async fn download_song_with_options(
         tracing::warn!(%error, path = %target.display(), "metadata write failed");
     }
     Ok(target.to_string_lossy().into_owned())
+}
+
+/// 手动清理：把“本地已下载、但已不在歌单里”的文件隔离到 .quarantine。
+/// 复用 quarantine_removed 的隔离逻辑（移动文件 + 写库），不触发下载/转换。
+#[allow(clippy::too_many_arguments)]
+pub async fn prune_playlist_removed(
+    state: &AppState,
+    playlist_id: u64,
+) -> Result<usize, UiMessage> {
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file).map_err(UiMessage::unknown)?;
+    let root = config
+        .music_root
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| UiMessage::new("music_root_required"))?;
+    let api = NeteaseApi::from_config(&config).map_err(UiMessage::unknown)?;
+    let playlist = api.playlist_tracks(playlist_id).await.map_err(|error| {
+        UiMessage::with_params("playlist_fetch_failed", vec![error.to_string()])
+    })?;
+    let setting = config.playlists.iter().find(|p| p.id == playlist_id);
+    let folder_template = setting
+        .and_then(|s| s.folder_override.as_deref())
+        .unwrap_or(&config.folder_template);
+    let artist_separator = &config.artist_separator;
+    let mut conn = database::open(&paths.database_file).map_err(UiMessage::unknown)?;
+    let mut report = SyncReport {
+        playlist_id,
+        playlist_name: playlist.name.clone(),
+        added: 0,
+        updated: 0,
+        quarantined: 0,
+        ncm_converted: 0,
+        failed: 0,
+        skipped: 0,
+        errors: vec![],
+        error_details: vec![],
+        started_at: database::now(),
+        finished_at: database::now(),
+    };
+    quarantine_removed(
+        None,
+        &playlist,
+        &root,
+        folder_template,
+        artist_separator,
+        &mut conn,
+        &mut report,
+    )
+    .map_err(UiMessage::unknown)?;
+    Ok(report.quarantined)
+}
+
+/// 把任意歌曲 id 列表批量下载到 target_dir（用于“我喜欢/已购”等非歌单歌单备份）。
+/// 不登记 track_files，也不标记为某个歌单的已同步。
+pub async fn download_track_ids(
+    app: Option<&AppHandle>,
+    state: &AppState,
+    target_dir: &Path,
+    label: &str,
+    quality: Option<&str>,
+    write_lrc: Option<bool>,
+    overwrite: bool,
+    tracks: Vec<Track>,
+) -> Result<Vec<BatchItemResult>, UiMessage> {
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file).map_err(UiMessage::unknown)?;
+    if let Some(app) = app {
+        let _ = app.emit("sync://state", true);
+    }
+    let api = NeteaseApi::from_config(&config).map_err(UiMessage::unknown)?;
+    let quality = quality.unwrap_or(&config.quality);
+    let write_lrc = write_lrc.unwrap_or(config.write_lrc);
+    let artist_separator = &config.artist_separator;
+    let concurrency = config.concurrency.max(1);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
+    let results = Arc::new(std::sync::Mutex::new(Vec::with_capacity(tracks.len())));
+    let destination = target_dir.join(naming::sanitize_component(label));
+    let label = label.to_owned();
+
+    // 批量预取直链：一次请求拿多首 url，避免逐首再请求；拿不到的首再走兜底。
+    let ids: Vec<u64> = tracks.iter().map(|t| t.id).collect();
+    let prewarmed = api.song_url_batch(&ids, &quality).await.ok();
+
+    let mut handles = Vec::new();
+    for (index, track) in tracks.into_iter().enumerate() {
+        let permit = semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| UiMessage::new("sync_canceled"))?;
+        let api = api.clone();
+        let destination = destination.clone();
+        let quality = quality.to_owned();
+        let artist_separator = artist_separator.to_owned();
+        let results = results.clone();
+        let file_name_template = config.filename_template.clone();
+        let label = label.clone();
+        let prewarmed = prewarmed.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = permit;
+            let file_name = naming::apply_template(
+                &file_name_template,
+                &label,
+                &track,
+                index + 1,
+                &artist_separator,
+            );
+            let cached_url = prewarmed
+                .as_ref()
+                .and_then(|map| map.get(&track.id))
+                .cloned();
+            let outcome = match cached_url {
+                Some(song_url) if song_url.url.is_some() => {
+                    let extension = song_url.file_type.clone().unwrap_or_else(|| "mp3".into());
+                    let url = song_url.url.clone().unwrap();
+                    let target = destination.join(format!("{file_name}.{extension}"));
+                    if target.exists() && !overwrite {
+                        BatchItemOutcome::Skipped
+                    } else {
+                        match download_track_with_retry(&url, &target, 3).await {
+                            Ok(_) => {
+                                let _ = tags::write_basic_tags(
+                                    &target,
+                                    &track,
+                                    index + 1,
+                                    track.id,
+                                    &artist_separator,
+                                );
+                                if write_lrc {
+                                    if let Ok(Some(lyrics)) = api.lyric(track.id).await {
+                                        let _ = fs::write(target.with_extension("lrc"), lyrics);
+                                    }
+                                }
+                                BatchItemOutcome::Downloaded(target.to_string_lossy().into_owned())
+                            }
+                            Err(error) => BatchItemOutcome::Failed(UiMessage::with_params(
+                                "download_failed",
+                                vec![error.to_string()],
+                            )),
+                        }
+                    }
+                }
+                _ => match fetch_download_url_with_retry(&api, track.id, &quality).await {
+                    Ok(Some((download_url, extension))) => {
+                        let target = destination.join(format!("{file_name}.{extension}"));
+                        if target.exists() && !overwrite {
+                            BatchItemOutcome::Skipped
+                        } else {
+                            match download_track_with_retry(&download_url, &target, 3).await {
+                                Ok(_bytes) => {
+                                    let _ = tags::write_basic_tags(
+                                        &target,
+                                        &track,
+                                        index + 1,
+                                        track.id,
+                                        &artist_separator,
+                                    );
+                                    if write_lrc {
+                                        if let Ok(Some(lyrics)) = api.lyric(track.id).await {
+                                            let _ = fs::write(target.with_extension("lrc"), lyrics);
+                                        }
+                                    }
+                                    BatchItemOutcome::Downloaded(
+                                        target.to_string_lossy().into_owned(),
+                                    )
+                                }
+                                Err(error) => BatchItemOutcome::Failed(UiMessage::with_params(
+                                    "download_failed",
+                                    vec![error.to_string()],
+                                )),
+                            }
+                        }
+                    }
+                    Ok(None) => BatchItemOutcome::Failed(UiMessage::with_params(
+                        "no_url",
+                        vec![track.name.clone()],
+                    )),
+                    Err(error) => BatchItemOutcome::Failed(UiMessage::with_params(
+                        "song_url_failed",
+                        vec![error.to_string()],
+                    )),
+                },
+            };
+            results.lock().unwrap().push(BatchItemResult {
+                track_id: track.id,
+                track_name: track.name.clone(),
+                outcome,
+            });
+        }));
+    }
+    for handle in handles {
+        let _ = handle.await;
+    }
+    if let Some(app) = app {
+        let _ = app.emit("sync://state", false);
+    }
+    Ok(Arc::try_unwrap(results)
+        .map_err(|_| UiMessage::new("unknown"))?
+        .into_inner()
+        .unwrap())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchItemResult {
+    pub track_id: u64,
+    pub track_name: String,
+    pub outcome: BatchItemOutcome,
+}
+
+#[derive(serde::Serialize)]
+#[serde(tag = "status", content = "data", rename_all = "camelCase")]
+pub enum BatchItemOutcome {
+    Downloaded(String),
+    Skipped,
+    Failed(UiMessage),
 }
 
 async fn download_track(url: &str, target: &Path) -> Result<u64> {

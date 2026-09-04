@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Layout, Menu, Tag, Typography, App as AntApp } from "antd";
+import { Alert, Button, Layout, Menu, Tag, Typography, App as AntApp } from "antd";
 import {
   CloudSyncOutlined,
   DeleteOutlined,
@@ -36,6 +36,7 @@ export default function App() {
   const [login, setLogin] = useState<LoginStatus | null>(null);
   const [sync, setSync] = useState<SyncEventState>({ running: false });
   const [appReady, setAppReady] = useState(false);
+  const [updateVersion, setUpdateVersion] = useState<string | null>(null);
 
   const applyLanguage = useCallback(async () => {
     try {
@@ -63,6 +64,10 @@ export default function App() {
     refreshLogin().then((status) => {
       if (status?.loggedIn) setPage((prev) => (prev === "login" ? "playlists" : prev));
     }).finally(() => setAppReady(true));
+
+    api.checkForUpdate().then((version) => {
+      if (version) setUpdateVersion(version);
+    }).catch(() => {});
 
     const unlistenProgress = listen<SyncProgress>("sync://progress", (e) => {
       setSync((s) => ({ ...s, progress: e.payload }));
@@ -144,6 +149,29 @@ export default function App() {
           </Typography.Text>
         </Header>
         <Content style={{ overflow: "auto", background: "#f5f5f5" }}>
+          {updateVersion && (
+            <Alert
+              banner
+              type="info"
+              showIcon
+              message={t("playlists.updateAvailable", { version: updateVersion })}
+              action={
+                <Button
+                  size="small"
+                  type="link"
+                  onClick={() => {
+                    const url = `https://github.com/muxinxy/music-auto-sync/releases/tag/v${updateVersion}`;
+                    window.open(url, "_blank");
+                  }}
+                >
+                  {t("playlists.updateGo")}
+                </Button>
+              }
+              closable
+              onClose={() => setUpdateVersion(null)}
+              style={{ borderRadius: 0 }}
+            />
+          )}
           {!appReady ? null : page === "login" ? (
             <LoginPage login={login} onLogin={refreshLogin} onLogout={onLogout} />
           ) : page === "playlists" ? (

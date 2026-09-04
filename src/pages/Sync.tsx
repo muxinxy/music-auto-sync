@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { Card, List, Progress, Tag, Typography, message as antMessage } from "antd";
+import { Button, Card, List, Progress, Tag, Typography, message as antMessage } from "antd";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { translateUi } from "../errors";
-import type { SyncProgress, SyncReport, UiMessage } from "../types";
+import type { SyncErrorDetail, SyncProgress, SyncReport, UiMessage } from "../types";
 
 interface LogEntry {
   id: number;
@@ -30,6 +30,7 @@ export default function SyncPage() {
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [reports, setReports] = useState<SyncReport[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [expanded, setExpanded] = useState<string | null>(null);
 
   const loadLogs = useCallback(async () => {
     try {
@@ -86,25 +87,63 @@ export default function SyncPage() {
           <List
             size="small"
             dataSource={reports}
-            renderItem={(r) => (
-              <List.Item>
-                <Typography.Text>
-                  {t("syncPage.resultLine", {
-                    name: r.playlistName,
-                    added: r.added,
-                    converted: r.ncmConverted,
-                    quarantined: r.quarantined,
-                    failed: r.failed,
-                  })}
-                  {r.errors.length > 0 && (
-                    <Typography.Text type="danger">（{translateUi(r.errors[0])}）</Typography.Text>
-                  )}
-                </Typography.Text>
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {r.finishedAt}
-                </Typography.Text>
-              </List.Item>
-            )}
+            renderItem={(r) => {
+              const details: SyncErrorDetail[] = (r.errorDetails ?? []).map((d) => ({
+                ...d,
+                message: d.message,
+              }));
+              const hasDetails = details.length > 0;
+              return (
+                <List.Item
+                  actions={[
+                    hasDetails ? (
+                      <Button
+                        key="view"
+                        size="small"
+                        type="link"
+                        onClick={() => {
+                          setExpanded(expanded === r.startedAt ? null : r.startedAt);
+                        }}
+                      >
+                        {t("syncPage.viewDetails", { count: r.failed })}
+                      </Button>
+                    ) : null,
+                  ]}
+                >
+                  <List.Item.Meta
+                    title={
+                      <Typography.Text>
+                        {t("syncPage.resultLine", {
+                          name: r.playlistName,
+                          added: r.added,
+                          converted: r.ncmConverted,
+                          quarantined: r.quarantined,
+                          failed: r.failed,
+                        })}
+                      </Typography.Text>
+                    }
+                    description={
+                      expanded === r.startedAt && hasDetails ? (
+                        <List
+                          size="small"
+                          dataSource={details}
+                          renderItem={(d) => (
+                            <List.Item style={{ border: "none", padding: "2px 0" }}>
+                              <Typography.Text type="danger" style={{ fontSize: 12 }}>
+                                {d.trackName}：{translateUi(d.message)}
+                              </Typography.Text>
+                            </List.Item>
+                          )}
+                        />
+                      ) : undefined
+                    }
+                  />
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {r.finishedAt}
+                  </Typography.Text>
+                </List.Item>
+              );
+            }}
           />
         </Card>
       )}

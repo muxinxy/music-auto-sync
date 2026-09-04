@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, sync::atomic::AtomicBool};
+use std::{fs, path::PathBuf, sync::atomic::AtomicBool, sync::Arc};
 
 use crate::{
     api::NeteaseApi,
@@ -27,7 +27,7 @@ fn build_state() -> Result<AppState, String> {
     Ok(AppState {
         paths: store::AppPaths::new(paths),
         sync_running: AtomicBool::new(false),
-        cancel_requested: AtomicBool::new(false),
+        cancel_requested: Arc::new(AtomicBool::new(false)),
     })
 }
 

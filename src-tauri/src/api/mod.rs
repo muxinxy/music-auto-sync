@@ -10,10 +10,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+use crate::error::UiMessage;
 use crate::store::config::Config;
-
-const API_USER_AGENT: &str =
-    "MusicAutoSync/0.1 (Windows; +https://github.com/muxinxy/music-auto-sync)";
 
 #[derive(Clone)]
 pub struct NeteaseApi {
@@ -108,6 +106,29 @@ pub struct PlaylistTracks {
 pub struct SongUrl {
     pub url: Option<String>,
     pub file_type: Option<String>,
+    /// 服务端实际返回的音质等级（/song/url/v1 的 level 字段）。
+    pub level: Option<String>,
+    /// 服务端返回的文件大小（字节），可用于识别试听片段。
+    pub size: Option<u64>,
+}
+
+/// 单曲可下载性预检结果（来自 /song/detail 的 privilege 字段）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TrackAvailability {
+    pub id: u64,
+    /// 当前账号是否可以下载该歌曲（dlLevel 非空且 st >= 0）。
+    pub downloadable: bool,
+    /// 当前账号允许下载的最高音质（privilege.dlLevel），如 lossless / exhigh。
+    pub download_level: Option<String>,
+    /// 当前账号允许试听的最高音质（privilege.plLevel）。
+    pub play_level: Option<String>,
+    /// fee：0 免费、1 VIP、4 购买专辑、8 低音质可播。
+    pub fee: Option<i64>,
+    /// 灰色歌曲（st < 0）。
+    pub locked: bool,
+    /// 不可下载/不可用的原因码（no_right / gray / region / purchased / none）。
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -201,7 +222,7 @@ impl NeteaseApi {
 
         let mut client = Client::builder()
             .default_headers(headers)
-            .user_agent(API_USER_AGENT)
+            .user_agent(config.ua.clone())
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(10))
             .timeout(Duration::from_secs(30));
@@ -558,6 +579,13 @@ impl NeteaseApi {
                 .and_then(|item| item.get("type"))
                 .and_then(Value::as_str)
                 .map(str::to_owned),
+            level: data
+                .and_then(|item| item.get("level"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            size: data
+                .and_then(|item| item.get("size"))
+                .and_then(Value::as_u64),
         })
     }
 
@@ -567,6 +595,313 @@ impl NeteaseApi {
             .pointer("/lrc/lyric")
             .and_then(Value::as_str)
             .map(str::to_owned))
+    }
+
+    /// 批量获取歌曲详情（支持逗号分隔多个 id，一次最多 ~100 个）。
+    /// 返回 id -> detail(含 privilege 音质/版权信息)。
+    pub async fn song_detail_batch(&self, ids: &[u64]) -> Result<HashMap<u64, serde_json::Value>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let joined = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(",");
+        let (json, _) = self.get("/song/detail", &[("ids", joined)]).await?;
+        let mut out = HashMap::new();
+        if let Some(songs) = json.get("songs").and_then(Value::as_array) {
+            for song in songs {
+                if let Some(id) = song.get("id").and_then(Value::as_u64) {
+                    out.insert(id, song.clone());
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// 基于 /song/detail 的 privilege 信息做可下载性/最高音质预检（不依赖付费探测）。
+    pub async fn preflight_tracks(&self, tracks: &[Track]) -> Result<Vec<TrackAvailability>> {
+        if tracks.is_empty() {
+            return Ok(vec![]);
+        }
+        let ids: Vec<u64> = tracks.iter().map(|t| t.id).collect();
+        let details = self.song_detail_batch(&ids).await?;
+        let mut out = Vec::with_capacity(ids.len());
+        for track in tracks {
+            let Some(detail) = details.get(&track.id) else {
+                out.push(TrackAvailability {
+                    id: track.id,
+                    downloadable: true,
+                    download_level: None,
+                    play_level: None,
+                    fee: None,
+                    locked: false,
+                    reason: None,
+                });
+                continue;
+            };
+            let fee = detail.get("fee").and_then(Value::as_i64);
+            let privilege = detail.get("privilege");
+            let st = privilege
+                .and_then(|p| p.get("st"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let locked = st < 0;
+            let download_level = privilege
+                .and_then(|p| p.get("dlLevel"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|s| !s.is_empty());
+            let play_level = privilege
+                .and_then(|p| p.get("plLevel"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|s| !s.is_empty());
+            let toast = privilege
+                .and_then(|p| p.get("toast"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let reason = if locked {
+                if toast {
+                    Some("region".into())
+                } else {
+                    Some("gray".into())
+                }
+            } else if fee == Some(4) && download_level.is_none() {
+                Some("purchased".into())
+            } else if download_level.is_none() && fee == Some(1) {
+                Some("no_right".into())
+            } else {
+                None
+            };
+            out.push(TrackAvailability {
+                id: track.id,
+                downloadable: !locked && !toast && (fee != Some(4) || download_level.is_some()),
+                download_level,
+                play_level,
+                fee,
+                locked,
+                reason,
+            });
+        }
+        Ok(out)
+    }
+
+    /// 批量获取直链（/song/url/v1 一次多 id）。服务端对“个别 id 无版权”会整组
+    /// 返回空 url，因此拿不到地址的 id 再按音质链逐个请求兜底。
+    pub async fn song_url_batch(
+        &self,
+        ids: &[u64],
+        quality: &str,
+    ) -> Result<HashMap<u64, SongUrl>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut result = HashMap::new();
+        // 每批最多 60 个 id，避免 URL 过长。
+        for chunk in ids.chunks(60) {
+            let joined = chunk
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let (json, _) = self
+                .get(
+                    "/song/url/v1",
+                    &[("id", joined), ("level", quality.to_owned())],
+                )
+                .await?;
+            if let Some(data) = json.get("data").and_then(Value::as_array) {
+                for item in data {
+                    let Some(id) = item.get("id").and_then(Value::as_u64) else {
+                        continue;
+                    };
+                    let url = item.get("url").and_then(Value::as_str).map(str::to_owned);
+                    if let Some(url) = url {
+                        result.insert(
+                            id,
+                            SongUrl {
+                                url: Some(url.replace("http://", "https://")),
+                                file_type: item
+                                    .get("type")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned),
+                                level: item.get("level").and_then(Value::as_str).map(str::to_owned),
+                                size: item.get("size").and_then(Value::as_u64),
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        // 兜底：批量整体失败 / 空地址的 id，按音质链逐个请求。
+        let attempts: Vec<String> = quality_fallback_chain(quality)
+            .iter()
+            .map(|level| (*level).to_owned())
+            .collect();
+        for id in ids {
+            if result.contains_key(id) {
+                continue;
+            }
+            for level in &attempts {
+                if let Ok(song_url) = self.song_url(*id, level).await {
+                    if let Some(url) = song_url.url.clone() {
+                        result.insert(
+                            *id,
+                            SongUrl {
+                                url: Some(url.replace("http://", "https://")),
+                                file_type: song_url.file_type,
+                                level: song_url.level,
+                                size: song_url.size,
+                            },
+                        );
+                        break;
+                    }
+                }
+            }
+            if !result.contains_key(id) {
+                if let Some((url, format)) = self.song_download_url_candidate(*id).await {
+                    result.insert(
+                        *id,
+                        SongUrl {
+                            url: Some(url.replace("http://", "https://")),
+                            file_type: Some(format),
+                            level: None,
+                            size: None,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// 获取当前账号“我喜欢”的歌曲 id 列表。
+    pub async fn liked_song_ids(&self, user_id: u64) -> Result<Vec<u64>> {
+        let (json, _) = self
+            .get("/likelist", &[("uid", user_id.to_string())])
+            .await?;
+        Ok(json
+            .get("ids")
+            .and_then(Value::as_array)
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(Value::as_u64)
+            .collect())
+    }
+
+    /// 获取已购买/已下载（单曲）歌曲列表（分页拉全）。
+    pub async fn purchased_songs(&self) -> Result<Vec<u64>> {
+        let mut ids = Vec::new();
+        let mut offset = 0i64;
+        loop {
+            let (json, _) = self
+                .get(
+                    "/song/purchased",
+                    &[("limit", "200".into()), ("offset", offset.to_string())],
+                )
+                .await?;
+            let page: Vec<u64> = json
+                .get("data")
+                .and_then(Value::as_array)
+                .unwrap_or(&vec![])
+                .iter()
+                .filter_map(|item| {
+                    item.get("id").and_then(Value::as_u64).or_else(|| {
+                        item.get("song")
+                            .and_then(|s| s.get("id"))
+                            .and_then(Value::as_u64)
+                    })
+                })
+                .collect();
+            let count = page.len();
+            ids.extend(page);
+            if count < 200 {
+                break;
+            }
+            offset += count as i64;
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// 发送手机验证码。
+    pub async fn send_captcha(&self, phone: &str, ctcode: &str) -> Result<()> {
+        let (json, _) = self
+            .get(
+                "/captcha/sent",
+                &[
+                    ("phone", phone.to_owned()),
+                    ("ctcode", ctcode.to_owned()),
+                    ("timestamp", cache_buster()),
+                ],
+            )
+            .await?;
+        ensure_success_code(&json)?;
+        Ok(())
+    }
+
+    /// 校验验证码（可选步骤，用于把“发送验证码”到“验证码登录”串起来）。
+    pub async fn verify_captcha(&self, phone: &str, captcha: &str) -> Result<bool> {
+        let (json, _) = self
+            .get(
+                "/captcha/verify",
+                &[
+                    ("phone", phone.to_owned()),
+                    ("captcha", captcha.to_owned()),
+                    ("ctcode", "86".into()),
+                    ("timestamp", cache_buster()),
+                ],
+            )
+            .await?;
+        Ok(json.get("data").and_then(Value::as_bool).unwrap_or(false))
+    }
+
+    /// 验证码登录（优先于密码，避免密码风险）。
+    pub async fn login_cellphone(
+        &self,
+        phone: &str,
+        captcha: &str,
+    ) -> Result<(String, Option<LoginStatus>)> {
+        let (json, set_cookie, meta) = self
+            .get_value(
+                "/login/cellphone",
+                &[
+                    ("phone", phone.to_owned()),
+                    ("captcha", captcha.to_owned()),
+                    ("ctcode", "86".into()),
+                    ("timestamp", cache_buster()),
+                ],
+            )
+            .await
+            .map_err(anyhow::Error::new)?;
+        let code = json.get("code").and_then(Value::as_i64).unwrap_or(200);
+        if code != 200 {
+            return Err(anyhow::Error::new(ApiCallError {
+                class: "api_business",
+                meta,
+            }));
+        }
+        let cookie = json
+            .get("cookie")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(set_cookie)
+            .ok_or_else(|| anyhow!(UiMessage::new("cookie_missing")))?;
+        let profile = json.get("profile");
+        let status = LoginStatus {
+            logged_in: true,
+            nickname: profile
+                .and_then(|p| p.get("nickname"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            user_id: profile
+                .and_then(|p| p.get("userId"))
+                .and_then(Value::as_u64),
+            avatar_url: profile
+                .and_then(|p| p.get("avatarUrl"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+        Ok((cookie, Some(status)))
     }
 
     /// 当 /song/url/v1 拿不到地址时的兜底候选：依次尝试
@@ -590,6 +925,16 @@ impl NeteaseApi {
             }
         }
         None
+    }
+}
+
+pub(crate) fn quality_fallback_chain(quality: &str) -> &'static [&'static str] {
+    match quality {
+        "hires" => &["hires", "lossless", "exhigh", "higher", "standard"],
+        "lossless" => &["lossless", "exhigh", "higher", "standard"],
+        "exhigh" => &["exhigh", "higher", "standard"],
+        "higher" => &["higher", "standard"],
+        _ => &["standard"],
     }
 }
 
