@@ -137,3 +137,76 @@ fn unique_path(mut path: PathBuf) -> PathBuf {
     }
     path
 }
+
+/// 单个 .ncm 转换的结果。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NcmConvertItemResult {
+    pub source: String,
+    pub output: Option<String>,
+    pub status: String, // converted | skipped | failed
+    pub error: Option<String>,
+}
+
+/// 把单个 .ncm 文件转换到其同目录：写 `.ncm.converted.json` 标记；keep_source=false 时删源；
+/// overwrite=true 时即使已有标记也重转。返回结构化结果（不抛错）。
+pub fn convert_file_with_marker(
+    input: &Path,
+    keep_source: bool,
+    overwrite: bool,
+) -> NcmConvertItemResult {
+    let source = input.to_string_lossy().into_owned();
+    let marker = input.with_extension("ncm.converted.json");
+    if marker.exists() && !overwrite {
+        return NcmConvertItemResult {
+            source,
+            output: None,
+            status: "skipped".into(),
+            error: None,
+        };
+    }
+    let output_dir = match input.parent() {
+        Some(dir) => dir.to_path_buf(),
+        None => {
+            return NcmConvertItemResult {
+                source,
+                output: None,
+                status: "failed".into(),
+                error: Some("no parent directory".into()),
+            };
+        }
+    };
+    match convert(input, &output_dir) {
+        Ok(output) => {
+            let marker_json = serde_json::json!({
+                "source": input.to_string_lossy(),
+                "output": output.path.to_string_lossy(),
+                "convertedAt": chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string(),
+                "format": output.metadata.format,
+            });
+            if let Err(error) = fs::write(&marker, serde_json::to_vec_pretty(&marker_json).unwrap_or_default()) {
+                return NcmConvertItemResult {
+                    source,
+                    output: Some(output.path.to_string_lossy().into_owned()),
+                    status: "converted".into(),
+                    error: Some(format!("marker write failed: {error}")),
+                };
+            }
+            if !keep_source && input.is_file() {
+                let _ = fs::remove_file(input);
+            }
+            NcmConvertItemResult {
+                source,
+                output: Some(output.path.to_string_lossy().into_owned()),
+                status: "converted".into(),
+                error: None,
+            }
+        }
+        Err(error) => NcmConvertItemResult {
+            source,
+            output: None,
+            status: "failed".into(),
+            error: Some(error.to_string()),
+        },
+    }
+}

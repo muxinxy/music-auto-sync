@@ -20,7 +20,7 @@ pub fn start(app: AppHandle) {
             sleep(Duration::from_secs(3)).await;
             let state = app.state::<AppState>();
             if !state.sync_running.load(Ordering::SeqCst) {
-                if let Err(error) = sync::sync_enabled(&app, &state).await {
+                if let Err(error) = sync::sync_enabled_with_source(&app, &state, "auto").await {
                     tracing::warn!(%error, "startup synchronization failed");
                 }
             }
@@ -36,7 +36,7 @@ pub fn start(app: AppHandle) {
                 if state.sync_running.load(Ordering::SeqCst) {
                     continue;
                 }
-                if let Err(error) = sync::sync_enabled(&app, &state).await {
+                if let Err(error) = sync::sync_enabled_with_source(&app, &state, "scheduled").await {
                     tracing::warn!(%error, "scheduled synchronization failed");
                 }
             }

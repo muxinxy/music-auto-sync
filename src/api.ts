@@ -1,14 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  AccountStats,
   AppInfo,
   BatchItemResult,
   Config,
+  DeletedLogEntry,
+  LocalStats,
   LoginStatus,
+  NcmConvertReport,
+  PlaylistHistoryEntry,
   PlaylistInfo,
   PlaylistSongsResult,
   QuarantineItem,
   QrCheckResult,
   SingleDownloadOptions,
+  SyncChangeEntry,
   SyncReport,
   TrackAvailability,
 } from "./types";
@@ -48,6 +54,10 @@ export const api = {
   syncPlaylist: (id: number) => invoke<SyncReport>("sync_playlist", { id }),
   syncAll: () => invoke<SyncReport[]>("sync_all"),
   cancelSync: () => invoke<boolean>("cancel_sync"),
+  pauseSync: () => invoke<boolean>("pause_sync"),
+  resumeSync: () => invoke<boolean>("resume_sync"),
+  getSyncControl: () =>
+    invoke<{ running: boolean; paused: boolean }>("get_sync_control"),
   manualPrune: (id: number) => invoke<number>("manual_prune", { id }),
 
   getSyncLogs: (limit: number) =>
@@ -80,4 +90,41 @@ export const api = {
     invoke<TrackAvailability[]>("preflight_playlist", { id }),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   checkForUpdate: () => invoke<string | null>("check_for_update"),
+  setPlaylistSyncPolicy: (
+    id: number,
+    mode: string | null,
+    uploadManual: boolean | null
+  ) => invoke<void>("set_playlist_sync_policy", { id, mode, uploadManual }),
+  getPlaylistSettings: (id: number) =>
+    invoke<{
+      playlistId: number;
+      modeOverride: string | null;
+      uploadManual: boolean | null;
+      globalMode: string;
+      globalUploadManual: boolean;
+    }>("get_playlist_settings", { id }),
+
+  getAccountStats: () => invoke<AccountStats>("get_account_stats"),
+  getLocalStats: () => invoke<LocalStats>("get_local_stats"),
+
+  getSyncChanges: (limit: number) =>
+    invoke<SyncChangeEntry[]>("get_sync_changes", { limit }),
+  getDeletedLog: (limit: number) =>
+    invoke<DeletedLogEntry[]>("get_deleted_log", { limit }),
+  getPlaylistHistory: (playlistId: number, limit: number) =>
+    invoke<PlaylistHistoryEntry[]>("get_playlist_history", { playlistId, limit }),
+  restoreDeletedItem: (id: number) => invoke<string>("restore_deleted_item", { id }),
+  restorePlaylistSnapshot: (playlistId: number, historyId: number) =>
+    invoke<number>("restore_playlist_snapshot_cmd", { playlistId, historyId }),
+  previewPlaylistRestore: (playlistId: number, historyId: number) =>
+    invoke<{ historyId: number; toAdd: Record<string, unknown>[]; toRemove: Record<string, unknown>[] }>(
+      "preview_playlist_restore_cmd",
+      { playlistId, historyId }
+    ),
+  clearSyncHistory: (kind: "logs" | "changes" | "deleted" | "history") =>
+    invoke<number>("clear_sync_history_cmd", { kind }),
+
+  convertNcmManual: (paths: string[], keepSource: boolean, overwrite: boolean) =>
+    invoke<NcmConvertReport>("convert_ncm_manual", { paths, keepSource, overwrite }),
+  setAutoLaunch: (enabled: boolean) => invoke<void>("set_auto_launch", { enabled }),
 };

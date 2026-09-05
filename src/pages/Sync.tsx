@@ -1,10 +1,34 @@
 import { useCallback, useEffect, useState } from "react";
-import { Button, Card, List, Progress, Tag, Typography, message as antMessage } from "antd";
+import {
+  Button,
+  Card,
+  Collapse,
+  Input,
+  List,
+  Popconfirm,
+  Progress,
+  Select,
+  Space,
+  Table,
+  Tag,
+  Typography,
+  message as antMessage,
+} from "antd";
+import type { ColumnsType } from "antd/es/table";
+import { RestOutlined, UndoOutlined } from "@ant-design/icons";
 import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
+import i18n from "../i18n";
 import { api } from "../api";
-import { translateUi } from "../errors";
-import type { SyncErrorDetail, SyncProgress, SyncReport, UiMessage } from "../types";
+import { formatError, translateUi } from "../errors";
+import type {
+  DeletedLogEntry,
+  SyncChangeEntry,
+  SyncErrorDetail,
+  SyncProgress,
+  SyncReport,
+  UiMessage,
+} from "../types";
 
 interface LogEntry {
   id: number;
@@ -25,33 +49,84 @@ function renderMessage(raw: string): string {
   return raw;
 }
 
+function actionLabel(action: string): string {
+  const map: Record<string, string> = {
+    added_local: "syncPage.action.addedLocal",
+    quarantined_local: "syncPage.action.quarantinedLocal",
+    added_playlist: "syncPage.action.addedPlaylist",
+    removed_from_playlist: "syncPage.action.removedFromPlaylist",
+    failed: "syncPage.action.failed",
+  };
+  return map[action] ?? action;
+}
+
 export default function SyncPage() {
   const { t } = useTranslation();
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [reports, setReports] = useState<SyncReport[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [changes, setChanges] = useState<SyncChangeEntry[]>([]);
+  const [deleted, setDeleted] = useState<DeletedLogEntry[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
+  const [changeFilter, setChangeFilter] = useState("");
+  const [changeAction, setChangeAction] = useState<string>("");
+  const [logFilter, setLogFilter] = useState("");
+  const [deletedFilter, setDeletedFilter] = useState("");
+  const [deletedKind, setDeletedKind] = useState<string>("");
 
   const loadLogs = useCallback(async () => {
     try {
-      setLogs(await api.getSyncLogs(100));
+      setLogs(await api.getSyncLogs(1000));
     } catch (e) {
       antMessage.error(t("syncPage.loadLogsFailed", { detail: String(e) }));
     }
   }, [t]);
 
+  const loadChanges = useCallback(async () => {
+    try {
+      const [c, d] = await Promise.all([api.getSyncChanges(2000), api.getDeletedLog(2000)]);
+      setChanges(c);
+      setDeleted(d);
+    } catch {
+      // 静默
+    }
+  }, []);
+
   useEffect(() => {
     loadLogs();
+    loadChanges();
     const un1 = listen<SyncProgress>("sync://progress", (e) => setProgress(e.payload));
     const un2 = listen<SyncReport>("sync://report", (e) => {
       setReports((r) => [e.payload, ...r].slice(0, 20));
       loadLogs();
+      loadChanges();
     });
     return () => {
       un1.then((f) => f());
       un2.then((f) => f());
     };
-  }, [loadLogs]);
+  }, [loadLogs, loadChanges]);
+
+  const restoreDeleted = async (item: DeletedLogEntry) => {
+    try {
+      const label = await api.restoreDeletedItem(item.id);
+      antMessage.success(t("syncPage.restored", { name: label }));
+      loadChanges();
+    } catch (e) {
+      antMessage.error(formatError(e));
+    }
+  };
+
+  const clearHistory = async (kind: "logs" | "changes" | "deleted") => {
+    try {
+      const count = await api.clearSyncHistory(kind);
+      antMessage.success(t("syncPage.cleared", { count }));
+      loadLogs();
+      loadChanges();
+    } catch (e) {
+      antMessage.error(formatError(e));
+    }
+  };
 
   const phaseLabel = progress
     ? t(`phases.${progress.phase}`, { defaultValue: progress.phase })
@@ -148,10 +223,42 @@ export default function SyncPage() {
         </Card>
       )}
 
-      <Card title={t("syncPage.syncLogs")} styles={{ body: { padding: 0 } }}>
+      <Card
+        title={t("syncPage.syncLogs")}
+        styles={{ body: { padding: 0 } }}
+        extra={
+          logs.length > 0 ? (
+            <Popconfirm
+              title={t("syncPage.clearConfirm")}
+              okText={t("syncPage.clearLogs")}
+              cancelText={t("playlists.cancel")}
+              onConfirm={() => clearHistory("logs")}
+            >
+              <Button size="small" type="text">
+                {t("syncPage.clearLogs")}
+              </Button>
+            </Popconfirm>
+          ) : undefined
+        }
+      >
+        <div style={{ padding: 12 }}>
+          <Input.Search
+            placeholder={t("syncPage.filterLog")}
+            allowClear
+            style={{ width: 260 }}
+            onSearch={setLogFilter}
+            onChange={(e) => !e.target.value && setLogFilter("")}
+          />
+        </div>
         <List
           size="small"
-          dataSource={logs}
+          dataSource={logs.filter((l) => {
+            if (!logFilter) return true;
+            const kw = logFilter.toLowerCase();
+            const hay = `${l.playlistName} ${renderMessage(l.message)}`.toLowerCase();
+            return hay.includes(kw);
+          })}
+          pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100], showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}` }}
           locale={{ emptyText: t("syncPage.noLogs") }}
           renderItem={(l) => {
             const tag =
@@ -180,6 +287,238 @@ export default function SyncPage() {
           }}
         />
       </Card>
+
+      <Card
+        title={t("syncPage.changesTitle")}
+        style={{ marginBottom: 16 }}
+        size="small"
+        extra={
+          changes.length > 0 ? (
+            <Popconfirm
+              title={t("syncPage.clearConfirm")}
+              okText={t("syncPage.clearChanges")}
+              cancelText={t("playlists.cancel")}
+              onConfirm={() => clearHistory("changes")}
+            >
+              <Button size="small" type="text">
+                {t("syncPage.clearChanges")}
+              </Button>
+            </Popconfirm>
+          ) : undefined
+        }
+      >
+        <Space style={{ marginBottom: 12 }} wrap>
+          <Input.Search
+            placeholder={t("syncPage.filterKeyword")}
+            allowClear
+            style={{ width: 220 }}
+            onSearch={setChangeFilter}
+            onChange={(e) => !e.target.value && setChangeFilter("")}
+          />
+          <Select
+            style={{ width: 160 }}
+            placeholder={t("syncPage.filterAction")}
+            allowClear
+            value={changeAction || undefined}
+            onChange={(v) => setChangeAction(v ?? "")}
+            options={[
+              { value: "added_local", label: t("syncPage.action.addedLocal") },
+              { value: "quarantined_local", label: t("syncPage.action.quarantinedLocal") },
+              { value: "added_playlist", label: t("syncPage.action.addedPlaylist") },
+              { value: "removed_from_playlist", label: t("syncPage.action.removedFromPlaylist") },
+            ]}
+          />
+        </Space>
+        <Table<SyncChangeEntry>
+          size="small"
+          rowKey="id"
+          dataSource={changes.filter((c) => {
+            if (changeAction && c.action !== changeAction) return false;
+            if (changeFilter) {
+              const kw = changeFilter.toLowerCase();
+              const hay = `${c.playlistName} ${c.trackName ?? ""} ${c.localPath ?? ""}`.toLowerCase();
+              if (!hay.includes(kw)) return false;
+            }
+            return true;
+          })}
+          columns={buildChangeColumns()}
+          pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100] }}
+          locale={{ emptyText: t("syncPage.noChanges") }}
+        />
+      </Card>
+
+      <Card
+        title={t("syncPage.deletedTitle")}
+        size="small"
+        extra={
+          deleted.length > 0 ? (
+            <Popconfirm
+              title={t("syncPage.clearConfirm")}
+              okText={t("syncPage.clearDeleted")}
+              cancelText={t("playlists.cancel")}
+              onConfirm={() => clearHistory("deleted")}
+            >
+              <Button size="small" type="text">
+                {t("syncPage.clearDeleted")}
+              </Button>
+            </Popconfirm>
+          ) : undefined
+        }
+      >
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+          {t("syncPage.deletedExplain")}
+        </Typography.Paragraph>
+        <Space style={{ marginBottom: 12 }} wrap>
+          <Input.Search
+            placeholder={t("syncPage.filterDeleted")}
+            allowClear
+            style={{ width: 240 }}
+            onSearch={setDeletedFilter}
+            onChange={(e) => !e.target.value && setDeletedFilter("")}
+          />
+          <Select
+            style={{ width: 150 }}
+            placeholder={t("syncPage.filterKind")}
+            allowClear
+            value={deletedKind || undefined}
+            onChange={(v) => setDeletedKind(v ?? "")}
+            options={[
+              { value: "local_file", label: t("syncPage.deletedLocal") },
+              { value: "playlist_track", label: t("syncPage.deletedPlaylist") },
+            ]}
+          />
+        </Space>
+        <Table<DeletedLogEntry>
+          size="small"
+          rowKey="id"
+          dataSource={deleted.filter((d) => {
+            if (deletedKind && d.kind !== deletedKind) return false;
+            if (deletedFilter) {
+              const kw = deletedFilter.toLowerCase();
+              const hay = `${d.playlistName} ${d.trackName ?? ""} ${d.localPath ?? ""}`.toLowerCase();
+              if (!hay.includes(kw)) return false;
+            }
+            return true;
+          })}
+          columns={deletedColumns(restoreDeleted, t)}
+          pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100], showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}` }}
+          locale={{ emptyText: t("syncPage.noDeleted") }}
+        />
+      </Card>
     </div>
   );
+}
+
+function buildChangeColumns(): ColumnsType<SyncChangeEntry> {
+  return [
+    {
+      title: i18n.t("syncPage.colTime"),
+      dataIndex: "ts",
+      width: 150,
+      render: (v: string) => <Typography.Text type="secondary" style={{ fontSize: 12 }}>{v}</Typography.Text>,
+    },
+    {
+      title: i18n.t("syncPage.colAction"),
+      dataIndex: "action",
+      width: 130,
+      render: (action: string) => {
+        const color =
+          action === "added_local" || action === "added_playlist"
+            ? "green"
+            : action === "quarantined_local" || action === "removed_from_playlist"
+              ? "orange"
+              : "red";
+        return <Tag color={color}>{i18nKey(action)}</Tag>;
+      },
+    },
+    {
+      title: i18n.t("syncPage.colTrack"),
+      dataIndex: "trackName",
+      ellipsis: true,
+      render: (v: string | undefined, c) => v ?? c.note ?? c.trackId ?? "-",
+    },
+    {
+      title: i18n.t("syncPage.colPlaylist"),
+      dataIndex: "playlistName",
+      width: 160,
+      ellipsis: true,
+    },
+    {
+      title: i18n.t("syncPage.colDirection"),
+      dataIndex: "direction",
+      width: 110,
+      render: (d: string) => (
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          {i18n.t(`syncPage.direction.${d}`, { defaultValue: d })}
+        </Typography.Text>
+      ),
+    },
+  ];
+}
+
+function i18nKey(action: string): string {
+  const map: Record<string, string> = {
+    added_local: i18n.t("syncPage.action.addedLocal"),
+    quarantined_local: i18n.t("syncPage.action.quarantinedLocal"),
+    added_playlist: i18n.t("syncPage.action.addedPlaylist"),
+    removed_from_playlist: i18n.t("syncPage.action.removedFromPlaylist"),
+    failed: i18n.t("syncPage.action.failed"),
+  };
+  return map[action] ?? action;
+}
+
+function deletedColumns(
+  restoreDeleted: (d: DeletedLogEntry) => void,
+  t: (k: string, opts?: Record<string, unknown>) => string
+): ColumnsType<DeletedLogEntry> {
+  return [
+    {
+      title: t("syncPage.colTime"),
+      dataIndex: "ts",
+      width: 150,
+      render: (v: string) => <Typography.Text type="secondary" style={{ fontSize: 12 }}>{v}</Typography.Text>,
+    },
+    {
+      title: t("syncPage.colType"),
+      dataIndex: "kind",
+      width: 110,
+      render: (k: string) => (
+        <Tag color={k === "local_file" ? "geekblue" : "volcano"}>
+          {k === "local_file" ? t("syncPage.deletedLocal") : t("syncPage.deletedPlaylist")}
+        </Tag>
+      ),
+    },
+    {
+      title: t("syncPage.colName"),
+      key: "name",
+      ellipsis: true,
+      render: (_, d) => d.trackName ?? d.localPath ?? "-",
+    },
+    {
+      title: t("syncPage.colPlaylist"),
+      dataIndex: "playlistName",
+      width: 150,
+      ellipsis: true,
+    },
+    {
+      title: "",
+      key: "action",
+      width: 110,
+      render: (_, d) =>
+        !d.restoredAt ? (
+          <Popconfirm
+            title={t("syncPage.restoreConfirmTitle")}
+            okText={t("playlists.ok")}
+            cancelText={t("playlists.cancel")}
+            onConfirm={() => restoreDeleted(d)}
+          >
+            <Button size="small" icon={<UndoOutlined />}>
+              {t("syncPage.restore")}
+            </Button>
+          </Popconfirm>
+        ) : (
+          <Tag color="success">{t("syncPage.restoredTag")}</Tag>
+        ),
+    },
+  ];
 }

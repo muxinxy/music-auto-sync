@@ -8,6 +8,9 @@ import {
   Form,
   Input,
   InputNumber,
+  List,
+  Modal,
+  Progress,
   Radio,
   Select,
   Space,
@@ -15,12 +18,12 @@ import {
   Typography,
   message as antMessage,
 } from "antd";
-import { FolderOpenOutlined } from "@ant-design/icons";
+import { FolderOpenOutlined, FileAddOutlined, ToolOutlined } from "@ant-design/icons";
 import { open } from "@tauri-apps/plugin-dialog";
 import i18n, { normalizeLanguage } from "../i18n";
 import { api } from "../api";
 import { formatError } from "../errors";
-import type { AppInfo, Config } from "../types";
+import type { AppInfo, Config, NcmConvertItemResult, NcmConvertReport } from "../types";
 
 const QUALITY_VALUES = ["standard", "higher", "exhigh", "lossless", "hires"] as const;
 
@@ -32,13 +35,17 @@ const defaultConfig: Config = {
   filenameTemplate: "{歌手} - {标题}",
   artistSeparator: "、",
   language: "zh-CN",
+  theme: "system",
   ua: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
   preflight: true,
   retry: 3,
   quality: "exhigh",
   downloadSource: "auto",
-  autoSyncOnStartup: true,
-  syncIntervalMinutes: 60,
+  syncMode: "mirror",
+  uploadManual: false,
+  autoSyncOnStartup: false,
+  syncIntervalMinutes: null,
+  autoLaunch: false,
   closeToTray: true,
   useRandomCnIp: false,
   ncmConvert: true,
@@ -62,6 +69,7 @@ export default function SettingsPage() {
   const [info, setInfo] = useState<AppInfo | null>(null);
   const [saving, setSaving] = useState(false);
   const [moving, setMoving] = useState(false);
+  const [ncmToolOpen, setNcmToolOpen] = useState(false);
   const readyRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const fullConfigRef = useRef<Config>({ ...defaultConfig });
@@ -266,6 +274,11 @@ export default function SettingsPage() {
           <Form.Item name="ncmKeepSource" valuePropName="checked">
             <Checkbox>{t("settings.cbNcmKeep")}</Checkbox>
           </Form.Item>
+          <Form.Item>
+            <Button icon={<ToolOutlined />} onClick={() => setNcmToolOpen(true)}>
+              {t("settings.ncmToolOpen")}
+            </Button>
+          </Form.Item>
           <Form.Item name="embedCover" valuePropName="checked">
             <Checkbox>{t("settings.cbCover")}</Checkbox>
           </Form.Item>
@@ -280,6 +293,19 @@ export default function SettingsPage() {
         <Card title={t("settings.cardAuto")} style={{ marginBottom: 16 }}>
           <Form.Item name="autoSyncOnStartup" valuePropName="checked" label={t("settings.labelAutoSync")}>
             <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
+          </Form.Item>
+          <Form.Item name="autoLaunch" valuePropName="checked" label={t("settings.labelAutoLaunch")} extra={t("settings.autoLaunchExtra")}>
+            <Switch
+              checkedChildren={t("settings.on")}
+              unCheckedChildren={t("settings.off")}
+              onChange={async (checked) => {
+                try {
+                  await api.setAutoLaunch(checked);
+                } catch (e) {
+                  antMessage.error(t("settings.autoLaunchFailed", { detail: formatError(e) }));
+                }
+              }}
+            />
           </Form.Item>
           <Form.Item label={t("settings.labelInterval")} name="syncIntervalMinutes">
             <InputNumber min={15} max={10080} style={{ width: 160 }} />
@@ -300,6 +326,19 @@ export default function SettingsPage() {
               onChange={onLanguageChange}
             />
           </Form.Item>
+          <Form.Item label={t("settings.labelTheme")} name="theme">
+            <Select
+              style={{ width: 200 }}
+              onChange={async (value) => {
+                window.dispatchEvent(new Event("theme-changed"));
+              }}
+              options={[
+                { value: "system", label: t("settings.themeSystem") },
+                { value: "light", label: t("settings.themeLight") },
+                { value: "dark", label: t("settings.themeDark") },
+              ]}
+            />
+          </Form.Item>
           <Divider />
           <Form.Item label={t("settings.labelApi")} name="apiBase" extra={t("settings.apiExtra")}>
             <Input />
@@ -308,7 +347,175 @@ export default function SettingsPage() {
             <Input placeholder={t("settings.placeholderProxy")} />
           </Form.Item>
         </Card>
+
+        <Card title={t("settings.cardSyncMode")} style={{ marginBottom: 16 }}>
+          <Form.Item label={t("settings.labelMode")} name="syncMode" extra={t("settings.modeExtra")}>
+            <Radio.Group>
+              <Radio.Button value="mirror">{t("settings.modeMirror")}</Radio.Button>
+              <Radio.Button value="add_only">{t("settings.modeAddOnly")}</Radio.Button>
+              <Radio.Button value="delete_only">{t("settings.modeDeleteOnly")}</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+          <Form.Item
+            name="uploadManual"
+            valuePropName="checked"
+            label={t("settings.labelUploadManual")}
+            extra={t("settings.uploadManualExtra")}
+          >
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
+          </Form.Item>
+          <Alert type="info" showIcon message={t("settings.syncModeHint")} />
+        </Card>
+
+        <NcmToolModal open={ncmToolOpen} onClose={() => setNcmToolOpen(false)} />
       </Form>
     </div>
+  );
+}
+
+/** 独立 NCM 转换工具弹窗：选文件（可多选）或目录 → 列出 .ncm → 转换。 */
+function NcmToolModal({ open: isOpen, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = i18n;
+  const [files, setFiles] = useState<string[]>([]);
+  const [keepSource, setKeepSource] = useState(true);
+  const [overwrite, setOverwrite] = useState(false);
+  const [running, setRunning] = useState(false);
+  const [done, setDone] = useState<NcmConvertReport | null>(null);
+  const [progress, setProgress] = useState<number>(0);
+
+  const reset = () => {
+    setFiles([]);
+    setDone(null);
+    setProgress(0);
+  };
+
+  const close = () => {
+    if (running) return;
+    reset();
+    onClose();
+  };
+
+  const addByFiles = async () => {
+    const picked = (await open({
+      multiple: true,
+      filters: [{ name: "NCM", extensions: ["ncm"] }],
+      title: t("settings.ncmPickFiles"),
+    })) as string[] | string | null;
+    if (!picked) return;
+    const list = Array.isArray(picked) ? picked : [picked];
+    setFiles((prev) => {
+      const next = [...prev];
+      for (const f of list) if (!next.includes(f)) next.push(f);
+      return next;
+    });
+  };
+
+  const addByDir = async () => {
+    const dir = (await dirPicker(t("settings.ncmPickDir"))) as string | null;
+    if (!dir) return;
+    setFiles((prev) => (prev.includes(dir) ? prev : [...prev, dir]));
+  };
+
+  const start = async () => {
+    if (files.length === 0 || running) return;
+    setRunning(true);
+    setDone(null);
+    try {
+      const report = await api.convertNcmManual(files, keepSource, overwrite);
+      setDone(report);
+      const total = report.converted + report.skipped + report.failed;
+      setProgress(total > 0 ? Math.round(((report.converted + report.skipped) / total) * 100) : 100);
+      antMessage.success(
+        t("settings.ncmToolDone", {
+          converted: report.converted,
+          skipped: report.skipped,
+          failed: report.failed,
+        })
+      );
+    } catch (e) {
+      antMessage.error(formatError(e));
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const failureItems = done?.items.filter((i) => i.status === "failed") ?? [];
+
+  return (
+    <Modal
+      title={t("settings.ncmToolTitle")}
+      open={isOpen}
+      onCancel={close}
+      onOk={start}
+      okText={t("settings.ncmToolStart")}
+      cancelText={t("settings.cancel")}
+      confirmLoading={running}
+      okButtonProps={{ disabled: files.length === 0 || running }}
+      width={640}
+    >
+      <Space direction="vertical" style={{ width: "100%" }} size="middle">
+        <Space>
+          <Button icon={<FileAddOutlined />} onClick={addByFiles} disabled={running}>
+            {t("settings.ncmPickFiles")}
+          </Button>
+          <Button icon={<FolderOpenOutlined />} onClick={addByDir} disabled={running}>
+            {t("settings.ncmPickDir")}
+          </Button>
+          {files.length > 0 && (
+            <Typography.Text type="secondary">
+              {t("settings.ncmFileCount", { count: files.length })}
+            </Typography.Text>
+          )}
+        </Space>
+        {files.length > 0 && (
+          <>
+            <List
+              size="small"
+              bordered
+              dataSource={files}
+              style={{ maxHeight: 200, overflow: "auto" }}
+              renderItem={(f) => (
+                <List.Item>
+                  <Typography.Text ellipsis style={{ maxWidth: 520, fontSize: 12 }}>
+                    {f}
+                  </Typography.Text>
+                </List.Item>
+              )}
+            />
+            <Space size="large">
+              <Checkbox checked={keepSource} onChange={(e) => setKeepSource(e.target.checked)}>
+                {t("settings.ncmKeepSource")}
+              </Checkbox>
+              <Checkbox checked={overwrite} onChange={(e) => setOverwrite(e.target.checked)}>
+                {t("settings.ncmOverwrite")}
+              </Checkbox>
+            </Space>
+            {running && <Progress percent={progress} status="active" />}
+            {done && (
+              <Alert
+                type={done.failed > 0 ? "warning" : "success"}
+                showIcon
+                message={t("settings.ncmToolDone", {
+                  converted: done.converted,
+                  skipped: done.skipped,
+                  failed: done.failed,
+                })}
+                description={
+                  failureItems.length > 0 ? (
+                    <Space direction="vertical" size={2}>
+                      {failureItems.slice(0, 5).map((f: NcmConvertItemResult, idx: number) => (
+                        <Typography.Text key={idx} style={{ fontSize: 12 }}>
+                          {f.source}：{f.error}
+                        </Typography.Text>
+                      ))}
+                    </Space>
+                  ) : undefined
+                }
+              />
+            )}
+          </>
+        )}
+      </Space>
+    </Modal>
   );
 }

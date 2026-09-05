@@ -11,6 +11,8 @@ export interface PlaylistSyncSetting {
   folderOverride?: string | null;
   qualityOverride?: string | null;
   overwrite?: boolean;
+  modeOverride?: string | null;
+  uploadManual?: boolean | null;
 }
 
 export interface Config {
@@ -21,13 +23,17 @@ export interface Config {
   filenameTemplate: string;
   artistSeparator: string;
   language: string;
+  theme: string;
   ua: string;
   preflight: boolean;
   retry: number;
   quality: string;
   downloadSource: string;
+  syncMode: string;
+  uploadManual: boolean;
   autoSyncOnStartup: boolean;
   syncIntervalMinutes?: number | null;
+  autoLaunch: boolean;
   closeToTray: boolean;
   useRandomCnIp: boolean;
   ncmConvert: boolean;
@@ -69,11 +75,14 @@ export interface PlaylistInfo {
   coverImgUrl: string;
   trackCount: number;
   subscribed: boolean;
+  creatorUserId?: number | null;
   enabled: boolean;
   synced: number;
   overwrite: boolean;
   lastSync?: string | null;
   lastResult?: string | null;
+  modeOverride?: string | null;
+  uploadManual?: boolean | null;
 }
 
 export interface PlaylistSong {
@@ -166,4 +175,83 @@ export interface QuarantineItem {
   originalPath: string;
   quarantinePath: string;
   quarantinedAt: string;
+}
+
+export interface AccountStats {
+  nickname?: string | null;
+  userId?: number | null;
+  avatarUrl?: string | null;
+  level?: number | null;
+  vipLevel?: number | null;
+  follows?: number | null;
+  followeds?: number | null;
+  createdPlaylistCount?: number | null;
+  subscribedPlaylistCount?: number | null;
+  likedCount?: number | null;
+  eventCount?: number | null;
+}
+
+export interface LocalStats {
+  totalSyncRuns: number;
+  totalAdded: number;
+  totalQuarantined: number;
+  totalNcmConverted: number;
+  totalFailed: number;
+  currentLocalFiles: number;
+  quarantineItems: number;
+  historySnapshots: number;
+}
+
+export interface SyncChangeEntry {
+  id: number;
+  syncRunId: number;
+  ts: string;
+  playlistId: number;
+  playlistName: string;
+  direction: string;
+  action: string;
+  trackId?: number | null;
+  trackName?: string | null;
+  localPath?: string | null;
+  quarantinedPath?: string | null;
+  neteaseId?: number | null;
+  note?: string | null;
+}
+
+export interface DeletedLogEntry {
+  id: number;
+  ts: string;
+  kind: "local_file" | "playlist_track";
+  playlistId: number;
+  playlistName: string;
+  trackId?: number | null;
+  trackName?: string | null;
+  localPath?: string | null;
+  quarantinedPath?: string | null;
+  neteaseId?: number | null;
+  restoredAt?: string | null;
+  note?: string | null;
+}
+
+export interface PlaylistHistoryEntry {
+  id: number;
+  playlistId: number;
+  ts: string;
+  playlistName: string;
+  snapshot: string;
+  source: string;
+}
+
+export interface NcmConvertItemResult {
+  source: string;
+  output?: string | null;
+  status: "converted" | "skipped" | "failed";
+  error?: string | null;
+}
+
+export interface NcmConvertReport {
+  converted: number;
+  skipped: number;
+  failed: number;
+  items: NcmConvertItemResult[];
 }

@@ -12,6 +12,7 @@ import {
   Modal,
   Popconfirm,
   Progress,
+  Segmented,
   Select,
   Space,
   Switch,
@@ -27,6 +28,7 @@ import {
   EyeOutlined,
   FolderOpenOutlined,
   HeartOutlined,
+  HistoryOutlined,
   ReloadOutlined,
   ShoppingOutlined,
   SyncOutlined,
@@ -39,6 +41,7 @@ import { formatError, translateUi, uiMessage } from "../errors";
 import type {
   BatchItemResult,
   LoginStatus,
+  PlaylistHistoryEntry,
   PlaylistInfo,
   PlaylistSong,
   PlaylistSongsResult,
@@ -92,6 +95,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
   const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [filter, setFilter] = useState("");
+  const [group, setGroup] = useState<"all" | "created" | "subscribed">("all");
   const [detailId, setDetailId] = useState<number | null>(null);
   const [songs, setSongs] = useState<PlaylistSongsResult | null>(null);
   const [songsLoading, setSongsLoading] = useState(false);
@@ -100,6 +104,11 @@ export default function PlaylistsPage({ login, sync }: Props) {
 
   const [selectedPlaylists, setSelectedPlaylists] = useState<Set<number>>(new Set());
   const [selectedSongs, setSelectedSongs] = useState<number[]>([]);
+  const [detailPolicy, setDetailPolicy] = useState<{
+    mode: string;
+    uploadManual: boolean | null;
+  } | null>(null);
+  const [historyList, setHistoryList] = useState<PlaylistHistoryEntry[]>([]);
 
   const [dlTarget, setDlTarget] = useState<{
     playlistId: number;
@@ -109,6 +118,9 @@ export default function PlaylistsPage({ login, sync }: Props) {
   const [dlDownloading, setDlDownloading] = useState(false);
   const [dlFailures, setDlFailures] = useState<{ song: PlaylistSong; message: UiMessage }[]>([]);
   const [lastReport, setLastReport] = useState<SyncReport | null>(null);
+  const dlPauseRef = useRef(false);
+  const dlCancelRef = useRef(false);
+  const [dlPaused, setDlPaused] = useState(false);
 
   const load = useCallback(
     async (force = false) => {
@@ -146,6 +158,25 @@ export default function PlaylistsPage({ login, sync }: Props) {
       try {
         const result = await api.getPlaylistSongs(id);
         setSongs(result);
+        // 从后端读取该歌单的同步策略（覆盖值 + 全局默认），避免依赖列表缓存。
+        api
+          .getPlaylistSettings(id)
+          .then((s) =>
+            setDetailPolicy({
+              mode: s.modeOverride ?? "",
+              uploadManual: s.uploadManual ?? null,
+            })
+          )
+          .catch(() =>
+            setDetailPolicy({
+              mode: "",
+              uploadManual: null,
+            })
+          );
+        api
+          .getPlaylistHistory(id, 50)
+          .then((h) => setHistoryList(h))
+          .catch(() => setHistoryList([]));
         // 后台预检可用性/最高音质（失败静默）。
         setAvailabilityLoading(true);
         api
@@ -168,6 +199,9 @@ export default function PlaylistsPage({ login, sync }: Props) {
   );
 
   const openDownloadDialog = (playlistId: number, songs: PlaylistSong[]) => {
+    dlPauseRef.current = false;
+    dlCancelRef.current = false;
+    setDlPaused(false);
     setDlTarget({ playlistId, songs });
     setDlFailures([]);
     setDlOptions({
@@ -187,9 +221,24 @@ export default function PlaylistsPage({ login, sync }: Props) {
     if (!dlTarget) return;
     const { playlistId, songs: targets } = dlTarget;
     setDlDownloading(true);
+    dlCancelRef.current = false;
     const failures: { song: PlaylistSong; message: UiMessage }[] = [];
+    let canceled = false;
     try {
       for (const song of targets) {
+        if (dlCancelRef.current) {
+          canceled = true;
+          break;
+        }
+        // 暂停等待（可继续/取消）。
+        while (dlPauseRef.current) {
+          if (dlCancelRef.current) {
+            canceled = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+        if (canceled) break;
         try {
           await api.downloadSongWithOptions(playlistId, song.id, {
             ...dlOptions,
@@ -201,7 +250,9 @@ export default function PlaylistsPage({ login, sync }: Props) {
       }
       setDlFailures(failures);
       const ok = targets.length - failures.length;
-      if (targets.length === 1) {
+      if (canceled) {
+        antMessage.info(t("playlists.downloadCanceled", { done: ok, total: targets.length }));
+      } else if (targets.length === 1) {
         if (failures.length === 0) {
           antMessage.success(t("playlists.downloaded", { name: targets[0].name }));
         } else {
@@ -217,7 +268,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
           antMessage.error(t("playlists.batchFailedList", { failed: failures.length, detail: sample }));
         }
       }
-      if (failures.length === 0) {
+      if (canceled || failures.length === 0) {
         setDlTarget(null);
         setSelectedSongs([]);
       }
@@ -225,6 +276,8 @@ export default function PlaylistsPage({ login, sync }: Props) {
       load(true);
     } finally {
       setDlDownloading(false);
+      dlPauseRef.current = false;
+      setDlPaused(false);
     }
   };
 
@@ -239,6 +292,68 @@ export default function PlaylistsPage({ login, sync }: Props) {
     // confirmDownload 成功清零时会把弹窗关闭；失败时保留弹窗。
   };
 
+  const saveDetailPolicy = async () => {
+    if (!detailId || !detailPolicy) return;
+    const mode = detailPolicy.mode === "" ? null : detailPolicy.mode;
+    try {
+      await api.setPlaylistSyncPolicy(detailId, mode, detailPolicy.uploadManual);
+      antMessage.success(t("settings.saved"));
+      // 重新拉取列表并回填保存后的实际覆盖值。
+      const fresh = await api.listPlaylists();
+      playlistCache.at = Date.now();
+      playlistCache.data = fresh;
+      setPlaylists(fresh);
+      const pl = fresh.find((p) => p.id === detailId);
+      setDetailPolicy({
+        mode: pl?.modeOverride ?? "",
+        uploadManual: pl?.uploadManual ?? null,
+      });
+    } catch (e) {
+      antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
+    }
+  };
+
+  const [restoreDiff, setRestoreDiff] = useState<{
+    historyId: number;
+    toAdd: { id?: number; name?: string }[];
+    toRemove: { id?: number; name?: string }[];
+  } | null>(null);
+  const [restoreBusy, setRestoreBusy] = useState(false);
+
+  const restoreHistory = async (historyId: number) => {
+    if (!detailId) return;
+    try {
+      // 先计算差异预览，让用户确认将新增/移除哪些曲目。
+      const diff = await api.previewPlaylistRestore(detailId, historyId);
+      setRestoreDiff({
+        historyId: diff.historyId,
+        toAdd: diff.toAdd.map((v) => ({ id: v.id as number, name: v.name as string })),
+        toRemove: diff.toRemove.map((v) => ({ id: v.id as number, name: v.name as string })),
+      });
+    } catch (e) {
+      antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
+    }
+  };
+
+  const doRestore = async () => {
+    if (!detailId || !restoreDiff) return;
+    setRestoreBusy(true);
+    try {
+      const count = await api.restorePlaylistSnapshot(detailId, restoreDiff.historyId);
+      antMessage.success(t("playlists.restoreSnapshotDone", { count }));
+      setRestoreDiff(null);
+      load(true);
+      api
+        .getPlaylistHistory(detailId, 50)
+        .then((h) => setHistoryList(h))
+        .catch(() => {});
+    } catch (e) {
+      antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
+    } finally {
+      setRestoreBusy(false);
+    }
+  };
+
   const runSync = async (id: number, messageName: string) => {
     try {
       const report = await api.syncPlaylist(id);
@@ -247,18 +362,6 @@ export default function PlaylistsPage({ login, sync }: Props) {
         setLastReport(report);
         antMessage.warning(t("playlists.syncDoneWithErrors", { failed: report.failed }));
       }
-      setSongs(await api.getPlaylistSongs(id));
-      load(true);
-    } catch (e) {
-      antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
-    }
-  };
-
-  const prunePlaylist = async (id: number) => {
-    try {
-      const count = await api.manualPrune(id);
-      if (count > 0) antMessage.success(t("playlists.pruneDone", { count }));
-      else antMessage.info(t("quarantine.empty"));
       setSongs(await api.getPlaylistSongs(id));
       load(true);
     } catch (e) {
@@ -297,9 +400,13 @@ export default function PlaylistsPage({ login, sync }: Props) {
     );
   }
 
-  const shown = playlists.filter((p) =>
-    p.name.toLowerCase().includes(filter.toLowerCase())
-  );
+  const myId = login?.userId;
+  const shown = playlists.filter((p) => {
+    const owned = p.creatorUserId != null ? p.creatorUserId === myId : !p.subscribed;
+    if (group === "created" && !owned) return false;
+    if (group === "subscribed" && owned) return false;
+    return p.name.toLowerCase().includes(filter.toLowerCase());
+  });
 
   const reasonTag = (song: PlaylistSong) => {
     const avail = availability[song.id];
@@ -333,14 +440,40 @@ export default function PlaylistsPage({ login, sync }: Props) {
       dataIndex: "name",
       ellipsis: true,
       render: (value: string, song) => (
-        <Space size={4} style={{ flexWrap: "wrap" }}>
-          <span>{value}</span>
+        <Space size={4}>
+          <Tooltip title={value}>
+            <span style={{ display: "inline-block", maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", verticalAlign: "bottom" }}>
+              {value}
+            </span>
+          </Tooltip>
           {reasonTag(song)}
         </Space>
       ),
     },
-    { title: t("playlists.columns.artists"), dataIndex: "artists", ellipsis: true },
-    { title: t("playlists.columns.album"), dataIndex: "album", ellipsis: true },
+    {
+      title: t("playlists.columns.artists"),
+      dataIndex: "artists",
+      ellipsis: true,
+      render: (value: string) => (
+        <Tooltip title={value}>
+          <span style={{ display: "inline-block", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", verticalAlign: "bottom" }}>
+            {value}
+          </span>
+        </Tooltip>
+      ),
+    },
+    {
+      title: t("playlists.columns.album"),
+      dataIndex: "album",
+      ellipsis: true,
+      render: (value: string) => (
+        <Tooltip title={value || "-"}>
+          <span style={{ display: "inline-block", maxWidth: "100%", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", verticalAlign: "bottom" }}>
+            {value || "-"}
+          </span>
+        </Tooltip>
+      ),
+    },
     {
       title: t("playlists.columns.duration"),
       dataIndex: "durationMs",
@@ -490,8 +623,17 @@ export default function PlaylistsPage({ login, sync }: Props) {
               onSearch={setFilter}
               onChange={(e) => !e.target.value && setFilter("")}
             />
+            <Segmented
+              value={group}
+              onChange={(v) => setGroup(v as "all" | "created" | "subscribed")}
+              options={[
+                { value: "all", label: t("playlists.groupAll") },
+                { value: "created", label: t("playlists.groupCreated") },
+                { value: "subscribed", label: t("playlists.groupSubscribed") },
+              ]}
+            />
             <Typography.Text type="secondary">
-              {t("playlists.countHint", { count: playlists.length })}
+              {t("playlists.countHint", { count: shown.length })}
             </Typography.Text>
           </Space>
           <Space>
@@ -579,6 +721,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
         <List
           loading={loading}
           dataSource={shown}
+          pagination={{ pageSize: 15, showSizeChanger: true, pageSizeOptions: [15, 30, 60], showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}` }}
           renderItem={(p) => {
             const percent = p.trackCount ? Math.round((p.synced / p.trackCount) * 100) : 0;
             const lastResult = displayLastResult(p.lastResult);
@@ -614,18 +757,6 @@ export default function PlaylistsPage({ login, sync }: Props) {
                       load(true);
                     }}
                   />,
-                  <Popconfirm
-                    key="prune"
-                    title={t("playlists.pruneConfirmTitle")}
-                    description={t("playlists.pruneConfirmDesc")}
-                    okText={t("playlists.ok")}
-                    cancelText={t("playlists.cancel")}
-                    onConfirm={() => prunePlaylist(p.id)}
-                  >
-                    <Button size="small" icon={<FolderOpenOutlined />}>
-                      {t("playlists.prune")}
-                    </Button>
-                  </Popconfirm>,
                   <Button
                     key="go"
                     size="small"
@@ -692,24 +823,81 @@ export default function PlaylistsPage({ login, sync }: Props) {
             >
               {t("playlists.downloadBatch", { count: selectedSongs.length })}
             </Button>
-            <Button
-              icon={<CloudDownloadOutlined />}
-              disabled={dlDownloading}
-              onClick={selectedPlaylistSongsAll}
-            >
-              {t("playlists.downloadMissing")}
-            </Button>
-            <Button
-              type="primary"
-              icon={<SyncOutlined />}
-              disabled={sync.running}
-              onClick={() => detailId && runSync(detailId, songs?.playlistName ?? "")}
-            >
-              {t("playlists.syncMissing")}
-            </Button>
+            <Tooltip title={t("playlists.downloadMissingTip")}>
+              <Button
+                icon={<CloudDownloadOutlined />}
+                disabled={dlDownloading}
+                onClick={selectedPlaylistSongsAll}
+              >
+                {t("playlists.downloadMissing")}
+              </Button>
+            </Tooltip>
+            <Tooltip title={t("playlists.syncThisPlaylistTip")}>
+              <Button
+                type="primary"
+                icon={<SyncOutlined />}
+                disabled={sync.running}
+                onClick={() => detailId && runSync(detailId, songs?.playlistName ?? "")}
+              >
+                {t("playlists.syncThisPlaylist")}
+              </Button>
+            </Tooltip>
           </Space>
         }
       >
+        <Card size="small" style={{ marginBottom: 12 }}>
+          <Space wrap>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {t("playlists.syncPolicy")}
+            </Typography.Text>
+            <Select
+              size="small"
+              style={{ width: 140 }}
+              value={detailPolicy?.mode ?? ""}
+              onChange={(v) => setDetailPolicy((p) => ({ ...(p ?? { uploadManual: null }), mode: v }))}
+              options={[
+                { value: "", label: t("playlists.policyDefault") },
+                { value: "mirror", label: t("settings.modeMirror") },
+                { value: "add_only", label: t("settings.modeAddOnly") },
+                { value: "delete_only", label: t("settings.modeDeleteOnly") },
+              ]}
+            />
+            <Select
+              size="small"
+              style={{ width: 170 }}
+              value={detailPolicy?.uploadManual === null ? "" : detailPolicy?.uploadManual ? "on" : "off"}
+              onChange={(v) =>
+                setDetailPolicy((p) => ({
+                  ...(p ?? { mode: "" }),
+                  uploadManual: v === "" ? null : v === "on",
+                }))
+              }
+              options={[
+                { value: "", label: t("playlists.policyDefault") },
+                { value: "on", label: t("settings.labelUploadManualShort") },
+                { value: "off", label: t("playlists.uploadOff") },
+              ]}
+            />
+            <Button size="small" type="primary" ghost onClick={saveDetailPolicy}>
+              {t("playlists.savePolicy")}
+            </Button>
+            {historyList.length > 0 && (
+              <Dropdown
+                menu={{
+                  items: historyList.map((h) => ({
+                    key: String(h.id),
+                    label: `${h.ts}（${t(`syncPage.source.${h.source}`, { defaultValue: h.source })}）`,
+                  })),
+                  onClick: ({ key }) => restoreHistory(Number(key)),
+                }}
+              >
+                <Button size="small" icon={<HistoryOutlined />}>
+                  {t("playlists.restoreSnapshot")}
+                </Button>
+              </Dropdown>
+            )}
+          </Space>
+        </Card>
         <Table<PlaylistSong>
           rowKey="id"
           size="small"
@@ -731,14 +919,74 @@ export default function PlaylistsPage({ login, sync }: Props) {
             : t("playlists.downloadTitle", { name: dlTarget?.songs[0]?.name ?? "" })
         }
         open={dlTarget !== null}
-        onCancel={() => !dlDownloading && setDlTarget(null)}
-        onOk={dlFailures.length > 0 ? retryFailedOnly : confirmDownload}
-        okText={dlFailures.length > 0 ? t("playlists.retryFailed") : t("playlists.ok")}
-        cancelText={t("playlists.cancel")}
-        confirmLoading={dlDownloading}
-        okButtonProps={{ disabled: dlDownloading }}
+        width={620}
+        onCancel={() => {
+          if (dlDownloading) {
+            dlCancelRef.current = true;
+            dlPauseRef.current = false;
+            setDlPaused(false);
+          } else {
+            setDlTarget(null);
+          }
+        }}
+        footer={
+          <div style={{ display: "flex", justifyContent: "flex-end" }}>
+            <Space wrap style={{ justifyContent: "flex-end" }}>
+            {dlDownloading ? (
+              <>
+                {dlPaused ? (
+                  <Button
+                    onClick={() => {
+                      dlPauseRef.current = false;
+                      setDlPaused(false);
+                    }}
+                  >
+                    {t("app.resume")}
+                  </Button>
+                ) : (
+                  <Button
+                    onClick={() => {
+                      dlPauseRef.current = true;
+                      setDlPaused(true);
+                    }}
+                  >
+                    {t("app.pause")}
+                  </Button>
+                )}
+                <Popconfirm
+                  title={t("app.cancelConfirm")}
+                  okText={t("app.cancel")}
+                  cancelText={t("playlists.cancel")}
+                  onConfirm={() => {
+                    dlCancelRef.current = true;
+                    dlPauseRef.current = false;
+                    setDlPaused(false);
+                  }}
+                >
+                  <Button danger>{t("app.cancelTask")}</Button>
+                </Popconfirm>
+              </>
+            ) : dlFailures.length > 0 ? (
+              <>
+                <Button onClick={() => setDlTarget(null)}>{t("playlists.cancel")}</Button>
+                <Button type="primary" onClick={retryFailedOnly}>
+                  {t("playlists.retryFailed")}
+                </Button>
+              </>
+            ) : (
+              <>
+                <Button onClick={() => setDlTarget(null)}>{t("playlists.cancel")}</Button>
+                <Button type="primary" onClick={confirmDownload}>
+                  {t("playlists.ok")}
+                </Button>
+              </>
+            )}
+            </Space>
+          </div>
+        }
       >
         <Space direction="vertical" style={{ width: "100%" }} size="middle">
+          {dlPaused && <Alert type="warning" showIcon message={t("app.syncPaused")} />}
           <Space.Compact style={{ width: "100%" }}>
             <Input
               placeholder={t("playlists.dlDirPlaceholder")}
@@ -807,6 +1055,64 @@ export default function PlaylistsPage({ login, sync }: Props) {
             />
           )}
         </Space>
+      </Modal>
+
+      <Modal
+        title={t("playlists.restorePreviewTitle")}
+        open={restoreDiff !== null}
+        onCancel={() => !restoreBusy && setRestoreDiff(null)}
+        onOk={doRestore}
+        okText={t("playlists.restoreSnapshot")}
+        cancelText={t("playlists.cancel")}
+        confirmLoading={restoreBusy}
+      >
+        {restoreDiff && (
+          <Space direction="vertical" style={{ width: "100%" }} size="small">
+            <Alert type="info" showIcon message={t("playlists.preRestoreNote")} />
+            {restoreDiff.toAdd.length === 0 && restoreDiff.toRemove.length === 0 ? (
+              <Typography.Text type="secondary">{t("playlists.restoreNoChange")}</Typography.Text>
+            ) : (
+              <>
+                {restoreDiff.toAdd.length > 0 && (
+                  <>
+                    <Typography.Text strong>
+                      {t("playlists.restoreAdd", { count: restoreDiff.toAdd.length })}
+                    </Typography.Text>
+                    <List
+                      size="small"
+                      bordered
+                      style={{ maxHeight: 140, overflow: "auto" }}
+                      dataSource={restoreDiff.toAdd}
+                      renderItem={(v) => (
+                        <List.Item style={{ padding: "2px 12px" }}>
+                          <Typography.Text style={{ fontSize: 12 }}>{v.name ?? v.id}</Typography.Text>
+                        </List.Item>
+                      )}
+                    />
+                  </>
+                )}
+                {restoreDiff.toRemove.length > 0 && (
+                  <>
+                    <Typography.Text strong type="danger">
+                      {t("playlists.restoreRemove", { count: restoreDiff.toRemove.length })}
+                    </Typography.Text>
+                    <List
+                      size="small"
+                      bordered
+                      style={{ maxHeight: 140, overflow: "auto" }}
+                      dataSource={restoreDiff.toRemove}
+                      renderItem={(v) => (
+                        <List.Item style={{ padding: "2px 12px" }}>
+                          <Typography.Text style={{ fontSize: 12 }}>{v.name ?? v.id}</Typography.Text>
+                        </List.Item>
+                      )}
+                    />
+                  </>
+                )}
+              </>
+            )}
+          </Space>
+        )}
       </Modal>
 
       {lastReport && lastReport.failed > 0 && (

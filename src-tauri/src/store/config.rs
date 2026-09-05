@@ -33,6 +33,18 @@ fn default_download_source() -> String {
     "auto".into()
 }
 
+fn default_upload_manual() -> bool {
+    false
+}
+
+fn default_sync_mode() -> String {
+    "mirror".into()
+}
+
+fn default_theme() -> String {
+    "system".into()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -46,6 +58,9 @@ pub struct Config {
     pub artist_separator: String,
     #[serde(default = "default_language")]
     pub language: String,
+    /// 界面主题：system / light / dark。
+    #[serde(default = "default_theme")]
+    pub theme: String,
     #[serde(default = "default_ua")]
     pub ua: String,
     #[serde(default = "default_preflight")]
@@ -55,8 +70,17 @@ pub struct Config {
     pub quality: String,
     #[serde(default = "default_download_source")]
     pub download_source: String,
+    /// 同步模式（全局默认）：mirror=镜像, add_only=仅新增, delete_only=仅删除（作用于歌单→本地下载侧）。
+    #[serde(default = "default_sync_mode")]
+    pub sync_mode: String,
+    /// 是否把“手动放入歌单文件夹的本地音频”补进网易歌单（仅新增，绝不反向删歌；需我创建的歌单）。
+    #[serde(default = "default_upload_manual")]
+    pub upload_manual: bool,
     pub auto_sync_on_startup: bool,
     pub sync_interval_minutes: Option<u64>,
+    /// 开机自启（Windows 注册表 HKCU\...\Run）。
+    #[serde(default)]
+    pub auto_launch: bool,
     #[serde(default = "default_true")]
     pub close_to_tray: bool,
     #[serde(default = "default_true")]
@@ -87,6 +111,12 @@ pub struct PlaylistSyncSetting {
     pub quality_override: Option<String>,
     #[serde(default)]
     pub overwrite: bool,
+    /// 覆盖全局同步模式（mirror/add_only/delete_only）。
+    #[serde(default)]
+    pub mode_override: Option<String>,
+    /// 覆盖全局“补录手动放入的歌到网易歌单”开关。
+    #[serde(default)]
+    pub upload_manual: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,13 +136,17 @@ impl Default for Config {
             filename_template: "{歌手} - {标题}".into(),
             artist_separator: "、".into(),
             language: "zh-CN".into(),
+            theme: "system".into(),
             ua: default_ua(),
             preflight: true,
             retry: 3,
             quality: "exhigh".into(),
             download_source: "auto".into(),
-            auto_sync_on_startup: true,
-            sync_interval_minutes: Some(60),
+            sync_mode: "mirror".into(),
+            upload_manual: false,
+            auto_sync_on_startup: false,
+            sync_interval_minutes: None,
+            auto_launch: false,
             close_to_tray: true,
             use_random_cn_ip: false,
             ncm_convert: true,

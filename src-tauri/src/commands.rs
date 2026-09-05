@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
 use std::{collections::HashMap, fs, path::Path, sync::atomic::Ordering};
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
     api::{
@@ -490,6 +490,8 @@ pub fn set_playlist_overwrite(
             folder_override: None,
             quality_override: None,
             overwrite,
+            mode_override: None,
+            upload_manual: None,
         });
     }
     store::config::save(&paths.config_file, &config).map_err(command_error)
@@ -513,6 +515,54 @@ pub fn set_playlist_enabled(
             folder_override: None,
             quality_override: None,
             overwrite: false,
+            mode_override: None,
+            upload_manual: None,
+        });
+    }
+    store::config::save(&paths.config_file, &config).map_err(command_error)
+}
+
+/// 返回歌单当前的同步策略（覆盖值 + 全局默认，供详情面板初始化与展示）。
+#[tauri::command]
+pub fn get_playlist_settings(state: State<'_, AppState>, id: u64) -> Result<serde_json::Value, String> {
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let setting = config.playlists.iter().find(|p| p.id == id);
+    Ok(serde_json::json!({
+        "playlistId": id,
+        "modeOverride": setting.and_then(|s| s.mode_override.clone()),
+        "uploadManual": setting.and_then(|s| s.upload_manual),
+        "globalMode": config.sync_mode,
+        "globalUploadManual": config.upload_manual,
+    }))
+}
+/// 设置单个歌单的同步策略：模式覆盖（None/空字符串 = 跟随全局默认）与
+/// “补录手动放入的歌”开关覆盖（None = 跟随全局默认）。
+#[tauri::command]
+pub fn set_playlist_sync_policy(
+    state: State<'_, AppState>,
+    id: u64,
+    mode: Option<String>,
+    upload_manual: Option<bool>,
+) -> Result<(), String> {
+    let paths = state.paths.get();
+    let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let mode = mode
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty());
+    if let Some(setting) = config.playlists.iter_mut().find(|p| p.id == id) {
+        setting.mode_override = mode;
+        setting.upload_manual = upload_manual;
+    } else {
+        config.playlists.push(PlaylistSyncSetting {
+            id,
+            name: format!("歌单 {id}"),
+            enabled: false,
+            folder_override: None,
+            quality_override: None,
+            overwrite: false,
+            mode_override: mode,
+            upload_manual,
         });
     }
     store::config::save(&paths.config_file, &config).map_err(command_error)
@@ -578,10 +628,42 @@ pub async fn sync_all(
 pub fn cancel_sync(state: State<'_, AppState>) -> bool {
     if state.sync_running.load(Ordering::SeqCst) {
         state.cancel_requested.store(true, Ordering::SeqCst);
+        state.pause_requested.store(false, Ordering::SeqCst);
         true
     } else {
         false
     }
+}
+
+/// 暂停当前同步任务（在曲目/歌单边界生效）。
+#[tauri::command]
+pub fn pause_sync(state: State<'_, AppState>) -> bool {
+    if state.sync_running.load(Ordering::SeqCst) {
+        state.pause_requested.store(true, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+/// 继续被暂停的同步任务。
+#[tauri::command]
+pub fn resume_sync(state: State<'_, AppState>) -> bool {
+    if state.sync_running.load(Ordering::SeqCst) && state.pause_requested.swap(false, Ordering::SeqCst)
+    {
+        true
+    } else {
+        false
+    }
+}
+
+/// 查询同步控制状态：running / paused。
+#[tauri::command]
+pub fn get_sync_control(state: State<'_, AppState>) -> serde_json::Value {
+    serde_json::json!({
+        "running": state.sync_running.load(Ordering::SeqCst),
+        "paused": state.pause_requested.load(Ordering::SeqCst),
+    })
 }
 
 #[tauri::command]
@@ -1052,4 +1134,320 @@ pub async fn check_for_update(state: State<'_, AppState>) -> Result<Option<Strin
         )
         == std::cmp::Ordering::Greater;
     Ok((is_newer && !latest.is_empty()).then(|| latest.to_string()))
+}
+
+/// 设置开机自启（写入 HKCU\Software\Microsoft\Windows\CurrentVersion\Run）。
+/// 便携/自定义数据目录场景会附加 --data-dir 参数，保证自启用同一数据目录。
+#[tauri::command]
+pub fn set_auto_launch(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let paths = state.paths.get();
+    let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let exe = std::env::current_exe().map_err(command_error)?;
+    let mut command = format!("\"{}\"", exe.to_string_lossy());
+    if paths.portable || !paths.root.to_string_lossy().is_empty() {
+        // 数据目录若与默认 AppData 不同则显式传入。
+        command.push_str(&format!(" --data-dir=\"{}\"", paths.root.to_string_lossy()));
+    }
+    if enabled {
+        std::process::Command::new("reg")
+            .args([
+                "add",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v",
+                "MusicAutoSync",
+                "/t",
+                "REG_SZ",
+                "/d",
+                &command,
+                "/f",
+            ])
+            .output()
+            .map_err(command_error)?;
+    } else {
+        std::process::Command::new("reg")
+            .args([
+                "delete",
+                "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+                "/v",
+                "MusicAutoSync",
+                "/f",
+            ])
+            .output()
+            .map_err(command_error)?;
+    }
+    config.auto_launch = enabled;
+    store::config::save(&paths.config_file, &config).map_err(command_error)
+}
+
+/// 清空同步日志/变更/删除/快照历史记录（不影响隔离区文件本身）。
+#[tauri::command]
+pub fn clear_sync_history_cmd(
+    state: State<'_, AppState>,
+    kind: String,
+) -> Result<usize, String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    database::clear_history(&conn, &kind).map_err(command_error)
+}
+
+/// 计算恢复到历史快照的差异预览（不写网易）。
+#[tauri::command]
+pub async fn preview_playlist_restore_cmd(
+    state: State<'_, AppState>,
+    playlist_id: u64,
+    history_id: i64,
+) -> Result<sync::PlaylistRestoreDiff, String> {
+    sync::preview_playlist_restore(&state, playlist_id, history_id)
+        .await
+        .map_err(|m| m.to_json())
+}
+
+/// 变更流水（每次同步的新增/删除记录）。
+#[tauri::command]
+pub fn get_sync_changes(
+    state: State<'_, AppState>,
+    limit: usize,
+) -> Result<Vec<database::SyncChangeEntry>, String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    database::list_changes(&conn, limit.min(2000)).map_err(command_error)
+}
+
+/// 删除日志（本地被隔离 / 网易歌单被移除的曲目）。
+#[tauri::command]
+pub fn get_deleted_log(
+    state: State<'_, AppState>,
+    limit: usize,
+) -> Result<Vec<database::DeletedLogEntry>, String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    database::list_deleted(&conn, limit.min(2000)).map_err(command_error)
+}
+
+/// 某歌单的历史快照列表。
+#[tauri::command]
+pub fn get_playlist_history(
+    state: State<'_, AppState>,
+    playlist_id: u64,
+    limit: usize,
+) -> Result<Vec<database::PlaylistHistoryEntry>, String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    database::list_playlist_history(&conn, playlist_id, limit.min(100)).map_err(command_error)
+}
+
+/// 恢复一条删除记录（本地隔离文件还原 / 网易曲目加回）。
+#[tauri::command]
+pub async fn restore_deleted_item(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    id: i64,
+) -> Result<String, String> {
+    if state.sync_running.load(Ordering::SeqCst) {
+        return Err(UiMessage::new("sync_busy").to_json());
+    }
+    let _ = app.emit("sync://state", true);
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    let kind: Option<String> = conn
+        .query_row("SELECT kind FROM deleted_log WHERE id=?1", [id], |r| r.get(0))
+        .optional()
+        .map_err(command_error)?;
+    let kind = kind.ok_or_else(|| UiMessage::new("deleted_record_missing").to_json())?;
+    let result = if kind == "local_file" {
+        sync::restore_deleted_local_item(&state, id)
+            .await
+            .map_err(|m| m.to_json())
+    } else {
+        sync::restore_deleted_playlist_track(&state, id)
+            .await
+            .map_err(|m| m.to_json())
+    };
+    let _ = app.emit("sync://state", false);
+    result
+}
+
+/// 把歌单恢复到某个历史快照。
+#[tauri::command]
+pub async fn restore_playlist_snapshot_cmd(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    playlist_id: u64,
+    history_id: i64,
+) -> Result<usize, String> {
+    if state.sync_running.load(Ordering::SeqCst) {
+        return Err(UiMessage::new("sync_busy").to_json());
+    }
+    let _ = app.emit("sync://state", true);
+    let result = sync::restore_playlist_snapshot(&state, playlist_id, history_id)
+        .await
+        .map_err(|m| m.to_json());
+    let _ = app.emit("sync://state", false);
+    result
+}
+
+/// 账号统计（登录卡片展示）。字段取不到时置空，接口失败静默降级。
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountStats {
+    pub nickname: Option<String>,
+    pub user_id: Option<u64>,
+    pub avatar_url: Option<String>,
+    /// /user/level data 里的 level。
+    pub level: Option<i64>,
+    /// /vip/info(/v2) 的 redVipLevel 或 vipCode。
+    pub vip_level: Option<i64>,
+    /// /user/subcount 的 follows/followeds。
+    pub follows: Option<i64>,
+    pub followeds: Option<i64>,
+    pub created_playlist_count: Option<i64>,
+    pub subscribed_playlist_count: Option<i64>,
+    /// 喜欢音乐数量（/likelist ids 长度）。
+    pub liked_count: Option<u64>,
+    pub event_count: Option<i64>,
+}
+
+#[tauri::command]
+pub async fn get_account_stats(state: State<'_, AppState>) -> Result<AccountStats, String> {
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let user = config
+        .cookie_user
+        .as_ref()
+        .context("请先登录")
+        .map_err(command_error)?;
+    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    let mut stats = AccountStats {
+        nickname: Some(user.nickname.clone()),
+        user_id: Some(user.user_id),
+        ..AccountStats::default()
+    };
+
+    // 头像/昵称/关注/粉丝/动态来自 user/detail 的 profile。
+    if let Ok(detail) = api.user_detail(user.user_id).await {
+        if !detail.is_null() {
+            stats.avatar_url = detail.get("avatarUrl").and_then(|v| v.as_str()).map(str::to_owned);
+            stats.nickname = detail.get("nickname").and_then(|v| v.as_str()).map(str::to_owned);
+            stats.follows = detail.get("follows").and_then(value_as_i64);
+            stats.followeds = detail.get("followeds").and_then(value_as_i64);
+            stats.event_count = detail.get("eventCount").and_then(value_as_i64);
+        }
+    }
+    // 等级来自 /user/level 的 data.level。
+    if let Ok(level) = api.user_level().await {
+        if !level.is_null() {
+            stats.level = level.get("level").and_then(value_as_i64);
+        }
+    }
+    // 歌单创建/收藏数量来自 /user/subcount（字段在顶层，非 data）。
+    if let Ok(subcount) = api.user_subcount().await {
+        if !subcount.is_null() {
+            stats.created_playlist_count = subcount
+                .get("createdPlaylistCount")
+                .and_then(value_as_i64);
+            stats.subscribed_playlist_count = subcount
+                .get("subPlaylistCount")
+                .and_then(value_as_i64);
+        }
+    }
+    if let Ok(vip) = api.vip_info().await {
+        if !vip.is_null() {
+            stats.vip_level = vip
+                .get("redVipLevel")
+                .or_else(|| vip.get("vipCode"))
+                .and_then(value_as_i64);
+        }
+    }
+    if let Ok(ids) = api.liked_song_ids(user.user_id).await {
+        stats.liked_count = Some(ids.len() as u64);
+    }
+    Ok(stats)
+}
+
+fn value_as_i64(v: &serde_json::Value) -> Option<i64> {
+    v.as_i64().or_else(|| v.as_u64().map(|x| x as i64))
+}
+
+/// 本地同步统计（登录卡片 / 概览）。
+#[tauri::command]
+pub fn get_local_stats(state: State<'_, AppState>) -> Result<database::LocalStats, String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    let mut stats = database::summarize_stats(&conn).map_err(command_error)?;
+    // 精确统计“磁盘上仍存在的已登记文件”。
+    let mut stmt = conn
+        .prepare("SELECT local_path FROM track_files")
+        .map_err(command_error)?;
+    let rows: Vec<String> = stmt
+        .query_map([], |r| r.get(0))
+        .map_err(command_error)?
+        .collect::<std::result::Result<_, _>>()
+        .map_err(command_error)?;
+    stats.current_local_files = rows
+        .iter()
+        .filter(|p| Path::new(p).is_file())
+        .count() as u64;
+    Ok(stats)
+}
+
+/// NCM 批量转换汇总结果。
+#[derive(Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct NcmConvertReport {
+    pub converted: usize,
+    pub skipped: usize,
+    pub failed: usize,
+    pub items: Vec<crate::ncm::ncm::NcmConvertItemResult>,
+}
+
+/// 独立 NCM 转换工具：paths 可混合 .ncm 文件与目录（目录递归）。
+/// keep_source=false 时转换成功后删除源文件；overwrite=true 时无视已有转换标记。
+#[tauri::command]
+pub async fn convert_ncm_manual(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    keep_source: bool,
+    overwrite: bool,
+) -> Result<NcmConvertReport, String> {
+    let _ = state;
+    // 展开为 .ncm 文件列表。
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    for p in &paths {
+        let path = std::path::Path::new(p);
+        if path.is_dir() {
+            for entry in walkdir::WalkDir::new(path)
+                .follow_links(false)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let entry_path = entry.path();
+                if entry_path
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("ncm"))
+                {
+                    files.push(entry_path.to_path_buf());
+                }
+            }
+        } else if path.is_file()
+            && path
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("ncm"))
+        {
+            files.push(path.to_path_buf());
+        }
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Err(UiMessage::new("ncm_no_files").to_json());
+    }
+    let report = tauri::async_runtime::spawn_blocking(move || {
+        let mut report = NcmConvertReport::default();
+        for file in files {
+            let item = crate::ncm::ncm::convert_file_with_marker(&file, keep_source, overwrite);
+            match item.status.as_str() {
+                "converted" => report.converted += 1,
+                "skipped" => report.skipped += 1,
+                _ => report.failed += 1,
+            }
+            report.items.push(item);
+        }
+        report
+    })
+    .await
+    .map_err(|error| UiMessage::with_params("ncm_convert_failed", vec![error.to_string()]).to_json())?;
+    Ok(report)
 }

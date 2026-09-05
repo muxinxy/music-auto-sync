@@ -1,6 +1,6 @@
 [package]
 name = "music-auto-sync"
-version = "0.5.0"
+version = "0.6.0"
 description = "Portable NetEase Cloud Music playlist synchronizer"
 license = "MIT"
 authors = ["muxinxy"]
@@ -38,6 +38,7 @@ lofty = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 walkdir = "2"
+md5 = "0.7"
 
 [profile.release]
 panic = "abort"

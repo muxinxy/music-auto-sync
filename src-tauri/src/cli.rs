@@ -28,6 +28,7 @@ fn build_state() -> Result<AppState, String> {
         paths: store::AppPaths::new(paths),
         sync_running: AtomicBool::new(false),
         cancel_requested: Arc::new(AtomicBool::new(false)),
+        pause_requested: Arc::new(AtomicBool::new(false)),
     })
 }
 

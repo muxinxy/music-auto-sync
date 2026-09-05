@@ -15,6 +15,8 @@ pub struct AppState {
     pub paths: store::AppPaths,
     pub sync_running: AtomicBool,
     pub cancel_requested: Arc<AtomicBool>,
+    /// 暂停请求：同步任务在曲目边界检查该标志并等待（可继续/取消）。
+    pub pause_requested: Arc<AtomicBool>,
 }
 
 pub fn run() {
@@ -38,6 +40,7 @@ pub fn run() {
             paths: store::AppPaths::new(paths),
             sync_running: AtomicBool::new(false),
             cancel_requested: Arc::new(AtomicBool::new(false)),
+            pause_requested: Arc::new(AtomicBool::new(false)),
         })
         .setup(|app| {
             runtime::tray::install(app.handle())?;
@@ -79,9 +82,14 @@ pub fn run() {
             commands::download_song_with_options,
             commands::set_playlist_enabled,
             commands::set_playlist_overwrite,
+            commands::set_playlist_sync_policy,
+            commands::get_playlist_settings,
             commands::sync_playlist,
             commands::sync_all,
             commands::cancel_sync,
+            commands::pause_sync,
+            commands::resume_sync,
+            commands::get_sync_control,
             commands::get_sync_logs,
             commands::list_quarantine,
             commands::restore_quarantine,
@@ -93,6 +101,17 @@ pub fn run() {
             commands::preflight_playlist,
             commands::show_in_folder,
             commands::check_for_update,
+            commands::get_sync_changes,
+            commands::get_deleted_log,
+            commands::get_playlist_history,
+            commands::restore_deleted_item,
+            commands::restore_playlist_snapshot_cmd,
+            commands::get_account_stats,
+            commands::get_local_stats,
+            commands::convert_ncm_manual,
+            commands::set_auto_launch,
+            commands::clear_sync_history_cmd,
+            commands::preview_playlist_restore_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Music Auto Sync");

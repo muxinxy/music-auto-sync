@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { Alert, Button, Layout, Menu, Tag, Typography, App as AntApp } from "antd";
+import { Alert, Avatar, Button, Layout, Menu, Popconfirm, Space, Tag, Typography, App as AntApp } from "antd";
 import {
   CloudSyncOutlined,
   DeleteOutlined,
@@ -26,6 +26,7 @@ export type PageKey = "login" | "playlists" | "sync" | "quarantine" | "settings"
 
 export interface SyncEventState {
   running: boolean;
+  paused?: boolean;
   progress?: SyncProgress;
 }
 
@@ -61,9 +62,9 @@ export default function App() {
 
   useEffect(() => {
     applyLanguage();
-    refreshLogin().then((status) => {
-      if (status?.loggedIn) setPage((prev) => (prev === "login" ? "playlists" : prev));
-    }).finally(() => setAppReady(true));
+    // 启动始终停留在“账号登录”页（登录后该页显示账号信息与统计）；
+    // 已登录也由用户自行点击左侧菜单进入歌单页。
+    refreshLogin().finally(() => setAppReady(true));
 
     api.checkForUpdate().then((version) => {
       if (version) setUpdateVersion(version);
@@ -73,13 +74,23 @@ export default function App() {
       setSync((s) => ({ ...s, progress: e.payload }));
     });
     const unlistenState = listen<boolean>("sync://state", (e) => {
-      setSync((s) => ({ ...s, running: e.payload }));
+      setSync((s) => ({ ...s, running: e.payload, paused: e.payload ? s.paused : false }));
       if (e.payload === false) refreshLogin();
     });
+    // 轮询同步控制状态（暂停/继续），保持 UI 与后端一致。
+    const poll = setInterval(async () => {
+      try {
+        const ctrl = await api.getSyncControl();
+        setSync((s) => ({ ...s, running: ctrl.running, paused: ctrl.running ? ctrl.paused : false }));
+      } catch {
+        // 忽略轮询失败
+      }
+    }, 1000);
 
     return () => {
       unlistenProgress.then((f) => f());
       unlistenState.then((f) => f());
+      clearInterval(poll);
     };
   }, [applyLanguage, refreshLogin]);
 
@@ -131,22 +142,57 @@ export default function App() {
             height: 48,
           }}
         >
-          <Typography.Text type="secondary">
-            {login?.loggedIn
-              ? t("app.loggedInAs", { name: login.nickname ?? "" })
-              : t("app.notLoggedIn")}
-          </Typography.Text>
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            {sync.running && sync.progress
-              ? t("app.progressHeader", {
-                  name: sync.progress.playlistName,
-                  phase: progressPhase,
-                  current: sync.progress.current,
-                  total: sync.progress.total,
-                })
-              : ""}
-            {sync.progress?.message ? ` · ${translateProgressMessage(sync.progress.message)}` : ""}
-          </Typography.Text>
+          <Space size={8}>
+            {login?.loggedIn && login.avatarUrl && (
+              <Avatar size={28} src={login.avatarUrl} />
+            )}
+            <Typography.Text type="secondary">
+              {login?.loggedIn
+                ? t("app.loggedInAs", { name: login.nickname ?? "" })
+                : t("app.notLoggedIn")}
+            </Typography.Text>
+          </Space>
+          <Space size={8}>
+            {sync.running && (
+              <Typography.Text type={sync.paused ? "warning" : "secondary"} style={{ fontSize: 12 }}>
+                {sync.paused
+                  ? t("app.syncPaused")
+                  : sync.progress
+                    ? t("app.progressHeader", {
+                        name: sync.progress.playlistName,
+                        phase: progressPhase,
+                        current: sync.progress.current,
+                        total: sync.progress.total,
+                      })
+                    : t("app.syncing")}
+                {sync.progress?.message && !sync.paused
+                  ? ` · ${translateProgressMessage(sync.progress.message)}`
+                  : ""}
+              </Typography.Text>
+            )}
+            {sync.running && !sync.paused && (
+              <Button size="small" onClick={() => api.pauseSync()}>
+                {t("app.pause")}
+              </Button>
+            )}
+            {sync.running && sync.paused && (
+              <Button size="small" type="primary" onClick={() => api.resumeSync()}>
+                {t("app.resume")}
+              </Button>
+            )}
+            {sync.running && (
+              <Popconfirm
+                title={t("app.cancelConfirm")}
+                okText={t("app.cancel")}
+                cancelText={t("playlists.cancel")}
+                onConfirm={() => api.cancelSync()}
+              >
+                <Button size="small" danger>
+                  {t("app.cancelTask")}
+                </Button>
+              </Popconfirm>
+            )}
+          </Space>
         </Header>
         <Content style={{ overflow: "auto", background: "#f5f5f5" }}>
           {updateVersion && (

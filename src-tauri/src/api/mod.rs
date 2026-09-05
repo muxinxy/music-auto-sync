@@ -61,11 +61,17 @@ pub struct PlaylistInfo {
     pub cover_img_url: String,
     pub track_count: u32,
     pub subscribed: bool,
+    /// 歌单创建者 userId（用于区分“我创建的” vs “我收藏的”）。
+    pub creator_user_id: Option<u64>,
     pub enabled: bool,
     pub synced: u32,
     pub overwrite: bool,
     pub last_sync: Option<String>,
     pub last_result: Option<String>,
+    /// 该歌单的同步模式覆盖（来自 config.playlists；None = 跟随全局）。
+    pub mode_override: Option<String>,
+    /// 该歌单的“补录手动放入的歌”开关覆盖（None = 跟随全局）。
+    pub upload_manual: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -504,11 +510,16 @@ impl NeteaseApi {
                         .get("subscribed")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    creator_user_id: playlist
+                        .pointer("/creator/userId")
+                        .and_then(Value::as_u64),
                     enabled: setting.is_some_and(|setting| setting.enabled),
                     synced: 0,
                     overwrite: setting.is_some_and(|setting| setting.overwrite),
                     last_sync: None,
                     last_result: None,
+                    mode_override: setting.and_then(|s| s.mode_override.clone()),
+                    upload_manual: setting.and_then(|s| s.upload_manual),
                 })
             })
             .collect())
@@ -902,6 +913,143 @@ impl NeteaseApi {
                 .map(str::to_owned),
         };
         Ok((cookie, Some(status)))
+    }
+
+    /// 判断歌单是否本人创建：/playlist/detail 的 creator.userId 与当前登录 uid 比对。
+    pub async fn playlist_owned_by_me(&self, playlist_id: u64, my_uid: u64) -> Result<bool> {
+        let (json, _) = self
+            .get("/playlist/detail", &[("id", playlist_id.to_string())])
+            .await?;
+        let creator_uid = json
+            .pointer("/playlist/creator/userId")
+            .and_then(Value::as_u64);
+        Ok(creator_uid == Some(my_uid))
+    }
+
+    /// 往歌单加入曲目（需要登录；仅对“我创建的”歌单有效）。
+    /// 批量分批（每批 50），返回实际加入数量。
+    pub async fn playlist_add_tracks(&self, pid: u64, ids: &[u64]) -> Result<usize> {
+        self.playlist_mutate("add", pid, ids).await
+    }
+
+    /// 从歌单移除曲目（需要登录；仅对“我创建的”歌单有效）。
+    pub async fn playlist_remove_tracks(&self, pid: u64, ids: &[u64]) -> Result<usize> {
+        self.playlist_mutate("del", pid, ids).await
+    }
+
+    async fn playlist_mutate(&self, op: &str, pid: u64, ids: &[u64]) -> Result<usize> {
+        let mut done = 0usize;
+        for chunk in ids.chunks(50) {
+            let joined = chunk
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let (json, _) = self
+                .get(
+                    "/playlist/tracks",
+                    &[
+                        ("op", op.into()),
+                        ("pid", pid.to_string()),
+                        ("tracks", joined),
+                        ("timestamp", cache_buster()),
+                    ],
+                )
+                .await?;
+            let code = json.get("code").and_then(Value::as_i64).unwrap_or(200);
+            if code != 200 {
+                let message = json
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("网易云 API 返回错误")
+                    .to_owned();
+                anyhow::bail!("playlist {} failed: {code} {message}", op);
+            }
+            done += chunk.len();
+        }
+        Ok(done)
+    }
+
+    /// 用本地文件信息匹配网易曲目（/search/match）。
+    /// 返回匹配到的 song id（取第一个结果的 id）。
+    pub async fn search_match_local(
+        &self,
+        title: &str,
+        album: &str,
+        artist: &str,
+        duration_secs: f64,
+        md5: &str,
+    ) -> Result<Option<u64>> {
+        let (json, _) = self
+            .get(
+                "/search/match",
+                &[
+                    ("title", title.to_owned()),
+                    ("album", album.to_owned()),
+                    ("artist", artist.to_owned()),
+                    ("duration", format!("{:.2}", duration_secs)),
+                    ("md5", md5.to_owned()),
+                    ("timestamp", cache_buster()),
+                ],
+            )
+            .await?;
+        let code = json.get("code").and_then(Value::as_i64).unwrap_or(200);
+        if code != 200 {
+            return Ok(None);
+        }
+        let songs = json
+            .get("result")
+            .and_then(|r| r.get("songs"))
+            .and_then(Value::as_array);
+        let first = songs.and_then(|arr| arr.first());
+        Ok(first
+            .and_then(|song| song.get("id"))
+            .and_then(Value::as_u64))
+    }
+
+    /// 用户详情（/user/detail）→ 返回 profile 顶层（level 等在 data 内）。
+    pub async fn user_detail(&self, uid: u64) -> Result<serde_json::Value> {
+        let (json, _) = self
+            .get("/user/detail", &[("uid", uid.to_string())])
+            .await?;
+        Ok(json
+            .get("profile")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// 用户计数（/user/subcount）：歌单/收藏/mv/dj 数量。
+    /// 实测该接口把字段放在 JSON 顶层（无 data 包裹），故返回整包由调用方取键。
+    pub async fn user_subcount(&self) -> Result<serde_json::Value> {
+        let (json, _) = self.get("/user/subcount", &[]).await?;
+        Ok(json)
+    }
+
+    /// 用户等级（/user/level）。
+    pub async fn user_level(&self) -> Result<serde_json::Value> {
+        let (json, _) = self.get("/user/level", &[]).await?;
+        Ok(json
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
+    }
+
+    /// VIP 信息：优先 /vip/info/v2，失败回 /vip/info。
+    pub async fn vip_info(&self) -> Result<serde_json::Value> {
+        let v2 = self.get("/vip/info/v2", &[]).await;
+        if let Ok((json, _)) = v2 {
+            if json.get("code").and_then(Value::as_i64).unwrap_or(200) == 200 {
+                return Ok(json
+                    .get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null));
+            }
+        }
+        let (json, _) = self.get("/vip/info", &[]).await?;
+        Ok(json
+            .get("data")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null))
     }
 
     /// 当 /song/url/v1 拿不到地址时的兜底候选：依次尝试

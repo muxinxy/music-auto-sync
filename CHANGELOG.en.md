@@ -4,6 +4,23 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.6.0] - 2026-09-05
+
+### Added
+
+- Download modes: each playlist (or globally) can choose mirror / add-only / delete-only, applied to the playlist→local download side (mirror by default).
+- Optional push-back: when “add manually placed local songs to the NetEase playlist” is enabled (globally or per playlist), sync matches local audio files not in the NetEase playlist (preferring the `.netease.json` sidecar, otherwise `/search/match` with title/artist/album/duration/md5) and adds them to the playlist. It applies only to playlists you created and is add-only — it never deletes NetEase tracks (so deleting a local file can never cascade into deleting it from the playlist). Off by default.
+- Full change history: every add/delete of each sync (downloads, quarantined local extras, tracks added to or removed from the playlist) is written to a change log; the sync page lists them and allows per-track restore.
+- Delete log with restore: quarantined local files can be moved back to their original path; tracks removed from a NetEase playlist can be added back; every sync saves a playlist snapshot so you can roll a playlist back to any historical state (owned playlists only).
+- Playlist grouping: the list can be filtered by All / Created by me / Favorited (based on `creator.userId`); each playlist can override its direction and mode.
+- Account stats panel: avatar, NetEase level, VIP, following/followers, created/favorited playlist counts, liked count, plus local cumulative sync stats (runs/added/quarantined/NCM converted/failed and current local file count).
+- Standalone NCM converter: open from Settings, pick .ncm files or a folder to batch-convert, choose to keep or delete sources, and optionally ignore existing conversion markers.
+- Avatar shown in the top bar.
+
+### Changed
+
+- Manual, startup, scheduled and tray sync all follow each playlist's direction × mode configuration.
+
 ## [0.5.0] - 2026-09-05
 
 ### Added

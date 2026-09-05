@@ -1,21 +1,37 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   Alert,
+  Avatar,
   Button,
   Card,
+  Col,
+  Descriptions,
   Input,
   Result,
+  Row,
   Space,
   Spin,
+  Statistic,
   Tabs,
+  Tag,
   Typography,
   message as antMessage,
 } from "antd";
-import { QrcodeOutlined, UserOutlined } from "@ant-design/icons";
+import {
+  CloudSyncOutlined,
+  CrownOutlined,
+  DatabaseOutlined,
+  FireOutlined,
+  HeartOutlined,
+  QrcodeOutlined,
+  SyncOutlined,
+  TeamOutlined,
+  UserOutlined,
+} from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { formatError } from "../errors";
-import type { LoginStatus } from "../types";
+import type { AccountStats, LocalStats, LoginStatus } from "../types";
 
 interface Props {
   login: LoginStatus | null;
@@ -32,9 +48,25 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
   const [qrState, setQrState] = useState<string>("");
   const [loginSucceeded, setLoginSucceeded] = useState(false);
   const [loading, setLoading] = useState(false);
+  const [account, setAccount] = useState<AccountStats | null>(null);
+  const [localStats, setLocalStats] = useState<LocalStats | null>(null);
   const keyRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionRef = useRef(0);
+
+  const loadStats = useCallback(async () => {
+    try {
+      const [a, l] = await Promise.all([api.getAccountStats(), api.getLocalStats()]);
+      setAccount(a);
+      setLocalStats(l);
+    } catch {
+      // 统计接口失败不影响登录页
+    }
+  }, []);
+
+  useEffect(() => {
+    if (login?.loggedIn) loadStats();
+  }, [login?.loggedIn, loadStats]);
 
   const stopPolling = useCallback(() => {
     sessionRef.current += 1;
@@ -127,20 +159,78 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
   }, [login?.loggedIn, startQr, stopPolling]);
 
   if (login?.loggedIn) {
+    const loadingStats = !account && !localStats;
     return (
-      <div style={{ padding: 24 }}>
-        <Card style={{ maxWidth: 560 }}>
-          <Result
-            icon={<UserOutlined style={{ color: "#c20c0c" }} />}
-            title={t("login.loggedInAs", { name: login.nickname ?? "" })}
-            subTitle={t("login.subtitle")}
-            extra={
-              <Button danger onClick={async () => { await api.logout(); onLogout(); }}>
-                {t("login.logout")}
-              </Button>
-            }
-          />
+      <div style={{ padding: 24, maxWidth: 860 }}>
+        {/* 个人信息头 */}
+        <Card style={{ marginBottom: 16, textAlign: "center" }}>
+          <Avatar size={72} src={account?.avatarUrl || login.avatarUrl} style={{ marginBottom: 8 }}>
+            {(account?.nickname ?? login.nickname ?? "?").slice(0, 1)}
+          </Avatar>
+          <div>
+            <Typography.Title level={4} style={{ marginBottom: 4, display: "inline-block" }}>
+              {account?.nickname ?? login.nickname ?? ""}
+            </Typography.Title>
+            <Space size={4} style={{ marginLeft: 8 }} wrap>
+              {account?.level != null && (
+                <Tag color="blue" icon={<FireOutlined />}>
+                  {t("login.level", { level: account.level })}
+                </Tag>
+              )}
+              {account?.vipLevel != null && account.vipLevel > 0 && (
+                <Tag color="gold" icon={<CrownOutlined />}>
+                  {t("login.vip", { level: account.vipLevel })}
+                </Tag>
+              )}
+            </Space>
+          </div>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {t("login.subtitle")}
+          </Typography.Text>
+          <div style={{ marginTop: 12 }}>
+            <Button danger onClick={async () => { await api.logout(); onLogout(); }}>
+              {t("login.logout")}
+            </Button>
+            <Button style={{ marginLeft: 8 }} onClick={() => api.openLoginLogDirectory()}>
+              {t("login.openLogDir")}
+            </Button>
+          </div>
         </Card>
+
+        {loadingStats ? (
+          <Card style={{ textAlign: "center", padding: 24 }}>
+            <Spin />
+          </Card>
+        ) : (
+          <Row gutter={[16, 16]}>
+            {/* 网易数据 */}
+            <Col xs={24} md={12}>
+              <Card size="small" title={<Space><TeamOutlined /><span>{t("login.cardNetEase")}</span></Space>}>
+                <Row gutter={[8, 8]}>
+                  <Col span={12}><Statistic title={t("login.statFollows")} value={account?.follows ?? 0} prefix={<TeamOutlined />} /></Col>
+                  <Col span={12}><Statistic title={t("login.statFolloweds")} value={account?.followeds ?? 0} prefix={<TeamOutlined />} /></Col>
+                  <Col span={12}><Statistic title={t("login.statCreatedPlaylists")} value={account?.createdPlaylistCount ?? 0} prefix={<CloudSyncOutlined />} /></Col>
+                  <Col span={12}><Statistic title={t("login.statSubscribedPlaylists")} value={account?.subscribedPlaylistCount ?? 0} prefix={<HeartOutlined />} /></Col>
+                  <Col span={12}><Statistic title={t("login.statLiked")} value={account?.likedCount ?? 0} prefix={<HeartOutlined />} /></Col>
+                  <Col span={12}><Statistic title={t("login.statEvents")} value={account?.eventCount ?? 0} /></Col>
+                </Row>
+              </Card>
+            </Col>
+            {/* 本地同步统计 */}
+            <Col xs={24} md={12}>
+              <Card size="small" title={<Space><DatabaseOutlined /><span>{t("login.cardLocal")}</span></Space>}>
+                <Row gutter={[8, 8]}>
+                  <Col span={12}><Statistic title={t("login.statTotalSync")} value={localStats?.totalSyncRuns ?? 0} prefix={<SyncOutlined />} /></Col>
+                  <Col span={12}><Statistic title={t("login.statLocalFiles")} value={localStats?.currentLocalFiles ?? 0} prefix={<DatabaseOutlined />} /></Col>
+                  <Col span={12}><Statistic title={t("login.statAdded")} value={localStats?.totalAdded ?? 0} /></Col>
+                  <Col span={12}><Statistic title={t("login.statQuarantined")} value={localStats?.totalQuarantined ?? 0} /></Col>
+                  <Col span={12}><Statistic title={t("login.statNcmConverted")} value={localStats?.totalNcmConverted ?? 0} /></Col>
+                  <Col span={12}><Statistic title={t("login.statFailed")} value={localStats?.totalFailed ?? 0} valueStyle={{ color: (localStats?.totalFailed ?? 0) > 0 ? "#cf1322" : undefined }} /></Col>
+                </Row>
+              </Card>
+            </Col>
+          </Row>
+        )}
       </div>
     );
   }

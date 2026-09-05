@@ -13,6 +13,11 @@ It talks to any service compatible with [NeteaseCloudMusicApi Enhanced](https://
 - NetEase QR code or SMS verification-code login; credentials are stored only in the local data directory
 - Manual, startup and scheduled sync, plus a system tray
 - Missing songs are downloaded; removed songs are moved to quarantine where you can restore or delete them
+- Download modes (playlist→local): mirror / add-only / delete-only, configurable globally or per playlist (mirror by default); an optional switch pushes manually placed local songs back into the NetEase playlist (add-only, never deletes remotely, off by default).
+- Every sync records each add/delete change with per-track restore; playlist snapshots let you roll back to any historical state
+- Playlists grouped by Created by me / Favorited; favorited playlists cannot be written to NetEase and sync one-way automatically
+- Account page shows NetEase level, VIP, following/followers, playlist/liked counts and local cumulative sync stats
+- Standalone NCM converter: pick files or folders to batch-convert, keeping or deleting sources
 - Pre-flight availability/quality check: the song table shows per-song downloadability and the best quality your account can get before you download
 - Concurrent downloads with batch pre-fetched URLs; per-track automatic retry and “retry failed only” for batch downloads
 - Configurable playlist folder/filename templates, quality, concurrency, retry count, download URL source, and an artist separator used consistently in filenames and ID3 tags
@@ -45,8 +50,8 @@ music-auto-sync_x64_portable/
 1. Run `Music Auto Sync.exe`.
 2. In “Settings”, choose the music root directory and, if needed, your API address (defaults to a compatible service of [NeteaseCloudMusicApi Enhanced](https://github.com/NeteaseCloudMusicApiEnhanced/api-enhanced)).
 3. Sign in on the “Account Login” page with the QR code or an SMS verification code.
-4. On the “Playlists” page, enable the playlists you want to sync, then click “Sync all” or wait for the auto task. Open a playlist to browse its songs (with availability/local-file status), download individual songs, clean files no longer in the playlist, or back up Liked/Purchased songs from the top bar.
-5. Files removed from a playlist go to `<music root>/.quarantine/`; manage them in “Quarantine”.
+4. On the “Playlists” page, enable the playlists you want to sync, then click “Sync all” or wait for the auto task. Open a playlist to browse its songs (with availability/local-file status) and download individual songs; configure the sync direction and mode (mirror / add-only / delete-only) globally or per playlist in Settings. In mirror mode, local extras and files removed from a playlist are moved to quarantine automatically and stay restorable from the delete log; you can also back up Liked/Purchased songs from the top bar.
+5. Files removed from a playlist (or local extras in mirror mode) go to `<music root>/.quarantine/`; restore or delete them in “Quarantine” or under “Sync Tasks → Restorable deletions”.
 
 The app data directory is resolved in this order:
 
