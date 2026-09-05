@@ -4,6 +4,7 @@ import {
   Button,
   Card,
   Checkbox,
+  Col,
   Divider,
   Form,
   Input,
@@ -12,6 +13,7 @@ import {
   Modal,
   Progress,
   Radio,
+  Row,
   Select,
   Space,
   Switch,
@@ -170,13 +172,15 @@ export default function SettingsPage() {
   };
 
   return (
-    <div style={{ padding: 24, maxWidth: 920 }}>
+    <div style={{ padding: 24, maxWidth: 1280, margin: "0 auto" }}>
       <Form
         form={form}
         layout="vertical"
         initialValues={defaultConfig}
         onValuesChange={scheduleAutoSave}
       >
+        <Row gutter={[24, 0]}>
+        <Col xs={24} xl={12}>
         <Card title={t("settings.cardData")} style={{ marginBottom: 16 }}>
           <Alert
             type={info?.dataDirPortable ? "success" : "info"}
@@ -237,6 +241,26 @@ export default function SettingsPage() {
           </Form.Item>
         </Card>
 
+        <Card title={t("settings.cardSyncMode")} style={{ marginBottom: 16 }}>
+          <Form.Item label={t("settings.labelMode")} name="syncMode" extra={t("settings.modeExtra")}>
+            <Radio.Group>
+              <Radio.Button value="mirror">{t("settings.modeMirror")}</Radio.Button>
+              <Radio.Button value="add_only">{t("settings.modeAddOnly")}</Radio.Button>
+              <Radio.Button value="delete_only">{t("settings.modeDeleteOnly")}</Radio.Button>
+            </Radio.Group>
+          </Form.Item>
+          <Form.Item
+            name="uploadManual"
+            valuePropName="checked"
+            label={t("settings.labelUploadManual")}
+            extra={t("settings.uploadManualExtra")}
+          >
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
+          </Form.Item>
+          <Alert type="info" showIcon message={t("settings.syncModeHint")} />
+        </Card>
+        </Col>
+        <Col xs={24} xl={12}>
         <Card title={t("settings.cardDownload")} style={{ marginBottom: 16 }}>
           <Form.Item label={t("settings.labelQuality")} name="quality">
             <Radio.Group>
@@ -313,7 +337,12 @@ export default function SettingsPage() {
           <Form.Item name="closeToTray" valuePropName="checked" label={t("settings.cbCloseToTray")}>
             <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
           </Form.Item>
-          <Form.Item name="useRandomCnIp" valuePropName="checked" label={t("settings.cbRandomCnIp")}>
+          <Form.Item
+            name="useRandomCnIp"
+            valuePropName="checked"
+            label={t("settings.cbRandomCnIp")}
+            extra={t("settings.cbRandomCnIpExtra")}
+          >
             <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
           </Form.Item>
           <Form.Item label={t("settings.labelLanguage")} name="language">
@@ -330,6 +359,9 @@ export default function SettingsPage() {
             <Select
               style={{ width: 200 }}
               onChange={async (value) => {
+                // 先落盘再派发主题变更事件，main.tsx 才会读到新值即时生效。
+                if (!readyRef.current || moving) return;
+                await save(form.getFieldsValue(true));
                 window.dispatchEvent(new Event("theme-changed"));
               }}
               options={[
@@ -347,25 +379,8 @@ export default function SettingsPage() {
             <Input placeholder={t("settings.placeholderProxy")} />
           </Form.Item>
         </Card>
-
-        <Card title={t("settings.cardSyncMode")} style={{ marginBottom: 16 }}>
-          <Form.Item label={t("settings.labelMode")} name="syncMode" extra={t("settings.modeExtra")}>
-            <Radio.Group>
-              <Radio.Button value="mirror">{t("settings.modeMirror")}</Radio.Button>
-              <Radio.Button value="add_only">{t("settings.modeAddOnly")}</Radio.Button>
-              <Radio.Button value="delete_only">{t("settings.modeDeleteOnly")}</Radio.Button>
-            </Radio.Group>
-          </Form.Item>
-          <Form.Item
-            name="uploadManual"
-            valuePropName="checked"
-            label={t("settings.labelUploadManual")}
-            extra={t("settings.uploadManualExtra")}
-          >
-            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
-          </Form.Item>
-          <Alert type="info" showIcon message={t("settings.syncModeHint")} />
-        </Card>
+        </Col>
+        </Row>
 
         <NcmToolModal open={ncmToolOpen} onClose={() => setNcmToolOpen(false)} />
       </Form>

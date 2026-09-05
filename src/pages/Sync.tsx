@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import {
   Button,
   Card,
@@ -20,12 +20,12 @@ import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import i18n from "../i18n";
 import { api } from "../api";
+import { syncStore } from "../syncStore";
 import { formatError, translateUi } from "../errors";
 import type {
   DeletedLogEntry,
   SyncChangeEntry,
   SyncErrorDetail,
-  SyncProgress,
   SyncReport,
   UiMessage,
 } from "../types";
@@ -39,15 +39,25 @@ interface LogEntry {
 }
 
 function renderMessage(raw: string): string {
-  if (raw.startsWith("{")) {
-    try {
-      return translateUi(JSON.parse(raw) as UiMessage);
-    } catch {
-      return raw;
+  return messageCache.get(raw) ?? (() => {
+    let result: string;
+    if (raw.startsWith("{")) {
+      try {
+        result = translateUi(JSON.parse(raw) as UiMessage);
+      } catch {
+        result = raw;
+      }
+    } else {
+      result = raw;
     }
-  }
-  return raw;
+    if (messageCache.size > 2000) messageCache.clear(); // 防长会话膨胀
+    messageCache.set(raw, result);
+    return result;
+  })();
 }
+
+/** 已翻译消息缓存：同一 JSON 字符串多次渲染只解析翻译一次。 */
+const messageCache = new Map<string, string>();
 
 function actionLabel(action: string): string {
   const map: Record<string, string> = {
@@ -62,7 +72,6 @@ function actionLabel(action: string): string {
 
 export default function SyncPage() {
   const { t } = useTranslation();
-  const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [reports, setReports] = useState<SyncReport[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [changes, setChanges] = useState<SyncChangeEntry[]>([]);
@@ -95,14 +104,12 @@ export default function SyncPage() {
   useEffect(() => {
     loadLogs();
     loadChanges();
-    const un1 = listen<SyncProgress>("sync://progress", (e) => setProgress(e.payload));
     const un2 = listen<SyncReport>("sync://report", (e) => {
       setReports((r) => [e.payload, ...r].slice(0, 20));
       loadLogs();
       loadChanges();
     });
     return () => {
-      un1.then((f) => f());
       un2.then((f) => f());
     };
   }, [loadLogs, loadChanges]);
@@ -128,34 +135,9 @@ export default function SyncPage() {
     }
   };
 
-  const phaseLabel = progress
-    ? t(`phases.${progress.phase}`, { defaultValue: progress.phase })
-    : "";
-  const progressMessage =
-    progress?.message.code === "track" && progress.message.params?.[0]
-      ? progress.message.params[0]
-      : progress?.message
-        ? translateUi(progress.message)
-        : "";
-
   return (
     <div style={{ padding: 24 }}>
-      <Card title={t("syncPage.currentTask")} style={{ marginBottom: 16 }}>
-        {progress ? (
-          <>
-            <Typography.Paragraph>
-              <Tag color="processing">{phaseLabel}</Tag>
-              {progress.playlistName} —— {progressMessage}
-            </Typography.Paragraph>
-            <Progress
-              percent={progress.total ? Math.round((progress.current / progress.total) * 100) : 0}
-              status="active"
-            />
-          </>
-        ) : (
-          <Typography.Text type="secondary">{t("syncPage.noTask")}</Typography.Text>
-        )}
-      </Card>
+      <CurrentTaskCard />
 
       {reports.length > 0 && (
         <Card title={t("syncPage.recentResults")} style={{ marginBottom: 16 }} size="small">
@@ -406,6 +388,42 @@ export default function SyncPage() {
         />
       </Card>
     </div>
+  );
+}
+
+/**
+ * “当前任务”卡片：独立订阅高频进度 store，使每曲目进度更新只重渲染本卡片，
+ * 不波及下方的日志/变更/删除大列表。
+ */
+function CurrentTaskCard() {
+  const { t } = useTranslation();
+  const progress = useSyncExternalStore(syncStore.subscribeProgress, syncStore.getProgress);
+  const phaseLabel = progress
+    ? t(`phases.${progress.phase}`, { defaultValue: progress.phase })
+    : "";
+  const progressMessage =
+    progress?.message.code === "track" && progress.message.params?.[0]
+      ? progress.message.params[0]
+      : progress?.message
+        ? translateUi(progress.message)
+        : "";
+  return (
+    <Card title={t("syncPage.currentTask")} style={{ marginBottom: 16 }}>
+      {progress ? (
+        <>
+          <Typography.Paragraph>
+            <Tag color="processing">{phaseLabel}</Tag>
+            {progress.playlistName} —— {progressMessage}
+          </Typography.Paragraph>
+          <Progress
+            percent={progress.total ? Math.round((progress.current / progress.total) * 100) : 0}
+            status="active"
+          />
+        </>
+      ) : (
+        <Typography.Text type="secondary">{t("syncPage.noTask")}</Typography.Text>
+      )}
+    </Card>
   );
 }
 

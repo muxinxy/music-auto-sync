@@ -7,11 +7,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+pub mod cache;
+
 use crate::error::UiMessage;
 use crate::store::config::Config;
+
+use self::cache::ApiCache;
+
+/// 可缓存端点的 TTL（进程内，重启即失效）。
+/// 仅用于低频变化的元数据；易变数据绝不缓存，见各方法内注释。
+const CACHE_TTL_PLAYLIST: Duration = Duration::from_secs(5 * 60);
+const CACHE_TTL_ACCOUNT: Duration = Duration::from_secs(10 * 60);
+const CACHE_TTL_LYRIC: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone)]
 pub struct NeteaseApi {
@@ -20,6 +31,8 @@ pub struct NeteaseApi {
     cookie: Option<String>,
     random_cn_ip: bool,
     download_source: String,
+    /// 进程内 TTL 响应缓存（多实例间 Arc 共享）。同步/写路径用 fresh 实例 = 空缓存。
+    api_cache: Arc<ApiCache>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -53,7 +66,7 @@ pub struct LoginStatus {
     pub avatar_url: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlaylistInfo {
     pub id: u64,
@@ -74,7 +87,7 @@ pub struct PlaylistInfo {
     pub upload_manual: Option<bool>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub id: u64,
     pub name: String,
@@ -88,12 +101,12 @@ pub struct Track {
     pub no: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Artist {
     pub name: String,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Album {
     pub id: u64,
     pub name: String,
@@ -101,7 +114,7 @@ pub struct Album {
     pub pic_url: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaylistTracks {
     pub id: u64,
     pub name: String,
@@ -116,6 +129,10 @@ pub struct SongUrl {
     pub level: Option<String>,
     /// 服务端返回的文件大小（字节），可用于识别试听片段。
     pub size: Option<u64>,
+    /// 服务端返回的比特率（br 字段，bps），用于写官方 163 key 的 bitrate。
+    pub br: Option<u64>,
+    /// 服务端返回的资源 md5（32 位 hex），最接近官方 163 key 的 mp3DocId。
+    pub md5: Option<String>,
 }
 
 /// 单曲可下载性预检结果（来自 /song/detail 的 privilege 字段）。
@@ -222,6 +239,16 @@ impl NeteaseApi {
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
+        // 默认（同步引擎/写路径/CLI）：全新空缓存——进程内不跨请求复用，
+        // 保证每次读取都基于最新远端数据。
+        Self::from_config_with_cache(config, Arc::new(ApiCache::new()))
+    }
+
+    /// 构建带共享缓存的 API 客户端。
+    /// - UI 展示 / 只读命令：把 AppState 持有的进程级缓存传入，重复读取复用响应。
+    /// - 同步引擎 / 写操作：用 `from_config`（全新空缓存），保证每次同步
+    ///   都基于最新曲目与权益，绝不被缓存污染。
+    pub fn from_config_with_cache(config: &Config, api_cache: Arc<ApiCache>) -> Result<Self> {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("zh-CN,zh;q=0.9"));
@@ -247,6 +274,7 @@ impl NeteaseApi {
             cookie: config.cookie.clone(),
             random_cn_ip: config.use_random_cn_ip,
             download_source: config.download_source.clone(),
+            api_cache,
         })
     }
 
@@ -470,7 +498,41 @@ impl NeteaseApi {
         })
     }
 
+    /// 当前用户歌单列表（低频变化，TTL 5 分钟缓存）。
+    /// 注意：仅调用方（UI/只读命令）可读缓存；同步引擎用 fresh 实例，不受影响。
+    /// 缓存只保存远端元数据；本地配置（启用/覆盖/策略）每次调用都按当前 config 重新合并，
+    /// 避免用户改完开关后读到旧值。
+    /// `force` 用于 UI“刷新”按钮：穿透缓存直拉网易并回填缓存。
     pub async fn user_playlists(&self, user_id: u64, config: &Config) -> Result<Vec<PlaylistInfo>> {
+        self.user_playlists_inner(user_id, config, false).await
+    }
+
+    /// 同 [`Self::user_playlists`]，但 `force=true` 时跳过缓存直接请求远端并回填缓存。
+    pub async fn user_playlists_forced(
+        &self,
+        user_id: u64,
+        config: &Config,
+    ) -> Result<Vec<PlaylistInfo>> {
+        self.user_playlists_inner(user_id, config, true).await
+    }
+
+    async fn user_playlists_inner(
+        &self,
+        user_id: u64,
+        config: &Config,
+        force: bool,
+    ) -> Result<Vec<PlaylistInfo>> {
+        if !force {
+            if let Some(cached) = self
+                .api_cache
+                .get("user_playlists", &user_id.to_string(), CACHE_TTL_PLAYLIST)
+            {
+                if let Ok(mut list) = serde_json::from_value::<Vec<PlaylistInfo>>(cached) {
+                    merge_playlist_settings(&mut list, config);
+                    return Ok(list);
+                }
+            }
+        }
         let (json, _) = self
             .get(
                 "/user/playlist",
@@ -482,7 +544,7 @@ impl NeteaseApi {
             .iter()
             .map(|playlist| (playlist.id, playlist))
             .collect();
-        Ok(json
+        let playlists: Vec<PlaylistInfo> = json
             .get("playlist")
             .and_then(Value::as_array)
             .unwrap_or(&vec![])
@@ -522,10 +584,37 @@ impl NeteaseApi {
                     upload_manual: setting.and_then(|s| s.upload_manual),
                 })
             })
-            .collect())
+            .collect();
+        if let Ok(serialized) = serde_json::to_value(&playlists) {
+            self.api_cache
+                .put("user_playlists", &user_id.to_string(), serialized);
+        }
+        Ok(playlists)
     }
 
+    /// 歌单全部曲目（分页拉全）。低频变化，TTL 5 分钟缓存。
+    /// 注意：同步引擎、恢复、隔离等“必须基于最新歌单”的路径用 fresh 实例
+    /// （每次全新空缓存），天然绕过这里；仅 UI 展示/只读命令共享进程级缓存。
     pub async fn playlist_tracks(&self, id: u64) -> Result<PlaylistTracks> {
+        self.playlist_tracks_inner(id, false).await
+    }
+
+    /// 同 [`Self::playlist_tracks`]，但 `force=true` 时跳过缓存直拉并回填（UI“刷新”按钮用）。
+    pub async fn playlist_tracks_forced(&self, id: u64) -> Result<PlaylistTracks> {
+        self.playlist_tracks_inner(id, true).await
+    }
+
+    async fn playlist_tracks_inner(&self, id: u64, force: bool) -> Result<PlaylistTracks> {
+        if !force {
+            if let Some(cached) = self
+                .api_cache
+                .get("playlist_tracks", &id.to_string(), CACHE_TTL_PLAYLIST)
+            {
+                if let Ok(playlist) = serde_json::from_value::<PlaylistTracks>(cached) {
+                    return Ok(playlist);
+                }
+            }
+        }
         let mut offset = 0;
         let mut tracks = Vec::new();
         let mut name = String::new();
@@ -567,7 +656,12 @@ impl NeteaseApi {
                 .unwrap_or_default()
                 .to_owned();
         }
-        Ok(PlaylistTracks { id, name, tracks })
+        let playlist = PlaylistTracks { id, name, tracks };
+        if let Ok(serialized) = serde_json::to_value(&playlist) {
+            self.api_cache
+                .put("playlist_tracks", &id.to_string(), serialized);
+        }
+        Ok(playlist)
     }
 
     pub async fn song_url(&self, id: u64, quality: &str) -> Result<SongUrl> {
@@ -597,15 +691,39 @@ impl NeteaseApi {
             size: data
                 .and_then(|item| item.get("size"))
                 .and_then(Value::as_u64),
+            br: data
+                .and_then(|item| item.get("br"))
+                .and_then(Value::as_u64),
+            md5: data
+                .and_then(|item| item.get("md5"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         })
     }
 
+    /// 歌词文本（对同一首歌基本不变，TTL 24 小时缓存）。
+    /// 写 LRC 的同步路径使用 fresh 实例（空缓存），保证每次重写都基于最新歌词。
     pub async fn lyric(&self, id: u64) -> Result<Option<String>> {
+        if let Some(cached) = self
+            .api_cache
+            .get("lyric", &id.to_string(), CACHE_TTL_LYRIC)
+        {
+            if let Some(text) = cached.as_str() {
+                return Ok(Some(text.to_owned()));
+            }
+            // 缓存了“无歌词”标记（Null）→ 直接返回 None。
+            if cached.is_null() {
+                return Ok(None);
+            }
+        }
         let (json, _) = self.get("/lyric", &[("id", id.to_string())]).await?;
-        Ok(json
+        let lyric = json
             .pointer("/lrc/lyric")
             .and_then(Value::as_str)
-            .map(str::to_owned))
+            .map(str::to_owned);
+        self.api_cache
+            .put("lyric", &id.to_string(), lyric.clone().map_or(Value::Null, Value::String));
+        Ok(lyric)
     }
 
     /// 批量获取歌曲详情（支持逗号分隔多个 id，一次最多 ~100 个）。
@@ -736,6 +854,8 @@ impl NeteaseApi {
                                     .map(str::to_owned),
                                 level: item.get("level").and_then(Value::as_str).map(str::to_owned),
                                 size: item.get("size").and_then(Value::as_u64),
+                                br: item.get("br").and_then(Value::as_u64),
+                                md5: item.get("md5").and_then(Value::as_str).map(str::to_owned),
                             },
                         );
                     }
@@ -761,6 +881,8 @@ impl NeteaseApi {
                                 file_type: song_url.file_type,
                                 level: song_url.level,
                                 size: song_url.size,
+                                br: song_url.br,
+                                md5: song_url.md5,
                             },
                         );
                         break;
@@ -776,6 +898,8 @@ impl NeteaseApi {
                             file_type: Some(format),
                             level: None,
                             size: None,
+                            br: None,
+                            md5: None,
                         },
                     );
                 }
@@ -784,18 +908,43 @@ impl NeteaseApi {
         Ok(result)
     }
 
-    /// 获取当前账号“我喜欢”的歌曲 id 列表。
+    /// 当前账号“我喜欢”的歌曲 id 列表（低频变化，TTL 10 分钟缓存）。
+    /// 同步/写路径用 fresh 实例；备份/统计等只读路径复用缓存减少重复请求。
     pub async fn liked_song_ids(&self, user_id: u64) -> Result<Vec<u64>> {
+        self.liked_song_ids_inner(user_id, false).await
+    }
+
+    /// 同 [`Self::liked_song_ids`]，但 `force=true` 时跳过缓存直拉并回填。
+    pub async fn liked_song_ids_forced(&self, user_id: u64) -> Result<Vec<u64>> {
+        self.liked_song_ids_inner(user_id, true).await
+    }
+
+    async fn liked_song_ids_inner(&self, user_id: u64, force: bool) -> Result<Vec<u64>> {
+        if !force {
+            if let Some(cached) = self
+                .api_cache
+                .get("likelist", &user_id.to_string(), CACHE_TTL_ACCOUNT)
+            {
+                if let Ok(ids) = serde_json::from_value::<Vec<u64>>(cached) {
+                    return Ok(ids);
+                }
+            }
+        }
         let (json, _) = self
             .get("/likelist", &[("uid", user_id.to_string())])
             .await?;
-        Ok(json
+        let ids: Vec<u64> = json
             .get("ids")
             .and_then(Value::as_array)
             .unwrap_or(&vec![])
             .iter()
             .filter_map(Value::as_u64)
-            .collect())
+            .collect();
+        if let Ok(serialized) = serde_json::to_value(&ids) {
+            self.api_cache
+                .put("likelist", &user_id.to_string(), serialized);
+        }
+        Ok(ids)
     }
 
     /// 获取已购买/已下载（单曲）歌曲列表（分页拉全）。
@@ -1008,48 +1157,118 @@ impl NeteaseApi {
     }
 
     /// 用户详情（/user/detail）→ 返回 profile 顶层（level 等在 data 内）。
+    /// 账号资料低频变化，TTL 10 分钟缓存。
     pub async fn user_detail(&self, uid: u64) -> Result<serde_json::Value> {
+        self.user_detail_inner(uid, false).await
+    }
+
+    /// 同 [`Self::user_detail`]，但 `force=true` 时跳过缓存直拉并回填。
+    pub async fn user_detail_forced(&self, uid: u64) -> Result<serde_json::Value> {
+        self.user_detail_inner(uid, true).await
+    }
+
+    async fn user_detail_inner(&self, uid: u64, force: bool) -> Result<serde_json::Value> {
+        if !force {
+            if let Some(cached) = self
+                .api_cache
+                .get("user_detail", &uid.to_string(), CACHE_TTL_ACCOUNT)
+            {
+                return Ok(cached);
+            }
+        }
         let (json, _) = self
             .get("/user/detail", &[("uid", uid.to_string())])
             .await?;
-        Ok(json
+        let profile = json
             .get("profile")
             .cloned()
-            .unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null);
+        self.api_cache.put("user_detail", &uid.to_string(), profile.clone());
+        Ok(profile)
     }
 
     /// 用户计数（/user/subcount）：歌单/收藏/mv/dj 数量。
     /// 实测该接口把字段放在 JSON 顶层（无 data 包裹），故返回整包由调用方取键。
+    /// 低频变化，TTL 10 分钟缓存。
     pub async fn user_subcount(&self) -> Result<serde_json::Value> {
+        self.user_subcount_inner(false).await
+    }
+
+    /// 同 [`Self::user_subcount`]，但跳过缓存直拉并回填。
+    pub async fn user_subcount_forced(&self) -> Result<serde_json::Value> {
+        self.user_subcount_inner(true).await
+    }
+
+    async fn user_subcount_inner(&self, force: bool) -> Result<serde_json::Value> {
+        if !force {
+            if let Some(cached) = self.api_cache.get("user_subcount", "self", CACHE_TTL_ACCOUNT) {
+                return Ok(cached);
+            }
+        }
         let (json, _) = self.get("/user/subcount", &[]).await?;
+        self.api_cache
+            .put("user_subcount", "self", json.clone());
         Ok(json)
     }
 
-    /// 用户等级（/user/level）。
+    /// 用户等级（/user/level）。低频变化，TTL 10 分钟缓存。
     pub async fn user_level(&self) -> Result<serde_json::Value> {
+        self.user_level_inner(false).await
+    }
+
+    /// 同 [`Self::user_level`]，但跳过缓存直拉并回填。
+    pub async fn user_level_forced(&self) -> Result<serde_json::Value> {
+        self.user_level_inner(true).await
+    }
+
+    async fn user_level_inner(&self, force: bool) -> Result<serde_json::Value> {
+        if !force {
+            if let Some(cached) = self.api_cache.get("user_level", "self", CACHE_TTL_ACCOUNT) {
+                return Ok(cached);
+            }
+        }
         let (json, _) = self.get("/user/level", &[]).await?;
-        Ok(json
+        let level = json
             .get("data")
             .cloned()
-            .unwrap_or(serde_json::Value::Null))
+            .unwrap_or(serde_json::Value::Null);
+        self.api_cache.put("user_level", "self", level.clone());
+        Ok(level)
     }
 
     /// VIP 信息：优先 /vip/info/v2，失败回 /vip/info。
+    /// VIP 权益变动会影响预检（那是独立路径，不缓存）；此处仅账号页展示，TTL 10 分钟。
     pub async fn vip_info(&self) -> Result<serde_json::Value> {
-        let v2 = self.get("/vip/info/v2", &[]).await;
-        if let Ok((json, _)) = v2 {
-            if json.get("code").and_then(Value::as_i64).unwrap_or(200) == 200 {
-                return Ok(json
-                    .get("data")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null));
+        self.vip_info_inner(false).await
+    }
+
+    /// 同 [`Self::vip_info`]，但跳过缓存直拉并回填。
+    pub async fn vip_info_forced(&self) -> Result<serde_json::Value> {
+        self.vip_info_inner(true).await
+    }
+
+    async fn vip_info_inner(&self, force: bool) -> Result<serde_json::Value> {
+        if !force {
+            if let Some(cached) = self.api_cache.get("vip_info", "self", CACHE_TTL_ACCOUNT) {
+                return Ok(cached);
             }
         }
-        let (json, _) = self.get("/vip/info", &[]).await?;
-        Ok(json
-            .get("data")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null))
+        let v2 = self.get("/vip/info/v2", &[]).await;
+        let data = if let Ok((json, _)) = v2 {
+            if json.get("code").and_then(Value::as_i64).unwrap_or(200) == 200 {
+                json.get("data")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null)
+            } else {
+                let (json, _) = self.get("/vip/info", &[]).await?;
+                json.get("data").cloned().unwrap_or(serde_json::Value::Null)
+            }
+        } else {
+            let (json, _) = self.get("/vip/info", &[]).await?;
+            json.get("data").cloned().unwrap_or(serde_json::Value::Null)
+        };
+        self.api_cache.put("vip_info", "self", data.clone());
+        Ok(data)
     }
 
     /// 当 /song/url/v1 拿不到地址时的兜底候选：依次尝试
@@ -1123,8 +1342,7 @@ fn cache_buster() -> String {
         .to_string()
 }
 
-fn parse_download_url(json: &Value) -> Option<(String, String)> {
-    let data = json.get("data")?;
+fn parse_download_url(json: &Value) -> Option<(String, String)> {    let data = json.get("data")?;
     if let Some(array) = data.as_array() {
         let first = array.first()?;
         let url = first.get("url")?.as_str()?;
@@ -1136,6 +1354,20 @@ fn parse_download_url(json: &Value) -> Option<(String, String)> {
     }
     let url = data.get("url")?.as_str()?;
     Some((url.to_owned(), "mp3".into()))
+}
+
+/// 把本地配置（启用/覆盖/策略）重新合并进歌单元数据。
+/// 远端元数据可缓存，但这些字段来自 config，变化时需即时反映。
+fn merge_playlist_settings(playlists: &mut [PlaylistInfo], config: &Config) {
+    for playlist in playlists.iter_mut() {
+        let Some(setting) = config.playlists.iter().find(|s| s.id == playlist.id) else {
+            continue;
+        };
+        playlist.enabled = setting.enabled;
+        playlist.overwrite = setting.overwrite;
+        playlist.mode_override.clone_from(&setting.mode_override);
+        playlist.upload_manual = setting.upload_manual;
+    }
 }
 
 fn safe_header(value: Option<&str>) -> Option<String> {

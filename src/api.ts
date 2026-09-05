@@ -5,6 +5,7 @@ import type {
   BatchItemResult,
   Config,
   DeletedLogEntry,
+  LocalMatchPreview,
   LocalStats,
   LoginStatus,
   NcmConvertReport,
@@ -37,9 +38,10 @@ export const api = {
   loginWithCaptcha: (phone: string, captcha: string) =>
     invoke<LoginStatus>("login_with_captcha", { phone, captcha }),
 
-  listPlaylists: () => invoke<PlaylistInfo[]>("list_playlists"),
-  getPlaylistSongs: (id: number) =>
-    invoke<PlaylistSongsResult>("get_playlist_songs", { id }),
+  listPlaylists: (force?: boolean) =>
+    invoke<PlaylistInfo[]>("list_playlists", { force: force ?? false }),
+  getPlaylistSongs: (id: number, force?: boolean) =>
+    invoke<PlaylistSongsResult>("get_playlist_songs", { id, force: force ?? false }),
   downloadSongWithOptions: (
     playlistId: number,
     trackId: number,
@@ -86,8 +88,12 @@ export const api = {
       writeLrc,
       overwrite,
     }),
-  preflightPlaylist: (id: number) =>
-    invoke<TrackAvailability[]>("preflight_playlist", { id }),
+  preflightPlaylist: (id: number, force?: boolean) =>
+    invoke<TrackAvailability[]>("preflight_playlist", { id, force: force ?? false }),
+  previewLocalMatch: (id: number) =>
+    invoke<LocalMatchPreview[]>("preview_local_match", { id }),
+  previewLocalFolder: (folder: string) =>
+    invoke<LocalMatchPreview[]>("preview_local_folder", { folder }),
   showInFolder: (path: string) => invoke<void>("show_in_folder", { path }),
   checkForUpdate: () => invoke<string | null>("check_for_update"),
   setPlaylistSyncPolicy: (
@@ -104,7 +110,8 @@ export const api = {
       globalUploadManual: boolean;
     }>("get_playlist_settings", { id }),
 
-  getAccountStats: () => invoke<AccountStats>("get_account_stats"),
+  getAccountStats: (force?: boolean) =>
+    invoke<AccountStats>("get_account_stats", { force: force ?? false }),
   getLocalStats: () => invoke<LocalStats>("get_local_stats"),
 
   getSyncChanges: (limit: number) =>

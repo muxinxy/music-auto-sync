@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import ReactDOM from "react-dom/client";
 import { ConfigProvider, theme as antdTheme } from "antd";
 import zhCN from "antd/locale/zh_CN";
@@ -12,6 +12,16 @@ function resolveTheme(pref: string, systemDark: boolean): "light" | "dark" {
   if (pref === "dark") return "dark";
   return systemDark ? "dark" : "light";
 }
+
+/** 暗色下的柔和覆盖：背景退到深灰而非纯黑、边框/分割线降对比，减轻“白色刺眼”。 */
+const softDarkTokens = {
+  colorBgLayout: "#141414",
+  colorBgContainer: "#1f1f1f",
+  colorBgElevated: "#262626",
+  colorBorder: "#3a3a3a",
+  colorBorderSecondary: "#333333",
+  colorSplit: "#333333",
+};
 
 function Root() {
   const [language, setLanguage] = useState<string>(i18n.language);
@@ -59,16 +69,22 @@ function Root() {
     document.documentElement.style.colorScheme = mode;
   }, [mode]);
 
+  const themeConfig = useMemo(
+    () => ({
+      algorithm: mode === "dark" ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
+      token: {
+        colorPrimary: "#c20c0c",
+        borderRadius: 6,
+        ...(mode === "dark" ? softDarkTokens : {}),
+      },
+    }),
+    [mode]
+  );
+
   return (
     <ConfigProvider
       locale={language === "en" ? enUS : zhCN}
-      theme={{
-        algorithm: mode === "dark" ? antdTheme.darkAlgorithm : antdTheme.defaultAlgorithm,
-        token: {
-          colorPrimary: "#c20c0c",
-          borderRadius: 6,
-        },
-      }}
+      theme={themeConfig}
     >
       <App />
     </ConfigProvider>

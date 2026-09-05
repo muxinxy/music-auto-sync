@@ -42,6 +42,13 @@ fn api_error_class(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// 构建带进程级共享缓存的 API 客户端（仅 UI 展示 / 只读命令使用）。
+/// 任何写路径、同步引擎路径一律用 `NeteaseApi::from_config`（fresh 空缓存），
+/// 保证读取/写入都基于最新远端状态。
+fn cached_api(state: &State<'_, AppState>, config: &Config) -> Result<NeteaseApi, String> {
+    NeteaseApi::from_config_with_cache(config, state.api_cache.clone()).map_err(command_error)
+}
+
 fn anyhow_to_ui(error: anyhow::Error) -> String {
     if let Some(api_error) = error.downcast_ref::<crate::api::ApiCallError>() {
         api_error.ui().to_json()
@@ -87,6 +94,8 @@ pub fn set_data_dir(
     new.write_portable_marker(&new.root)
         .map_err(command_error)?;
     state.paths.set(new.clone());
+    // 数据目录已切换：清空内存缓存（缓存 key 不跨目录复用）。
+    state.api_cache.clear_all();
     Ok(AppInfo {
         data_dir: new.root.to_string_lossy().into(),
         data_dir_portable: true,
@@ -157,6 +166,8 @@ pub async fn check_login_qr(
         config.cookie = Some(cookie);
         config.cookie_user = None;
         store::config::save(&paths.config_file, &config).map_err(command_error)?;
+        // 账号切换：清掉上个账号的缓存数据。
+        state.api_cache.clear_all();
 
         let mut saved = LoginDiagnostic::new(
             "session_cookie_saved",
@@ -303,22 +314,34 @@ pub fn logout(state: State<'_, AppState>) -> Result<(), String> {
     let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
     config.cookie = None;
     config.cookie_user = None;
-    store::config::save(&paths.config_file, &config).map_err(command_error)
+    store::config::save(&paths.config_file, &config).map_err(command_error)?;
+    // 账号已切换：清空所有按账号/歌单缓存，避免泄露上一个账号的数据。
+    state.api_cache.clear_all();
+    Ok(())
 }
 
 #[tauri::command]
-pub async fn list_playlists(state: State<'_, AppState>) -> Result<Vec<PlaylistInfo>, String> {
+pub async fn list_playlists(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<Vec<PlaylistInfo>, String> {
     let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
     let user = config
         .cookie_user
         .as_ref()
         .context("请先登录")
         .map_err(command_error)?;
-    let mut playlists = NeteaseApi::from_config(&config)
-        .map_err(command_error)?
-        .user_playlists(user.user_id, &config)
-        .await
-        .map_err(command_error)?;
+    let api = cached_api(&state, &config)?;
+    // force=true（UI 刷新按钮）：穿透 5 分钟缓存直拉网易并回填。
+    let mut playlists = if force.unwrap_or(false) {
+        api.user_playlists_forced(user.user_id, &config)
+            .await
+            .map_err(command_error)?
+    } else {
+        api.user_playlists(user.user_id, &config)
+            .await
+            .map_err(command_error)?
+    };
     fill_synced_counts(&state, &mut playlists);
     fill_last_sync(&state, &mut playlists);
     Ok(playlists)
@@ -405,14 +428,19 @@ pub struct PlaylistSongsResult {
 pub async fn get_playlist_songs(
     state: State<'_, AppState>,
     id: u64,
+    force: Option<bool>,
 ) -> Result<PlaylistSongsResult, String> {
     let paths = state.paths.get();
     let config = store::config::load(&paths.config_file).map_err(command_error)?;
-    let playlist = NeteaseApi::from_config(&config)
-        .map_err(command_error)?
-        .playlist_tracks(id)
-        .await
-        .map_err(command_error)?;
+    // UI 展示：读进程级共享缓存，避免重复整表拉取（歌单变更后由同步/下载完成事件
+    // 与 TTL 双重保证新鲜度）。force=true（抽屉“刷新”按钮）穿透缓存直拉。
+    let api = cached_api(&state, &config)?;
+    let playlist = if force.unwrap_or(false) {
+        api.playlist_tracks_forced(id).await
+    } else {
+        api.playlist_tracks(id).await
+    }
+    .map_err(command_error)?;
     let conn = database::open(&paths.database_file).map_err(command_error)?;
     let mut songs = Vec::with_capacity(playlist.tracks.len());
     for (index, track) in playlist.tracks.iter().enumerate() {
@@ -941,6 +969,8 @@ pub async fn login_with_captcha(
     config.cookie = Some(cookie);
     config.cookie_user = status.as_ref().and_then(|s| cookie_user_from_status(s));
     store::config::save(&paths.config_file, &config).map_err(command_error)?;
+    // 账号切换：清掉上个账号的缓存数据。
+    state.api_cache.clear_all();
     Ok(status.unwrap_or(LoginStatus {
         logged_in: true,
         nickname: None,
@@ -1049,15 +1079,231 @@ pub async fn manual_prune(state: State<'_, AppState>, id: u64) -> Result<usize, 
         .map_err(|message| message.to_json())
 }
 
+/// 本地文件匹配预览条目：歌单文件夹里每个音频的解析结果。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalMatchPreview {
+    /// 本地文件路径（歌单文件夹内）。
+    pub path: String,
+    /// 文件名（不含目录）。
+    pub file_name: String,
+    /// 解析出的网易曲目 id（旁车/ID3/文件名匹配；无命中则为 null）。
+    pub netease_id: Option<u64>,
+    /// 是否命中当前歌单中的曲目。
+    pub matched: bool,
+    /// 命中时对应的曲目名。
+    pub track_name: Option<String>,
+    /// 该曲目是否已在歌单标记为已同步（DB 登记且文件存在）。
+    pub synced: bool,
+    /// 该本地文件是否正是 DB 中登记的已同步文件（路径一致）。
+    pub is_registered_file: bool,
+    /// 匹配来源：sidecar / key163 / id3 / tag / none。
+    pub match_kind: String,
+}
+
+/// 扫描一个本地歌单文件夹并把其中音频与给定曲目列表匹配（共用核心）。
+/// 优先级：旁车 → 标签 163 key/netease-id → ID3 标签标题+艺术家。纯只读，零网络。
+async fn preview_folder_matches(
+    folder: std::path::PathBuf,
+    playlist_id: u64,
+    tracks: &[crate::api::Track],
+    db_file: &std::path::Path,
+) -> Vec<LocalMatchPreview> {
+    if !folder.is_dir() {
+        return Vec::new();
+    }
+    let canonical_folder = folder.canonicalize().unwrap_or(folder.clone());
+    // DB 已登记路径（判定 synced / is_registered_file）。
+    let registered_map: std::collections::HashMap<u64, String> = database::open(db_file)
+        .ok()
+        .and_then(|conn| {
+            let mut stmt = conn
+                .prepare("SELECT track_id, local_path FROM track_files WHERE playlist_id=?1")
+                .ok()?;
+            let rows = stmt
+                .query_map([playlist_id as i64], |row| {
+                    Ok((row.get::<_, i64>(0)? as u64, row.get(1)?))
+                })
+                .ok()?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .ok()?;
+            Some(rows.into_iter().collect())
+        })
+        .unwrap_or_default();
+
+    // 文件名匹配候选：尚未被可靠识别占用的曲目，按歌名预筛以提速。
+    let mut used_ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for (path, marker_id) in sync::list_local_audio_with_id(&folder) {
+        let file_name = path
+            .file_name()
+            .and_then(|x| x.to_str())
+            .unwrap_or_default()
+            .to_owned();
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+        let is_registered_file = registered_map.values().any(|p| {
+            std::path::Path::new(p)
+                .canonicalize()
+                .map(|c| c == canonical)
+                .unwrap_or(false)
+        });
+
+        // 1) 旁车/标签可靠标记。细分来源：旁车 → sidecar；
+        //    标签里的 163 key 解出的 → key163；旧版纯文本 netease-id → id3。
+        let mut netease_id = marker_id;
+        let sidecar_exists = path
+            .with_extension(format!(
+                "{}.netease.json",
+                path.extension().and_then(|x| x.to_str()).unwrap_or("mp3")
+            ))
+            .is_file();
+        let mut match_kind = if sidecar_exists {
+            Some("sidecar")
+        } else if marker_id.is_some() {
+            // 区分 163 key 与旧纯文本：读 comment 文本判断。
+            let has_163 = crate::core::sync::read_comment_text(&path)
+                .is_some_and(|t| t.contains(crate::core::netease_key::KEY_PREFIX));
+            Some(if has_163 { "key163" } else { "id3" })
+        } else {
+            None
+        };
+        // 2) ID3 标签标题+艺术家匹配（仅当标记缺失且非已登记文件时兜底）。
+        if netease_id.is_none() && !is_registered_file {
+            if let Some((tag_title, tag_artist)) = crate::core::sync::read_local_tags(&path) {
+                if let Some(t) = tracks.iter().find(|t| {
+                    !used_ids.contains(&t.id)
+                        && crate::core::filename_match::tag_matches_track(
+                            &tag_title,
+                            &tag_artist,
+                            t,
+                        )
+                }) {
+                    netease_id = Some(t.id);
+                    match_kind = Some("tag");
+                }
+            }
+        }
+
+        let in_playlist = netease_id.is_some_and(|id| tracks.iter().any(|t| t.id == id));
+        if let Some(id) = netease_id {
+            used_ids.insert(id);
+        }
+        let track_name = netease_id
+            .and_then(|id| tracks.iter().find(|t| t.id == id).map(|t| t.name.clone()));
+        let synced = in_playlist
+            && netease_id.is_some_and(|id| {
+                registered_map
+                    .get(&id)
+                    .is_some_and(|p| std::path::Path::new(p).is_file())
+            });
+        let display_path = canonical
+            .strip_prefix(&canonical_folder)
+            .unwrap_or(&canonical)
+            .to_string_lossy()
+            .into_owned();
+        out.push(LocalMatchPreview {
+            path: display_path,
+            file_name,
+            netease_id,
+            matched: in_playlist,
+            track_name,
+            synced,
+            is_registered_file,
+            match_kind: match_kind.unwrap_or("none").to_owned(),
+        });
+    }
+    out
+}
+
+/// 本地匹配预览（按网易歌单 id，只读）：扫描该歌单的本地文件夹，展示每个本地音频
+/// 解析出的网易曲目、是否在歌单、是否已同步。不下载、不改名、不写库。
+#[tauri::command]
+pub async fn preview_local_match(
+    state: State<'_, AppState>,
+    id: u64,
+) -> Result<Vec<LocalMatchPreview>, String> {
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let root = config
+        .music_root
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .context("请先在设置中配置音乐根目录")
+        .map_err(command_error)?;
+    // 预览需要最新曲目：穿透缓存强制拉取。
+    let api = cached_api(&state, &config)?;
+    let playlist = api.playlist_tracks_forced(id).await.map_err(command_error)?;
+    let folder = sync::playlist_folder_path(
+        &root,
+        &config.folder_template,
+        &config.artist_separator,
+        &playlist,
+    );
+    Ok(preview_folder_matches(folder, id, &playlist.tracks, &paths.database_file).await)
+}
+
+/// 本地匹配预览（按本地文件夹名驱动）：musicRoot 下名为 `folder` 的子目录即歌单文件夹。
+/// 若网易账号存在同名歌单则用其曲目列表匹配；找不到同名歌单时仅列出本地文件（未匹配）。
+#[tauri::command]
+pub async fn preview_local_folder(
+    state: State<'_, AppState>,
+    folder: String,
+) -> Result<Vec<LocalMatchPreview>, String> {
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file).map_err(command_error)?;
+    let root = config
+        .music_root
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .context("请先在设置中配置音乐根目录")
+        .map_err(command_error)?;
+    let folder_path = root.join(&folder);
+    if !folder_path.is_dir() {
+        return Ok(vec![]);
+    }
+    let api = cached_api(&state, &config)?;
+    // 找网易同名歌单 id（归一化比较，兼容大小写/空格）。
+    let user = config
+        .cookie_user
+        .as_ref()
+        .context("请先登录")
+        .map_err(command_error)?;
+    let mut playlist_id: u64 = 0;
+    let mut tracks: Vec<crate::api::Track> = Vec::new();
+    if let Ok(playlists) = api.user_playlists(user.user_id, &config).await {
+        let norm = |s: &str| crate::core::filename_match::normalize_title(s);
+        let target = norm(&folder);
+        if let Some(matched) = playlists.iter().find(|p| norm(&p.name) == target) {
+            if let Ok(pl) = api.playlist_tracks_forced(matched.id).await {
+                playlist_id = matched.id;
+                tracks = pl.tracks;
+            }
+        }
+    }
+    if playlist_id == 0 {
+        // 无同名歌单：用 0 作为“无对照”，仅列文件。
+        playlist_id = 0;
+    }
+    Ok(preview_folder_matches(folder_path, playlist_id, &tracks, &paths.database_file).await)
+}
+
 /// 预检歌单歌曲可用性与最高音质（供歌曲列表标注）。
+/// 曲目列表走共享缓存去重；预检结果本身（VIP/版权实时）从不缓存。
+/// force=true（抽屉“刷新”按钮）穿透曲目列表缓存直拉。
 #[tauri::command]
 pub async fn preflight_playlist(
     state: State<'_, AppState>,
     id: u64,
+    force: Option<bool>,
 ) -> Result<Vec<serde_json::Value>, String> {
     let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
-    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
-    let playlist = api.playlist_tracks(id).await.map_err(command_error)?;
+    let api = cached_api(&state, &config)?;
+    let playlist = if force.unwrap_or(false) {
+        api.playlist_tracks_forced(id).await
+    } else {
+        api.playlist_tracks(id).await
+    }
+    .map_err(command_error)?;
     let preflight = api
         .preflight_tracks(&playlist.tracks)
         .await
@@ -1259,6 +1505,8 @@ pub async fn restore_deleted_item(
             .map_err(|m| m.to_json())
     };
     let _ = app.emit("sync://state", false);
+    // 网易歌单曲目被加回 → 该歌单缓存失效。
+    state.api_cache.invalidate_namespace("playlist_tracks");
     result
 }
 
@@ -1278,6 +1526,8 @@ pub async fn restore_playlist_snapshot_cmd(
         .await
         .map_err(|m| m.to_json());
     let _ = app.emit("sync://state", false);
+    // 歌单内容被恢复改写 → 该歌单缓存失效。
+    state.api_cache.invalidate_namespace("playlist_tracks");
     result
 }
 
@@ -1303,14 +1553,20 @@ pub struct AccountStats {
 }
 
 #[tauri::command]
-pub async fn get_account_stats(state: State<'_, AppState>) -> Result<AccountStats, String> {
+pub async fn get_account_stats(
+    state: State<'_, AppState>,
+    force: Option<bool>,
+) -> Result<AccountStats, String> {
     let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
     let user = config
         .cookie_user
         .as_ref()
         .context("请先登录")
         .map_err(command_error)?;
-    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    // 账号资料低频变化：共享缓存 + TTL（user_detail/user_level/subcount/vip/likelist）。
+    // force=true（登录页“刷新统计”按钮）穿透全部缓存直拉并回填。
+    let api = cached_api(&state, &config)?;
+    let force = force.unwrap_or(false);
     let mut stats = AccountStats {
         nickname: Some(user.nickname.clone()),
         user_id: Some(user.user_id),
@@ -1318,7 +1574,12 @@ pub async fn get_account_stats(state: State<'_, AppState>) -> Result<AccountStat
     };
 
     // 头像/昵称/关注/粉丝/动态来自 user/detail 的 profile。
-    if let Ok(detail) = api.user_detail(user.user_id).await {
+    let detail = if force {
+        api.user_detail_forced(user.user_id).await
+    } else {
+        api.user_detail(user.user_id).await
+    };
+    if let Ok(detail) = detail {
         if !detail.is_null() {
             stats.avatar_url = detail.get("avatarUrl").and_then(|v| v.as_str()).map(str::to_owned);
             stats.nickname = detail.get("nickname").and_then(|v| v.as_str()).map(str::to_owned);
@@ -1328,13 +1589,23 @@ pub async fn get_account_stats(state: State<'_, AppState>) -> Result<AccountStat
         }
     }
     // 等级来自 /user/level 的 data.level。
-    if let Ok(level) = api.user_level().await {
+    let level = if force {
+        api.user_level_forced().await
+    } else {
+        api.user_level().await
+    };
+    if let Ok(level) = level {
         if !level.is_null() {
             stats.level = level.get("level").and_then(value_as_i64);
         }
     }
     // 歌单创建/收藏数量来自 /user/subcount（字段在顶层，非 data）。
-    if let Ok(subcount) = api.user_subcount().await {
+    let subcount = if force {
+        api.user_subcount_forced().await
+    } else {
+        api.user_subcount().await
+    };
+    if let Ok(subcount) = subcount {
         if !subcount.is_null() {
             stats.created_playlist_count = subcount
                 .get("createdPlaylistCount")
@@ -1344,7 +1615,12 @@ pub async fn get_account_stats(state: State<'_, AppState>) -> Result<AccountStat
                 .and_then(value_as_i64);
         }
     }
-    if let Ok(vip) = api.vip_info().await {
+    let vip = if force {
+        api.vip_info_forced().await
+    } else {
+        api.vip_info().await
+    };
+    if let Ok(vip) = vip {
         if !vip.is_null() {
             stats.vip_level = vip
                 .get("redVipLevel")
@@ -1352,7 +1628,12 @@ pub async fn get_account_stats(state: State<'_, AppState>) -> Result<AccountStat
                 .and_then(value_as_i64);
         }
     }
-    if let Ok(ids) = api.liked_song_ids(user.user_id).await {
+    let liked = if force {
+        api.liked_song_ids_forced(user.user_id).await
+    } else {
+        api.liked_song_ids(user.user_id).await
+    };
+    if let Ok(ids) = liked {
         stats.liked_count = Some(ids.len() as u64);
     }
     Ok(stats)

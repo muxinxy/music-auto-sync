@@ -15,6 +15,7 @@ import {
   Segmented,
   Select,
   Space,
+  Spin,
   Switch,
   Table,
   Tag,
@@ -40,6 +41,7 @@ import { api } from "../api";
 import { formatError, translateUi, uiMessage } from "../errors";
 import type {
   BatchItemResult,
+  LocalMatchPreview,
   LoginStatus,
   PlaylistHistoryEntry,
   PlaylistInfo,
@@ -88,7 +90,12 @@ function displayLastResult(raw?: string | null): string {
 const QUALITY_OPTIONS = ["standard", "higher", "exhigh", "lossless", "hires"] as const;
 const VARIABLE_HINT = "{音轨号} {歌手} {标题} {专辑} {网易云ID}";
 const CACHE_TTL_MS = 60_000;
-const playlistCache: { at: number; data: PlaylistInfo[] } = { at: 0, data: [] };
+/** 歌单列表缓存：key 绑定登录账号，账号切换立即视为 miss，避免展示上一账号数据。 */
+const playlistCache: { userId: number | null; at: number; data: PlaylistInfo[] } = {
+  userId: null,
+  at: 0,
+  data: [],
+};
 
 export default function PlaylistsPage({ login, sync }: Props) {
   const { t } = useTranslation();
@@ -109,6 +116,10 @@ export default function PlaylistsPage({ login, sync }: Props) {
     uploadManual: boolean | null;
   } | null>(null);
   const [historyList, setHistoryList] = useState<PlaylistHistoryEntry[]>([]);
+  const [matchOpen, setMatchOpen] = useState(false);
+  const [matchList, setMatchList] = useState<LocalMatchPreview[]>([]);
+  const [matchLoading, setMatchLoading] = useState(false);
+  const [matchPlaylistId, setMatchPlaylistId] = useState<number | null>(null);
 
   const [dlTarget, setDlTarget] = useState<{
     playlistId: number;
@@ -125,13 +136,21 @@ export default function PlaylistsPage({ login, sync }: Props) {
   const load = useCallback(
     async (force = false) => {
       if (!login?.loggedIn) return;
-      if (!force && Date.now() - playlistCache.at < CACHE_TTL_MS && playlistCache.data.length > 0) {
+      const userId = login.userId ?? null;
+      const cacheFresh =
+        playlistCache.userId === userId &&
+        !force &&
+        Date.now() - playlistCache.at < CACHE_TTL_MS &&
+        playlistCache.data.length > 0;
+      if (cacheFresh) {
         setPlaylists(playlistCache.data);
         return;
       }
       setLoading(true);
       try {
-        const data = await api.listPlaylists();
+        // force=true（刷新按钮/操作后重载）时穿透后端 TTL 缓存直拉网易。
+        const data = await api.listPlaylists(force);
+        playlistCache.userId = userId;
         playlistCache.at = Date.now();
         playlistCache.data = data;
         setPlaylists(data);
@@ -141,62 +160,64 @@ export default function PlaylistsPage({ login, sync }: Props) {
         setLoading(false);
       }
     },
-    [login?.loggedIn, t]
+    [login?.loggedIn, login?.userId, t]
   );
 
   useEffect(() => {
     load();
   }, [load]);
 
-  const openDetail = useCallback(
-    async (id: number) => {
-      setDetailId(id);
-      setSongsLoading(true);
-      setSongs(null);
-      setAvailability({});
-      setLastReport(null);
-      try {
-        const result = await api.getPlaylistSongs(id);
-        setSongs(result);
-        // 从后端读取该歌单的同步策略（覆盖值 + 全局默认），避免依赖列表缓存。
-        api
-          .getPlaylistSettings(id)
-          .then((s) =>
-            setDetailPolicy({
-              mode: s.modeOverride ?? "",
-              uploadManual: s.uploadManual ?? null,
-            })
-          )
-          .catch(() =>
-            setDetailPolicy({
-              mode: "",
-              uploadManual: null,
-            })
-          );
-        api
-          .getPlaylistHistory(id, 50)
-          .then((h) => setHistoryList(h))
-          .catch(() => setHistoryList([]));
-        // 后台预检可用性/最高音质（失败静默）。
-        setAvailabilityLoading(true);
-        api
-          .preflightPlaylist(id)
-          .then((list) => {
-            const map: Record<number, TrackAvailability> = {};
-            for (const item of list) map[item.id] = item;
-            setAvailability(map);
-          })
-          .catch(() => {})
-          .finally(() => setAvailabilityLoading(false));
-      } catch (e) {
-        antMessage.error(t("playlists.loadSongsFailed", { detail: formatError(e) }));
-        setDetailId(null);
-      } finally {
-        setSongsLoading(false);
-      }
-    },
-    [t]
-  );
+  const openDetail = useCallback(async (id: number) => {
+    setDetailId(id);
+    setSongs(null);
+    setAvailability({});
+    setLastReport(null);
+    // 首次打开不穿透缓存（普通读取）；抽屉内“刷新”按钮穿透。
+    await loadDetail(id, false);
+    // 从后端读取该歌单的同步策略（覆盖值 + 全局默认），避免依赖列表缓存。
+    api
+      .getPlaylistSettings(id)
+      .then((s) =>
+        setDetailPolicy({
+          mode: s.modeOverride ?? "",
+          uploadManual: s.uploadManual ?? null,
+        })
+      )
+      .catch(() =>
+        setDetailPolicy({
+          mode: "",
+          uploadManual: null,
+        })
+      );
+    api
+      .getPlaylistHistory(id, 50)
+      .then((h) => setHistoryList(h))
+      .catch(() => setHistoryList([]));
+  }, []);
+
+  /** 拉取歌单歌曲列表 + 后台预检。force=true 穿透后端 TTL 缓存（刷新按钮用）。 */
+  const loadDetail = useCallback(async (id: number, force: boolean) => {
+    setSongsLoading(true);
+    setAvailabilityLoading(true);
+    try {
+      const result = await api.getPlaylistSongs(id, force);
+      setSongs(result);
+      api
+        .preflightPlaylist(id, force)
+        .then((list) => {
+          const map: Record<number, TrackAvailability> = {};
+          for (const item of list) map[item.id] = item;
+          setAvailability(map);
+        })
+        .catch(() => {})
+        .finally(() => setAvailabilityLoading(false));
+    } catch (e) {
+      antMessage.error(t("playlists.loadSongsFailed", { detail: formatError(e) }));
+      setDetailId(null);
+    } finally {
+      setSongsLoading(false);
+    }
+  }, [t]);
 
   const openDownloadDialog = (playlistId: number, songs: PlaylistSong[]) => {
     dlPauseRef.current = false;
@@ -272,7 +293,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
         setDlTarget(null);
         setSelectedSongs([]);
       }
-      setSongs(await api.getPlaylistSongs(playlistId));
+      setSongs(await api.getPlaylistSongs(playlistId, true));
       load(true);
     } finally {
       setDlDownloading(false);
@@ -298,8 +319,9 @@ export default function PlaylistsPage({ login, sync }: Props) {
     try {
       await api.setPlaylistSyncPolicy(detailId, mode, detailPolicy.uploadManual);
       antMessage.success(t("settings.saved"));
-      // 重新拉取列表并回填保存后的实际覆盖值。
-      const fresh = await api.listPlaylists();
+      // 重新拉取列表并回填保存后的实际覆盖值（仅改本地 config 策略，无需穿透远端缓存）。
+      const fresh = await api.listPlaylists(false);
+      playlistCache.userId = login?.userId ?? null;
       playlistCache.at = Date.now();
       playlistCache.data = fresh;
       setPlaylists(fresh);
@@ -310,6 +332,42 @@ export default function PlaylistsPage({ login, sync }: Props) {
       });
     } catch (e) {
       antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
+    }
+  };
+
+  /** 打开本地匹配预览：给 playlistId 则预选该歌单，否则用列表中第一个。 */
+  const openMatchPreview = async (playlistId?: number) => {
+    const target = playlistId ?? playlists[0]?.id;
+    if (target == null) {
+      antMessage.info(t("playlists.matchPreviewNoPlaylist"));
+      return;
+    }
+    setMatchPlaylistId(target);
+    setMatchOpen(true);
+    setMatchLoading(true);
+    setMatchList([]);
+    try {
+      const list = await api.previewLocalMatch(target);
+      setMatchList(list);
+    } catch (e) {
+      antMessage.error(t("playlists.matchPreviewFailed", { detail: formatError(e) }));
+      setMatchOpen(false);
+    } finally {
+      setMatchLoading(false);
+    }
+  };
+
+  /** 切换预览目标歌单。 */
+  const changeMatchPlaylist = async (id: number) => {
+    setMatchPlaylistId(id);
+    setMatchLoading(true);
+    setMatchList([]);
+    try {
+      setMatchList(await api.previewLocalMatch(id));
+    } catch (e) {
+      antMessage.error(t("playlists.matchPreviewFailed", { detail: formatError(e) }));
+    } finally {
+      setMatchLoading(false);
     }
   };
 
@@ -362,7 +420,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
         setLastReport(report);
         antMessage.warning(t("playlists.syncDoneWithErrors", { failed: report.failed }));
       }
-      setSongs(await api.getPlaylistSongs(id));
+      setSongs(await api.getPlaylistSongs(id, true));
       load(true);
     } catch (e) {
       antMessage.error(t("playlists.syncFailed", { detail: formatError(e) }));
@@ -640,6 +698,9 @@ export default function PlaylistsPage({ login, sync }: Props) {
             <Button icon={<ReloadOutlined />} onClick={() => load(true)} disabled={sync.running}>
               {t("playlists.refresh")}
             </Button>
+            <Button icon={<FolderOpenOutlined />} onClick={() => openMatchPreview()} disabled={sync.running}>
+              {t("playlists.matchPreviewGlobal")}
+            </Button>
             <Dropdown
               menu={{
                 items: [
@@ -816,6 +877,16 @@ export default function PlaylistsPage({ login, sync }: Props) {
         onClose={() => setDetailId(null)}
         extra={
           <Space>
+            <Tooltip title={t("playlists.refreshSongsTip")}>
+              <Button
+                icon={<ReloadOutlined />}
+                loading={songsLoading}
+                disabled={detailId == null || sync.running}
+                onClick={() => detailId != null && loadDetail(detailId, true).then(() => load(true))}
+              >
+                {t("playlists.refreshSongs")}
+              </Button>
+            </Tooltip>
             <Button
               icon={<DownloadOutlined />}
               disabled={selectedSongs.length === 0 || dlDownloading}
@@ -881,6 +952,9 @@ export default function PlaylistsPage({ login, sync }: Props) {
             <Button size="small" type="primary" ghost onClick={saveDetailPolicy}>
               {t("playlists.savePolicy")}
             </Button>
+            <Button size="small" icon={<FolderOpenOutlined />} onClick={() => openMatchPreview(detailId ?? undefined)}>
+              {t("playlists.matchPreview")}
+            </Button>
             {historyList.length > 0 && (
               <Dropdown
                 menu={{
@@ -911,6 +985,113 @@ export default function PlaylistsPage({ login, sync }: Props) {
           pagination={{ pageSize: 50, showSizeChanger: false }}
         />
       </Drawer>
+
+      <Modal
+        title={t("playlists.matchPreviewTitle", {
+          name: songs?.playlistName ?? "",
+          count: matchList.length,
+        })}
+        open={matchOpen}
+        width={880}
+        zIndex={1100}
+        onCancel={() => setMatchOpen(false)}
+        footer={null}
+      >
+        <Space style={{ marginBottom: 12 }} wrap>
+          <Select<number>
+            style={{ width: 320 }}
+            placeholder={t("playlists.matchPickPlaylist")}
+            value={matchPlaylistId ?? undefined}
+            onChange={(v) => changeMatchPlaylist(v)}
+            showSearch
+            optionFilterProp="label"
+            options={playlists.map((p) => ({
+              value: p.id,
+              label: p.name,
+            }))}
+          />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {t("playlists.matchCount", { count: matchList.length })}
+          </Typography.Text>
+        </Space>
+        {matchLoading ? (
+          <div style={{ textAlign: "center", padding: 24 }}>
+            <Spin />
+          </div>
+        ) : (
+          <>
+            <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+              {t("playlists.matchPreviewHint")}
+            </Typography.Paragraph>
+            <Table<LocalMatchPreview>
+              size="small"
+              rowKey={(r) => r.path}
+              dataSource={matchList}
+              pagination={matchList.length > 10 ? { pageSize: 10, showSizeChanger: false } : false}
+              columns={[
+                {
+                  title: t("playlists.matchColFile"),
+                  dataIndex: "path",
+                  ellipsis: true,
+                  render: (v: string) => <Typography.Text style={{ fontSize: 12 }}>{v}</Typography.Text>,
+                },
+                {
+                  title: t("playlists.matchColKind"),
+                  dataIndex: "matchKind",
+                  width: 110,
+                  render: (k: LocalMatchPreview["matchKind"]) => (
+                    <Tag
+                      color={
+                        k === "sidecar" || k === "key163"
+                          ? "blue"
+                          : k === "tag"
+                            ? "green"
+                            : k === "id3"
+                              ? "purple"
+                              : "default"
+                      }
+                    >
+                      {t(`playlists.matchKind.${k}`)}
+                    </Tag>
+                  ),
+                },
+                {
+                  title: t("playlists.matchColResult"),
+                  key: "result",
+                  width: 240,
+                  render: (_, r) => {
+                    if (!r.neteaseId) {
+                      return <Typography.Text type="secondary" style={{ fontSize: 12 }}>-</Typography.Text>;
+                    }
+                    if (!r.matched) {
+                      return <Tag color="default">{t("playlists.matchNotInPlaylist")}</Tag>;
+                    }
+                    return (
+                      <Space size={4} wrap>
+                        <Tag color="green">{t("playlists.matchMatched")}</Tag>
+                        <Typography.Text style={{ fontSize: 12 }}>{r.trackName}</Typography.Text>
+                      </Space>
+                    );
+                  },
+                },
+                {
+                  title: t("playlists.matchColStatus"),
+                  key: "status",
+                  width: 160,
+                  render: (_, r) => {
+                    if (!r.neteaseId) return <Typography.Text type="secondary" style={{ fontSize: 12 }}>-</Typography.Text>;
+                    if (r.synced) return <Tag color="success">{t("playlists.matchSynced")}</Tag>;
+                    if (r.isRegisteredFile) return <Tag color="warning">{t("playlists.matchFileGone")}</Tag>;
+                    if (r.matched) return <Tag color="processing">{t("playlists.matchPendingRename")}</Tag>;
+                    return <Tag>{t("playlists.matchExtra")}</Tag>;
+                  },
+                },
+              ]}
+              locale={{ emptyText: t("playlists.matchEmpty") }}
+            />
+          </>
+        )}
+      </Modal>
 
       <Modal
         title={

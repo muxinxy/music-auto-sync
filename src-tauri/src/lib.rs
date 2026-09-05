@@ -11,8 +11,12 @@ pub mod tags;
 use std::sync::{atomic::AtomicBool, Arc};
 use tauri::Manager;
 
+pub use crate::api::cache::ApiCache;
+
 pub struct AppState {
     pub paths: store::AppPaths,
+    /// 进程级 TTL 响应缓存：UI 展示/只读命令共享；同步引擎用 fresh 实例（见 NeteaseApi）。
+    pub api_cache: Arc<ApiCache>,
     pub sync_running: AtomicBool,
     pub cancel_requested: Arc<AtomicBool>,
     /// 暂停请求：同步任务在曲目边界检查该标志并等待（可继续/取消）。
@@ -38,6 +42,7 @@ pub fn run() {
         }))
         .manage(AppState {
             paths: store::AppPaths::new(paths),
+            api_cache: Arc::new(ApiCache::new()),
             sync_running: AtomicBool::new(false),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             pause_requested: Arc::new(AtomicBool::new(false)),
@@ -99,6 +104,8 @@ pub fn run() {
             commands::get_purchased_songs,
             commands::backup_songs,
             commands::preflight_playlist,
+            commands::preview_local_match,
+            commands::preview_local_folder,
             commands::show_in_folder,
             commands::check_for_update,
             commands::get_sync_changes,

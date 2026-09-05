@@ -24,6 +24,7 @@ import {
   FireOutlined,
   HeartOutlined,
   QrcodeOutlined,
+  ReloadOutlined,
   SyncOutlined,
   TeamOutlined,
   UserOutlined,
@@ -54,9 +55,12 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionRef = useRef(0);
 
-  const loadStats = useCallback(async () => {
+  const loadStats = useCallback(async (force = false) => {
     try {
-      const [a, l] = await Promise.all([api.getAccountStats(), api.getLocalStats()]);
+      const [a, l] = await Promise.all([
+        api.getAccountStats(force),
+        api.getLocalStats(),
+      ]);
       setAccount(a);
       setLocalStats(l);
     } catch {
@@ -161,7 +165,7 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
   if (login?.loggedIn) {
     const loadingStats = !account && !localStats;
     return (
-      <div style={{ padding: 24, maxWidth: 860 }}>
+      <div style={{ padding: 24, maxWidth: 1200, margin: "0 auto" }}>
         {/* 个人信息头 */}
         <Card style={{ marginBottom: 16, textAlign: "center" }}>
           <Avatar size={72} src={account?.avatarUrl || login.avatarUrl} style={{ marginBottom: 8 }}>
@@ -188,6 +192,14 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
             {t("login.subtitle")}
           </Typography.Text>
           <div style={{ marginTop: 12 }}>
+            <Button
+              icon={<ReloadOutlined />}
+              loading={loadingStats}
+              onClick={() => loadStats(true)}
+              style={{ marginRight: 8 }}
+            >
+              {t("login.refreshStats")}
+            </Button>
             <Button danger onClick={async () => { await api.logout(); onLogout(); }}>
               {t("login.logout")}
             </Button>
@@ -236,8 +248,8 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
   }
 
   return (
-    <div style={{ padding: 24 }}>
-      <Card style={{ maxWidth: 560 }}>
+    <div style={{ padding: 24, display: "flex", justifyContent: "center" }}>
+      <Card style={{ maxWidth: 600, width: "100%" }}>
         <Tabs
           centered
           items={[

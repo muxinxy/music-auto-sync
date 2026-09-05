@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from "react";
-import { Alert, Avatar, Button, Layout, Menu, Popconfirm, Space, Tag, Typography, App as AntApp } from "antd";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
+import { Alert, App as AntApp, Avatar, Button, Layout, Menu, Popconfirm, Select, Space, Tag, theme, Typography } from "antd";
 import {
   CloudSyncOutlined,
   DeleteOutlined,
@@ -14,6 +14,7 @@ import i18n, { normalizeLanguage } from "./i18n";
 import { api } from "./api";
 import type { LoginStatus, SyncProgress, UiMessage } from "./types";
 import { translateUi } from "./errors";
+import { syncStore } from "./syncStore";
 import LoginPage from "./pages/Login";
 import PlaylistsPage from "./pages/Playlists";
 import SyncPage from "./pages/Sync";
@@ -33,11 +34,18 @@ export interface SyncEventState {
 export default function App() {
   const { message } = AntApp.useApp();
   const { t } = useTranslation();
+  const { token } = theme.useToken();
   const [page, setPage] = useState<PageKey>("login");
   const [login, setLogin] = useState<LoginStatus | null>(null);
-  const [sync, setSync] = useState<SyncEventState>({ running: false });
   const [appReady, setAppReady] = useState(false);
   const [updateVersion, setUpdateVersion] = useState<string | null>(null);
+  const [prefLanguage, setPrefLanguage] = useState<string>(i18n.language);
+  const [prefTheme, setPrefTheme] = useState<string>("system");
+
+  // 低频运行状态（running/paused）：来自进度外部 store，不随每曲目 progress 重渲染。
+  const syncRunning = useSyncExternalStore(syncStore.subscribeRunning, syncStore.getRunning);
+  const syncPaused = useSyncExternalStore(syncStore.subscribeRunning, syncStore.getPaused);
+  const sync: SyncEventState = { running: syncRunning, paused: syncPaused };
 
   const applyLanguage = useCallback(async () => {
     try {
@@ -62,6 +70,15 @@ export default function App() {
 
   useEffect(() => {
     applyLanguage();
+    // 同步 Header 快捷切换显示值（语言/主题）。
+    api.getConfig().then((cfg) => {
+      setPrefLanguage(normalizeLanguage(cfg.language));
+      setPrefTheme(cfg.theme ?? "system");
+    }).catch(() => {});
+    const onThemeChanged = () => {
+      api.getConfig().then((cfg) => setPrefTheme(cfg.theme ?? "system")).catch(() => {});
+    };
+    window.addEventListener("theme-changed", onThemeChanged);
     // 启动始终停留在“账号登录”页（登录后该页显示账号信息与统计）；
     // 已登录也由用户自行点击左侧菜单进入歌单页。
     refreshLogin().finally(() => setAppReady(true));
@@ -71,26 +88,43 @@ export default function App() {
     }).catch(() => {});
 
     const unlistenProgress = listen<SyncProgress>("sync://progress", (e) => {
-      setSync((s) => ({ ...s, progress: e.payload }));
+      syncStore.setProgress(e.payload);
     });
     const unlistenState = listen<boolean>("sync://state", (e) => {
-      setSync((s) => ({ ...s, running: e.payload, paused: e.payload ? s.paused : false }));
-      if (e.payload === false) refreshLogin();
+      syncStore.setRunning(e.payload, e.payload ? syncStore.getPaused() : false);
     });
     // 轮询同步控制状态（暂停/继续），保持 UI 与后端一致。
-    const poll = setInterval(async () => {
+    // 仅在实际同步期间轮询；空闲时停表，避免常驻每 1 秒一次的 IPC 调用。
+    let poll: ReturnType<typeof setInterval> | null = null;
+    const syncFromControl = async () => {
       try {
         const ctrl = await api.getSyncControl();
-        setSync((s) => ({ ...s, running: ctrl.running, paused: ctrl.running ? ctrl.paused : false }));
+        syncStore.setRunning(ctrl.running, ctrl.running ? ctrl.paused : false);
       } catch {
         // 忽略轮询失败
       }
-    }, 1000);
+    };
+    const ensurePolling = () => {
+      if (syncStore.getRunning() && !poll) {
+        poll = setInterval(syncFromControl, 1000);
+      } else if (!syncStore.getRunning() && poll) {
+        clearInterval(poll);
+        poll = null;
+      }
+    };
+    // 运行状态变化时决定启停轮询。
+    const unsubRunning = syncStore.subscribeRunning(() => {
+      ensurePolling();
+      if (!syncStore.getRunning()) refreshLogin();
+    });
+    ensurePolling();
 
     return () => {
       unlistenProgress.then((f) => f());
       unlistenState.then((f) => f());
-      clearInterval(poll);
+      window.removeEventListener("theme-changed", onThemeChanged);
+      unsubRunning();
+      if (poll) clearInterval(poll);
     };
   }, [applyLanguage, refreshLogin]);
 
@@ -100,9 +134,31 @@ export default function App() {
     setPage("login");
   };
 
-  const progressPhase = sync.progress
-    ? t(`phases.${sync.progress.phase}`, { defaultValue: sync.progress.phase })
-    : "";
+  /** Header 快捷切语言：先落盘再即时生效。 */
+  const changeLanguagePref = async (language: string) => {
+    const normalized = normalizeLanguage(language);
+    setPrefLanguage(normalized);
+    i18n.changeLanguage(normalized);
+    try {
+      const cfg = await api.getConfig();
+      await api.saveConfig({ ...cfg, language: normalized });
+    } catch {
+      // 保存失败不阻塞已生效的语言切换
+    }
+    await api.setLanguage(normalized).catch(() => {});
+  };
+
+  /** Header 快捷切主题：先落盘再派发事件，确保 main.tsx 读到新值即时生效。 */
+  const changeThemePref = async (pref: string) => {
+    setPrefTheme(pref);
+    try {
+      const cfg = await api.getConfig();
+      await api.saveConfig({ ...cfg, theme: pref });
+      window.dispatchEvent(new Event("theme-changed"));
+    } catch {
+      // 保存失败不派发（主题保持原样）
+    }
+  };
 
   const items = [
     { key: "login", icon: <LoginOutlined />, label: t("app.menu.login") },
@@ -127,14 +183,14 @@ export default function App() {
           onClick={(e) => setPage(e.key as PageKey)}
         />
         <div style={{ position: "absolute", bottom: 12, left: 16, color: "#888", fontSize: 12 }}>
-          {sync.running ? <Tag color="processing">{t("app.syncing")}</Tag> : <Tag>{t("app.idle")}</Tag>}
+          {syncRunning ? <Tag color="processing">{t("app.syncing")}</Tag> : <Tag>{t("app.idle")}</Tag>}
         </div>
       </Sider>
       <Layout>
         <Header
           style={{
-            background: "#fff",
-            borderBottom: "1px solid #f0f0f0",
+            background: token.colorBgContainer,
+            borderBottom: `1px solid ${token.colorSplit}`,
             padding: "0 24px",
             display: "flex",
             alignItems: "center",
@@ -153,34 +209,41 @@ export default function App() {
             </Typography.Text>
           </Space>
           <Space size={8}>
-            {sync.running && (
-              <Typography.Text type={sync.paused ? "warning" : "secondary"} style={{ fontSize: 12 }}>
-                {sync.paused
-                  ? t("app.syncPaused")
-                  : sync.progress
-                    ? t("app.progressHeader", {
-                        name: sync.progress.playlistName,
-                        phase: progressPhase,
-                        current: sync.progress.current,
-                        total: sync.progress.total,
-                      })
-                    : t("app.syncing")}
-                {sync.progress?.message && !sync.paused
-                  ? ` · ${translateProgressMessage(sync.progress.message)}`
-                  : ""}
-              </Typography.Text>
-            )}
-            {sync.running && !sync.paused && (
+            <Select<string>
+              size="small"
+              variant="borderless"
+              style={{ width: 84 }}
+              value={prefLanguage}
+              onChange={changeLanguagePref}
+              options={[
+                { value: "zh-CN", label: "中文" },
+                { value: "en", label: "EN" },
+              ]}
+            />
+            <Select<string>
+              size="small"
+              variant="borderless"
+              style={{ width: 96 }}
+              value={prefTheme}
+              onChange={changeThemePref}
+              options={[
+                { value: "system", label: t("app.themeSystemShort") },
+                { value: "light", label: t("app.themeLightShort") },
+                { value: "dark", label: t("app.themeDarkShort") },
+              ]}
+            />
+            <SyncHeaderProgress running={syncRunning} paused={syncPaused} />
+            {syncRunning && !syncPaused && (
               <Button size="small" onClick={() => api.pauseSync()}>
                 {t("app.pause")}
               </Button>
             )}
-            {sync.running && sync.paused && (
+            {syncRunning && syncPaused && (
               <Button size="small" type="primary" onClick={() => api.resumeSync()}>
                 {t("app.resume")}
               </Button>
             )}
-            {sync.running && (
+            {syncRunning && (
               <Popconfirm
                 title={t("app.cancelConfirm")}
                 okText={t("app.cancel")}
@@ -194,7 +257,7 @@ export default function App() {
             )}
           </Space>
         </Header>
-        <Content style={{ overflow: "auto", background: "#f5f5f5" }}>
+        <Content style={{ overflow: "auto", background: token.colorBgLayout }}>
           {updateVersion && (
             <Alert
               banner
@@ -232,6 +295,37 @@ export default function App() {
         </Content>
       </Layout>
     </Layout>
+  );
+}
+
+/**
+ * Header 顶部进度文案：单独订阅高频 progress store，
+ * 使每曲目进度更新只重渲染该小组件，不波及 App/侧栏/歌单页。
+ */
+function SyncHeaderProgress({ running, paused }: { running: boolean; paused: boolean }) {
+  const { t } = useTranslation();
+  const progress = useSyncExternalStore(syncStore.subscribeProgress, syncStore.getProgress);
+
+  if (!running) return null;
+  const progressPhase = progress
+    ? t(`phases.${progress.phase}`, { defaultValue: progress.phase })
+    : "";
+  return (
+    <Typography.Text type={paused ? "warning" : "secondary"} style={{ fontSize: 12 }}>
+      {paused
+        ? t("app.syncPaused")
+        : progress
+          ? t("app.progressHeader", {
+              name: progress.playlistName,
+              phase: progressPhase,
+              current: progress.current,
+              total: progress.total,
+            })
+          : t("app.syncing")}
+      {progress?.message && !paused
+        ? ` · ${translateProgressMessage(progress.message)}`
+        : ""}
+    </Typography.Text>
   );
 }
 

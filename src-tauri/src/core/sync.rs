@@ -293,6 +293,10 @@ async fn sync_one_inner_with_source(
     // 记录本次歌单全量快照（供历史回滚）。
     record_history_snapshot(&conn, &playlist, source)?;
 
+    // 同步改变了歌单（可能新增/隔离/回写）→ 使该歌单的曲目与元数据缓存失效，
+    // 让 UI 下一次读取拿到最新状态。
+    state.api_cache.invalidate_namespace("playlist_tracks");
+
     report.finished_at = database::now();
     let status = if report.failed == 0 { "ok" } else { "error" };
     database::log(
@@ -369,8 +373,21 @@ async fn sync_tracks(
         }
     }
 
+    // 扫描歌单本地文件夹：把“已存在但文件名不符当前模板”的音频解析成 网易id→路径 映射，
+    // 供 worker 在 DB/模板均未命中时匹配，避免旧模板歌曲被重复下载。
+    let local_map = Arc::new(scan_playlist_folder(
+        root,
+        folder_template,
+        artist_separator,
+        playlist,
+    ));
+
     // 滑动窗口并发：维持最多 concurrency 个在途 worker；每完成一个即收集结果，
     // 并在曲目边界检查暂停/取消（暂停时阻塞等待，取消时终止）。
+    // 用 Arc 共享整份歌单/配置，避免每曲目深克隆整表（O(N²) 复制）。
+    let playlist = Arc::new(playlist.clone());
+    let config = Arc::new(config.clone());
+    let prewarmed = prewarmed.map(Arc::new);
     let mut running = tokio::task::JoinSet::new();
     let mut next_index = 0usize;
     let total = playlist.tracks.len();
@@ -392,8 +409,9 @@ async fn sync_tracks(
                 .cloned();
             let app = app.cloned();
             let api = api.clone();
-            let config = config.clone();
-            let playlist = playlist.clone();
+            let playlist = Arc::clone(&playlist);
+            let config = Arc::clone(&config);
+            let local_map = Arc::clone(&local_map);
             let db_file = db_file.to_path_buf();
             let root = root.to_path_buf();
             let logs_dir = logs_dir.to_path_buf();
@@ -407,6 +425,7 @@ async fn sync_tracks(
                     &api,
                     &config,
                     &playlist,
+                    &local_map,
                     &db_file,
                     &root,
                     &folder_template,
@@ -536,6 +555,78 @@ fn record_track_file(
     Ok(())
 }
 
+/// 下载完成后：拉一次 song detail，把歌曲元数据按官方结构加密成 163 key 写入备注。
+/// detail 提供 ar[].id、al.pic/picUrl、mv.id、各音质 br；下载响应的 md5 不在
+/// 本路径透传，mp3DocId 留空（自家读取不受影响）。
+async fn write_official_key_after_download(
+    api: &NeteaseApi,
+    target: &Path,
+    track: &Track,
+    extension: &str,
+) -> Result<()> {
+    let details = api.song_detail_batch(&[track.id]).await?;
+    let Some(song) = details.get(&track.id) else {
+        return Ok(());
+    };
+    let mut meta = detail_to_official_meta(song, track);
+    meta.format = extension.to_ascii_lowercase();
+    let key_text = crate::core::netease_key::encrypt_official(&meta);
+    tags::write_netease_key(target, &key_text)
+}
+
+/// 从 /song/detail 的 song Value + 本地 Track 构造官方 163 key 元数据。
+fn detail_to_official_meta(
+    song: &serde_json::Value,
+    track: &Track,
+) -> crate::core::netease_key::OfficialKeyMeta {
+    use serde_json::Value;
+    let val = |path: &str| song.pointer(path);
+    let artists = val("/ar")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|a| {
+                    Some((
+                        a.get("name")?.as_str()?.to_owned(),
+                        a.get("id")?.as_u64()?,
+                    ))
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            track
+                .ar
+                .iter()
+                .map(|a| (a.name.clone(), 0u64))
+                .collect::<Vec<_>>()
+        });
+    let album = val("/al/name").and_then(Value::as_str).unwrap_or(&track.al.name).to_owned();
+    let album_id = val("/al/id").and_then(Value::as_u64).unwrap_or(track.al.id);
+    let album_pic_doc = val("/al/pic").and_then(Value::as_u64).map(|v| v.to_string());
+    let album_pic = val("/al/picUrl").and_then(Value::as_str).map(str::to_owned);
+    // bitrate：从下载音质对应字段取（h/m/l/sq）。此处未传 quality，取 h（320k 常见）优先，
+    // 其次 m。无损场景由调用方在需要时补充。
+    let bitrate = ["sq", "h", "m", "l"]
+        .iter()
+        .find_map(|k| song.get(*k).and_then(|q| q.get("br")).and_then(Value::as_u64));
+    let duration = val("/dt").and_then(Value::as_u64).unwrap_or(track.dt);
+    let mv_id = song.pointer("/mv/id").and_then(Value::as_u64).unwrap_or(0);
+    crate::core::netease_key::OfficialKeyMeta {
+        music_id: track.id,
+        music_name: track.name.clone(),
+        artists,
+        album,
+        album_id,
+        album_pic_doc_id: album_pic_doc,
+        album_pic,
+        bitrate,
+        mp3_doc_id: None,
+        duration,
+        mv_id,
+        format: "mp3".into(),
+    }
+}
+
 async fn finalize_track(
     api: &NeteaseApi,
     playlist: &PlaylistTracks,
@@ -547,7 +638,7 @@ async fn finalize_track(
     artist_separator: &str,
     conn: &mut rusqlite::Connection,
 ) {
-    if let Err(error) = tags::write_basic_tags(target, track, position, track.id, artist_separator)
+    if let Err(error) = tags::write_basic_tags(target, track, position, artist_separator)
     {
         tracing::warn!(%error, path = %target.display(), "metadata write failed");
     }
@@ -561,12 +652,115 @@ async fn finalize_track(
     let _ = update_snapshot(conn, playlist.id, track.id, position - 1);
 }
 
+/// 计算歌单对应的本地文件夹路径（与下载目标一致）。
+pub(crate) fn playlist_folder_path(
+    root: &Path,
+    folder_template: &str,
+    artist_separator: &str,
+    playlist: &PlaylistTracks,
+) -> PathBuf {
+    root.join(naming::apply_template(
+        folder_template,
+        &playlist.name,
+        &playlist.tracks.first().cloned().unwrap_or_else(empty_track),
+        1,
+        artist_separator,
+    ))
+}
+
+/// 枚举歌单本地文件夹中的音频文件并尝试零网络解析网易 id
+/// （.netease.json 旁车、ID3 `netease-id` comment）。返回 (路径, Option<id>)。
+/// 供同步扫描与“本地匹配预览”共用，**不触发 /search/match 网络请求**。
+pub(crate) fn list_local_audio_with_id(folder: &Path) -> Vec<(PathBuf, Option<u64>)> {
+    if !folder.is_dir() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for entry in WalkDir::new(folder)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let name = path.to_string_lossy();
+        if name.contains(".quarantine") || name.ends_with(".part") {
+            continue;
+        }
+        let ext = path.extension().and_then(|x| x.to_str()).unwrap_or("");
+        if !matches!(
+            ext.to_ascii_lowercase().as_str(),
+            "mp3" | "flac" | "m4a" | "wav" | "ogg" | "aac"
+        ) {
+            continue;
+        }
+        let id = sidecar_netease_id(path).or_else(|| tag_netease_id(path));
+        out.push((path.to_path_buf(), id));
+    }
+    out
+}
+
+/// 扫描该歌单的本地文件夹，把“已存在但文件名不符当前模板”的音频解析成
+/// 网易id → 路径 映射（零网络，只认旁车/ID3）。无标记的音频无法可靠识别，
+/// 保持缺失由正常下载补齐。
+fn scan_playlist_folder(
+    root: &Path,
+    folder_template: &str,
+    artist_separator: &str,
+    playlist: &PlaylistTracks,
+) -> HashMap<u64, PathBuf> {
+    let folder = playlist_folder_path(root, folder_template, artist_separator, playlist);
+    let mut map = HashMap::new();
+    for (path, id) in list_local_audio_with_id(&folder) {
+        if let Some(id) = id {
+            map.entry(id).or_insert(path);
+        }
+    }
+    map
+}
+
+/// 读 .netease.json 旁车里的网易 id（零网络）。
+fn sidecar_netease_id(path: &Path) -> Option<u64> {
+    let sidecar = sidecar_path(path);
+    if !sidecar.is_file() {
+        return None;
+    }
+    let text = fs::read_to_string(sidecar).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    value.get("neteaseId").and_then(|v| v.as_u64())
+}
+
+/// 把已命中的本地旧文件移动到当前模板路径，连同 .lrc 与 .netease.json 旁车一起迁移。
+/// 目标父目录自动创建；目标已存在则返回错误（由调用方决定放弃改名，保留原文件）。
+fn rename_to_target(source: &Path, target: &Path) -> Result<()> {
+    if target.exists() {
+        anyhow::bail!("rename target already exists: {}", target.display());
+    }
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::rename(source, target)?;
+    // 伴生文件（尽力而为）。
+    let source_lrc = source.with_extension("lrc");
+    if source_lrc.is_file() {
+        let _ = fs::rename(source_lrc, target.with_extension("lrc"));
+    }
+    let source_sidecar = sidecar_path(source);
+    if source_sidecar.is_file() {
+        let _ = fs::rename(source_sidecar, sidecar_path(target));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn sync_one_track_worker(
     app: Option<&AppHandle>,
     api: &NeteaseApi,
-    config: &Config,
-    playlist: &PlaylistTracks,
+    config: &Arc<Config>,
+    playlist: &Arc<PlaylistTracks>,
+    local_map: &Arc<HashMap<u64, PathBuf>>,
     db_file: &Path,
     root: &Path,
     folder_template: &str,
@@ -679,6 +873,42 @@ async fn sync_one_track_worker(
         return TrackOutcome::Skipped;
     }
 
+    // DB 与模板均未命中：检查歌单文件夹里是否已有同一首歌（旧模板/手放文件）。
+    // 命中则登记为已同步并把文件重命名到当前模板，避免重复下载。
+    if !overwrite {
+        if let Some(source) = local_map.get(&track.id) {
+            if source.is_file() {
+                let source_ext = source
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("mp3")
+                    .to_ascii_lowercase();
+                let source_target = naming::track_path(
+                    root,
+                    folder_template,
+                    &config.filename_template,
+                    &playlist.name,
+                    track,
+                    position,
+                    &source_ext,
+                    artist_separator,
+                );
+                if source_target != *source && !source_target.exists() {
+                    if let Err(error) = rename_to_target(source, &source_target) {
+                        tracing::warn!(%error, path = %source.display(), "local track rename failed");
+                    } else {
+                        let _ = record_track_file(&mut conn, playlist, track, &source_target, &source_ext);
+                        let _ = write_sidecar(&source_target, playlist.id, track.id);
+                        let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
+                        log_entry.outcome("skipped", &UiMessage::new("track_exists"));
+                        let _ = store::track_log::append(logs_dir, &log_entry);
+                        return TrackOutcome::Skipped;
+                    }
+                }
+            }
+        }
+    }
+
     emit_progress(
         app,
         playlist.id,
@@ -692,9 +922,14 @@ async fn sync_one_track_worker(
     match download_track_with_retry(&download_url, &target, config.retry).await {
         Ok(bytes) => {
             if let Err(error) =
-                tags::write_basic_tags(&target, track, position, track.id, artist_separator)
+                tags::write_basic_tags(&target, track, position, artist_separator)
             {
                 tracing::warn!(%error, path = %target.display(), "metadata write failed");
+            }
+            // 写入官方格式 163 key（含 musicId），供后续精确匹配；失败仅告警。
+            if let Err(error) = write_official_key_after_download(api, &target, track, &extension).await
+            {
+                tracing::warn!(%error, path = %target.display(), "163 key write failed");
             }
             if config.write_lrc {
                 if let Ok(Some(lyrics)) = api.lyric(track.id).await {
@@ -760,7 +995,11 @@ pub async fn download_song_with_options(
     }
     let paths = state.paths.get();
     let config = store::config::load(&paths.config_file).map_err(UiMessage::unknown)?;
-    let api = NeteaseApi::from_config(&config).map_err(UiMessage::unknown)?;
+    // 用共享缓存定位曲目：UI 打开详情抽屉时曲目表已入缓存（TTL 5 分钟），
+    // 批量逐首下载不再为每首歌重复整表拉取网络；仅首次/缓存过期才回源一次。
+    // 下载直链本身仍走 fresh 实例，绝不读缓存（易变）。
+    let api = NeteaseApi::from_config_with_cache(&config, state.api_cache.clone())
+        .map_err(UiMessage::unknown)?;
     let playlist = api.playlist_tracks(playlist_id).await.map_err(|error| {
         UiMessage::with_params("playlist_fetch_failed", vec![error.to_string()])
     })?;
@@ -892,7 +1131,7 @@ pub async fn download_song_with_options(
         }
     }
     if let Err(error) =
-        tags::write_basic_tags(&target, track, index + 1, track.id, artist_separator)
+        tags::write_basic_tags(&target, track, index + 1, artist_separator)
     {
         tracing::warn!(%error, path = %target.display(), "metadata write failed");
     }
@@ -978,7 +1217,7 @@ pub async fn download_track_ids(
 
     // 批量预取直链：一次请求拿多首 url，避免逐首再请求；拿不到的首再走兜底。
     let ids: Vec<u64> = tracks.iter().map(|t| t.id).collect();
-    let prewarmed = api.song_url_batch(&ids, &quality).await.ok();
+    let prewarmed = Arc::new(api.song_url_batch(&ids, &quality).await.ok());
 
     // 滑动窗口并发 + 暂停/取消检查点（与 sync_tracks 一致）。
     let mut running = tokio::task::JoinSet::new();
@@ -1002,7 +1241,8 @@ pub async fn download_track_ids(
             let results = results.clone();
             let file_name_template = config.filename_template.clone();
             let label = label.clone();
-            let prewarmed = prewarmed.clone();
+            // Arc 共享批量预取表：闭包只 clone 命中单曲的 url，避免逐曲复制整表。
+            let prewarmed = Arc::clone(&prewarmed);
             running.spawn(async move {
                 let file_name = naming::apply_template(
                     &file_name_template,
@@ -1012,6 +1252,7 @@ pub async fn download_track_ids(
                     &artist_separator,
                 );
                 let cached_url = prewarmed
+                    .as_ref()
                     .as_ref()
                     .and_then(|map| map.get(&track.id))
                     .cloned();
@@ -1029,7 +1270,6 @@ pub async fn download_track_ids(
                                         &target,
                                         &track,
                                         index + 1,
-                                        track.id,
                                         &artist_separator,
                                     );
                                     if write_lrc {
@@ -1058,7 +1298,6 @@ pub async fn download_track_ids(
                                             &target,
                                             &track,
                                             index + 1,
-                                            track.id,
                                             &artist_separator,
                                         );
                                         if write_lrc {
@@ -1447,8 +1686,8 @@ async fn sync_from_local_to_playlist(
     Ok(())
 }
 
-/// 从本地音频文件解析网易曲目 id：优先读 .netease.json 旁车；否则读 tag+时长+md5，
-/// 调 /search/match 匹配。返回 None 表示无法解析（不写网易侧）。
+/// 从本地音频文件解析网易曲目 id：优先读 .netease.json 旁车；否则读 ID3
+/// `netease-id` comment；最后 tag+时长+md5 调 /search/match。返回 None 表示无法解析。
 async fn local_file_netease_id(api: &NeteaseApi, path: &Path) -> Result<Option<u64>> {
     // 1) 旁车标记。
     let sidecar = sidecar_path(path);
@@ -1461,7 +1700,11 @@ async fn local_file_netease_id(api: &NeteaseApi, path: &Path) -> Result<Option<u
             }
         }
     }
-    // 2) tag 匹配：title/artist/album + duration + md5 → /search/match。
+    // 2) ID3/标签里的 `netease-id:<n>` comment（本软件写标签时写入）。
+    if let Some(id) = tag_netease_id(path) {
+        return Ok(Some(id));
+    }
+    // 3) tag 匹配：title/artist/album + duration + md5 → /search/match。
     match read_local_audio_meta(path) {
         Ok(Some((title, artist, album, duration_secs))) => {
             let md5 = file_md5(path);
@@ -1477,6 +1720,56 @@ async fn local_file_netease_id(api: &NeteaseApi, path: &Path) -> Result<Option<u
         }
         _ => Ok(None),
     }
+}
+
+/// 从音频标签解析网易 id（零网络）：优先解官方 `163 key(Don't modify)`，
+/// 兼容早期纯文本 `netease-id:<n>`。
+fn tag_netease_id(path: &Path) -> Option<u64> {
+    use lofty::file::TaggedFileExt;
+    use lofty::probe::Probe;
+    use lofty::tag::ItemKey;
+    let tagged = Probe::open(path).ok()?.read().ok()?;
+    for tag in tagged.tags() {
+        if let Some(item) = tag.get(&ItemKey::Comment) {
+            if let Some(text) = item.value().text() {
+                if let Some(id) = crate::core::netease_key::parse_music_id(text) {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 读音频标签的标题与艺术家（零网络），供标签匹配。
+pub(crate) fn read_local_tags(path: &Path) -> Option<(String, String)> {
+    use lofty::file::TaggedFileExt;
+    use lofty::probe::Probe;
+    use lofty::tag::Accessor;
+    let tagged = Probe::open(path).ok()?.read().ok()?;
+    let tag = tagged.primary_tag()?;
+    let title = tag.title().map(|v| v.into_owned()).unwrap_or_default();
+    let artist = tag.artist().map(|v| v.into_owned()).unwrap_or_default();
+    if title.is_empty() && artist.is_empty() {
+        return None;
+    }
+    Some((title, artist))
+}
+
+/// 读音频第一条 Comment（备注）文本（零网络），用于区分 163 key 来源。
+pub(crate) fn read_comment_text(path: &Path) -> Option<String> {
+    use lofty::file::TaggedFileExt;
+    use lofty::probe::Probe;
+    use lofty::tag::ItemKey;
+    let tagged = Probe::open(path).ok()?.read().ok()?;
+    for tag in tagged.tags() {
+        if let Some(item) = tag.get(&ItemKey::Comment) {
+            if let Some(text) = item.value().text() {
+                return Some(text.to_owned());
+            }
+        }
+    }
+    None
 }
 
 /// 读本地音频元数据：标题/艺术家/专辑/时长(秒)。

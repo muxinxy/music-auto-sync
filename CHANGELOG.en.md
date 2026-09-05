@@ -4,6 +4,28 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.7.0] - 2026-09-05
+
+### Added
+
+- Local match preview: a “Match preview” entry on the playlists page shows how local audio files map to NetEase tracks per playlist. It first parses the official `163 key(Don't modify)` comment (AES-decrypts the embedded NetEase song id for exact matching), then falls back to ID3 tag title + artists. Match sources are labelled sidecar / 163 key / netease-id / tag / unresolved.
+- Newly downloaded songs get an official-format 163 key comment (enc=0 Latin1 + lang=XXX, byte-identical to files downloaded by the NetEase client, so Windows properties shows it); the NetEase id is no longer written as plain text.
+- Language / theme quick switchers in the top bar (available on every page, applied and saved immediately).
+- Local-file reuse on sync: when a playlist folder already holds the same song (recognized via sidecar / 163 key / tags), it is registered as synced and renamed to the current template instead of being re-downloaded.
+
+### Changed
+
+- Data freshness & performance: NetEase metadata (playlist list/tracks/lyrics/account profile) now has an in-process TTL cache so repeated UI reads don't re-request; the sync engine always uses fresh data and is never cache-stale. Refresh buttons and match preview can force a cache-bypassing fetch.
+- Sync concurrency: workers share the whole playlist/config instead of deep-cloning large objects per track.
+- Dark theme softened: backgrounds are no longer pure black and borders have lower contrast; login/settings content now fills the window responsively; settings items moved to a two-column layout.
+- Theme switching applies immediately (config is persisted before the change event is dispatched — fixed an ordering bug).
+
+### Fixed
+
+- Playlist-list cache leaking across accounts (old account's playlists shown after logout/switch) — cache is now keyed by account.
+- Download progress no longer re-renders the whole UI tree (progress has its own subscription); the idle 1-second poll is stopped when nothing is running.
+- Match-preview dialog hidden behind the song-list drawer (z-index).
+
 ## [0.6.0] - 2026-09-05
 
 ### Added

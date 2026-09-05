@@ -108,6 +108,17 @@ export interface TrackAvailability {
   reason?: string | null;
 }
 
+export interface LocalMatchPreview {
+  path: string;
+  fileName: string;
+  neteaseId?: number | null;
+  matched: boolean;
+  trackName?: string | null;
+  synced: boolean;
+  isRegisteredFile: boolean;
+  matchKind: "sidecar" | "key163" | "id3" | "tag" | "none";
+}
+
 export interface PlaylistSongsResult {
   playlistId: number;
   playlistName: string;

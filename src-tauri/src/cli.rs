@@ -26,6 +26,7 @@ fn build_state() -> Result<AppState, String> {
     let paths = store::paths::DataPaths::discover().map_err(|error| error.to_string())?;
     Ok(AppState {
         paths: store::AppPaths::new(paths),
+        api_cache: Arc::new(crate::ApiCache::new()),
         sync_running: AtomicBool::new(false),
         cancel_requested: Arc::new(AtomicBool::new(false)),
         pause_requested: Arc::new(AtomicBool::new(false)),
