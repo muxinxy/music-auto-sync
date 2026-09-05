@@ -56,8 +56,8 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
 
       - name: Clean previous NSIS bundles
-        # Tauri 从不清空 bundle 目录；若不删，缓存恢复的旧版本安装包会被
-        # 一并上传到新 Release（历史上 v0.1.1→v0.7.0 每个都带上了更早版本的 exe）。
+        # Tauri never cleans the bundle dir; without this, cached older
+        # installers would be uploaded into every new Release.
         shell: pwsh
         run: |
           $nsis = "src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis"
@@ -72,7 +72,8 @@ jobs:
         run: ./scripts/package-portable.ps1
 
       - name: Upload Windows artifacts
-        # artifact 只被 tag 触发的 publish-release 消费；main 分支跑只做构建/测试验证。
+        # Artifacts are only consumed by the tag-triggered publish job;
+        # branch runs just build and test.
         if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
