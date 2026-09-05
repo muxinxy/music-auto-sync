@@ -15,6 +15,8 @@ jobs:
   build-windows:
     name: Build Windows x64
     runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.bare }}
 
     steps:
       - name: Check out source
@@ -55,6 +57,14 @@ jobs:
       - name: Run Rust tests
         run: cargo test --manifest-path src-tauri/Cargo.toml --target x86_64-pc-windows-msvc
 
+      - name: Resolve bare version
+        id: version
+        shell: pwsh
+        run: |
+          $bare = "${{ github.ref_name }}" -replace '^v', ''
+          "bare=$bare" >> $env:GITHUB_OUTPUT
+          Write-Host "Resolved version: $bare"
+
       - name: Clean previous NSIS bundles
         # Tauri never cleans the bundle dir; without this, cached older
         # installers would be uploaded into every new Release.
@@ -81,7 +91,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
           path: |
-            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Music Auto Sync_${{ replace(github.ref_name, 'v', '') }}_x64-setup.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/Music Auto Sync_${{ steps.version.outputs.bare }}_x64-setup.exe
             release/music-auto-sync_x64_portable.zip
 
   publish-release:
@@ -136,5 +146,5 @@ jobs:
         with:
           body: ${{ steps.changelog.outputs.notes }}
           files: |
-            release-assets/**/Music Auto Sync_${{ replace(github.ref_name, 'v', '') }}_x64-setup.exe
+            release-assets/**/Music Auto Sync_${{ needs.build-windows.outputs.version }}_x64-setup.exe
             release-assets/**/music-auto-sync_x64_portable.zip
