@@ -1043,7 +1043,15 @@ export default function PlaylistsPage({ login, sync }: Props) {
                     if (!r.neteaseId) return <Typography.Text type="secondary" style={{ fontSize: 12 }}>-</Typography.Text>;
                     if (r.synced) return <Tag color="success">{t("playlists.matchSynced")}</Tag>;
                     if (r.isRegisteredFile) return <Tag color="warning">{t("playlists.matchFileGone")}</Tag>;
-                    if (r.matched) return <Tag color="processing">{t("playlists.matchPendingRename")}</Tag>;
+                    if (r.matched) {
+                      return (
+                        <Tag color="processing">
+                          {r.nameMatchesTemplate
+                            ? t("playlists.matchPendingRegister")
+                            : t("playlists.matchPendingRename")}
+                        </Tag>
+                      );
+                    }
                     return <Tag>{t("playlists.matchExtra")}</Tag>;
                   },
                 },

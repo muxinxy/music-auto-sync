@@ -32,8 +32,10 @@ fn is_running(app: &AppHandle) -> bool {
             .load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// 任务运行/暂停状态变化后重建托盘菜单。托盘必须在主线程操作，
-/// 异步任务上下文里经此调度（install 内部自带 remove_tray_by_id 防重复）。
+/// 任务运行/暂停状态变化后重建托盘菜单。**必须经此调度而不是直接调 install**：
+/// 托盘重建须在主线程；且在菜单事件回调里同步销毁/重建托盘会和菜单的内部状态
+/// 互锁，导致主线程卡死（应用未响应）。run_on_main_thread 把重建排队到当前
+/// 事件处理返回之后，两个问题同时规避。install 内部自带 remove_tray_by_id。
 pub fn refresh(app: &AppHandle) {
     let handle = app.clone();
     let _ = app.run_on_main_thread(move || {
@@ -106,7 +108,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                     if let Err(error) = sync::sync_enabled_with_source(&app, &state, "tray").await {
                         tracing::warn!(%error, "tray synchronization failed");
                     }
-                    let _ = install(&app);
+                    refresh(&app);
                 });
             }
             "pause" => {
@@ -122,7 +124,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                         .cloud_pause_requested
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
-                let _ = install(app);
+                refresh(app);
             }
             "resume" => {
                 let state = app.state::<AppState>();
@@ -132,7 +134,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 state
                     .cloud_pause_requested
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = install(app);
+                refresh(app);
             }
             "cancel" => {
                 let state = app.state::<AppState>();
@@ -152,7 +154,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 state
                     .cloud_pause_requested
                     .store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = install(app);
+                refresh(app);
             }
             "quit" => app.exit(0),
             _ => {}

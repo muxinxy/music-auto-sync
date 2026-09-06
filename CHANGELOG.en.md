@@ -4,6 +4,14 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.2] - 2026-09-07
+
+### Fixed
+
+- Clicking Pause/Resume/Cancel in the tray froze the app (not responding): the menu callback rebuilt the tray icon synchronously, deadlocking the main thread against the open menu's internal state. The rebuild is now queued to run after the menu event handler returns.
+- Match preview statuses are more accurate: matched-but-unregistered files always showed "Pending rename/register" even when the file name already matched the current naming template (sync would register it directly without renaming). The status now distinguishes "Pending rename/register" from "Pending registration (name matches template)", using the same rule as the sync engine's rename decision.
+- Pause/Resume actions in the UI now also refresh the tray menu labels instead of leaving them stale.
+
 ## [0.8.1] - 2026-09-06
 
 ### Added

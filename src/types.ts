@@ -116,6 +116,8 @@ export interface LocalMatchPreview {
   trackName?: string | null;
   synced: boolean;
   isRegisteredFile: boolean;
+  /** 命中且未登记时：文件名是否已符合当前命名模板（true = 同步时直接登记免改名）。 */
+  nameMatchesTemplate: boolean;
   matchKind: "sidecar" | "key163" | "id3" | "tag" | "none";
 }
 

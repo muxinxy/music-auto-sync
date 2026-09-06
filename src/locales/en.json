@@ -189,6 +189,7 @@
     "matchSynced": "Synced",
     "matchFileGone": "Registered file missing",
     "matchPendingRename": "Pending rename/register",
+    "matchPendingRegister": "Pending registration (name matches template)",
     "matchExtra": "Extra outside playlist",
     "matchEmpty": "No audio files in this playlist folder",
     "syncAll": "Sync all",

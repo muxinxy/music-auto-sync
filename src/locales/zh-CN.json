@@ -189,6 +189,7 @@
     "matchSynced": "已同步",
     "matchFileGone": "登记文件缺失",
     "matchPendingRename": "待改名登记",
+    "matchPendingRegister": "待登记（文件名已符合模板）",
     "matchExtra": "歌单外冗余",
     "matchEmpty": "该歌单文件夹没有音频文件",
     "syncAll": "立即同步全部",

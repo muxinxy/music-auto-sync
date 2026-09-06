@@ -821,9 +821,10 @@ pub fn cancel_sync(state: State<'_, AppState>) -> bool {
 
 /// 暂停当前同步任务（在曲目/歌单边界生效）。
 #[tauri::command]
-pub fn pause_sync(state: State<'_, AppState>) -> bool {
+pub fn pause_sync(app: AppHandle, state: State<'_, AppState>) -> bool {
     if state.sync_running.load(Ordering::SeqCst) {
         state.pause_requested.store(true, Ordering::SeqCst);
+        crate::runtime::tray::refresh(&app);
         true
     } else {
         false
@@ -832,9 +833,10 @@ pub fn pause_sync(state: State<'_, AppState>) -> bool {
 
 /// 继续被暂停的同步任务。
 #[tauri::command]
-pub fn resume_sync(state: State<'_, AppState>) -> bool {
+pub fn resume_sync(app: AppHandle, state: State<'_, AppState>) -> bool {
     if state.sync_running.load(Ordering::SeqCst) && state.pause_requested.swap(false, Ordering::SeqCst)
     {
+        crate::runtime::tray::refresh(&app);
         true
     } else {
         false
@@ -864,9 +866,10 @@ pub fn cancel_cloud_sync(state: State<'_, AppState>) -> bool {
 }
 
 #[tauri::command]
-pub fn pause_cloud_sync(state: State<'_, AppState>) -> bool {
+pub fn pause_cloud_sync(app: AppHandle, state: State<'_, AppState>) -> bool {
     if state.cloud_running.load(Ordering::SeqCst) {
         state.cloud_pause_requested.store(true, Ordering::SeqCst);
+        crate::runtime::tray::refresh(&app);
         true
     } else {
         false
@@ -874,12 +877,13 @@ pub fn pause_cloud_sync(state: State<'_, AppState>) -> bool {
 }
 
 #[tauri::command]
-pub fn resume_cloud_sync(state: State<'_, AppState>) -> bool {
+pub fn resume_cloud_sync(app: AppHandle, state: State<'_, AppState>) -> bool {
     if state.cloud_running.load(Ordering::SeqCst)
         && state
             .cloud_pause_requested
             .swap(false, Ordering::SeqCst)
     {
+        crate::runtime::tray::refresh(&app);
         true
     } else {
         false
@@ -1216,17 +1220,27 @@ pub struct LocalMatchPreview {
     pub synced: bool,
     /// 该本地文件是否正是 DB 中登记的已同步文件（路径一致）。
     pub is_registered_file: bool,
+    /// 命中且未登记时：文件名是否已符合当前命名模板（true = 同步时直接登记免改名）。
+    pub name_matches_template: bool,
     /// 匹配来源：sidecar / key163 / id3 / tag / none。
     pub match_kind: String,
 }
 
 /// 扫描一个本地歌单文件夹并把其中音频与给定曲目列表匹配（共用核心）。
 /// 优先级：旁车 → 标签 163 key/netease-id → ID3 标签标题+艺术家。纯只读，零网络。
+/// 命名参数（root/templates/separator/playlist_name）用于判定"文件名是否已符合
+/// 当前模板"，与同步引擎的改名判定（`naming::track_path`）保持一致。
+#[allow(clippy::too_many_arguments)]
 async fn preview_folder_matches(
     folder: std::path::PathBuf,
     playlist_id: u64,
     tracks: &[crate::api::Track],
     db_file: &std::path::Path,
+    root: &std::path::Path,
+    folder_template: &str,
+    filename_template: &str,
+    artist_separator: &str,
+    playlist_name: &str,
 ) -> Vec<LocalMatchPreview> {
     if !folder.is_dir() {
         return Vec::new();
@@ -1315,6 +1329,35 @@ async fn preview_folder_matches(
                     .get(&id)
                     .is_some_and(|p| std::path::Path::new(p).is_file())
             });
+        // 与同步引擎的改名判定一致：按当前模板生成目标文件名（保留文件现有扩展名），
+        // 与实际文件名做大小写不敏感比较（Windows 文件系统）。
+        let name_matches_template = match netease_id
+            .and_then(|id| tracks.iter().position(|t| t.id == id))
+            .map(|index| (index, &tracks[index]))
+        {
+            Some((index, track)) => {
+                let extension = path
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .unwrap_or("mp3")
+                    .to_ascii_lowercase();
+                let target = crate::core::naming::track_path(
+                    root,
+                    folder_template,
+                    filename_template,
+                    playlist_name,
+                    track,
+                    index + 1,
+                    &extension,
+                    artist_separator,
+                );
+                target
+                    .file_name()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|expected| expected.eq_ignore_ascii_case(&file_name))
+            }
+            None => false,
+        };
         let display_path = canonical
             .strip_prefix(&canonical_folder)
             .unwrap_or(&canonical)
@@ -1328,6 +1371,7 @@ async fn preview_folder_matches(
             track_name,
             synced,
             is_registered_file,
+            name_matches_template,
             match_kind: match_kind.unwrap_or("none").to_owned(),
         });
     }
@@ -1358,7 +1402,18 @@ pub async fn preview_local_match(
         &config.artist_separator,
         &playlist,
     );
-    Ok(preview_folder_matches(folder, id, &playlist.tracks, &paths.database_file).await)
+    Ok(preview_folder_matches(
+        folder,
+        id,
+        &playlist.tracks,
+        &paths.database_file,
+        &root,
+        &config.folder_template,
+        &config.filename_template,
+        &config.artist_separator,
+        &playlist.name,
+    )
+    .await)
 }
 
 /// 本地匹配预览（按本地文件夹名驱动）：musicRoot 下名为 `folder` 的子目录即歌单文件夹。
@@ -1403,7 +1458,18 @@ pub async fn preview_local_folder(
         // 无同名歌单：用 0 作为“无对照”，仅列文件。
         playlist_id = 0;
     }
-    Ok(preview_folder_matches(folder_path, playlist_id, &tracks, &paths.database_file).await)
+    Ok(preview_folder_matches(
+        folder_path,
+        playlist_id,
+        &tracks,
+        &paths.database_file,
+        &root,
+        &config.folder_template,
+        &config.filename_template,
+        &config.artist_separator,
+        &folder,
+    )
+    .await)
 }
 
 /// 预检歌单歌曲可用性与最高音质（供歌曲列表标注）。
