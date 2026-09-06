@@ -51,6 +51,10 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Check i18n key parity
+        # zh-CN.json and en.json must stay in sync; fails the build otherwise.
+        run: node scripts/check-i18n-keys.mjs
+
       - name: Build frontend
         run: npm run build
 

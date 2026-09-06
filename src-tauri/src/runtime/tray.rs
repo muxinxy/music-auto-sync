@@ -14,8 +14,33 @@ fn language(app: &AppHandle) -> bool {
     }
 }
 
+/// 任一任务（歌单同步或云盘）处于暂停等待态。暂停标志只在任务运行期间置位，
+/// 任务结束时统一清零，因此无需区分"哪个任务暂停了"。
 fn is_paused(app: &AppHandle) -> bool {
-    app.state::<AppState>().pause_requested.load(std::sync::atomic::Ordering::SeqCst)
+    let state = app.state::<AppState>();
+    state.pause_requested.load(std::sync::atomic::Ordering::SeqCst)
+        || state
+            .cloud_pause_requested
+            .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+fn is_running(app: &AppHandle) -> bool {
+    let state = app.state::<AppState>();
+    state.sync_running.load(std::sync::atomic::Ordering::SeqCst)
+        || state
+            .cloud_running
+            .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 任务运行/暂停状态变化后重建托盘菜单。托盘必须在主线程操作，
+/// 异步任务上下文里经此调度（install 内部自带 remove_tray_by_id 防重复）。
+pub fn refresh(app: &AppHandle) {
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        if let Err(error) = install(&handle) {
+            tracing::warn!(%error, "tray refresh failed");
+        }
+    });
 }
 
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
@@ -23,10 +48,7 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let _ = app.remove_tray_by_id("main-tray");
     let en = language(app);
     let paused = is_paused(app);
-    let running = app
-        .state::<AppState>()
-        .sync_running
-        .load(std::sync::atomic::Ordering::SeqCst);
+    let running = is_running(app);
     let show_label = if en { "Show window" } else { "打开主窗口" };
     let sync_label = if en { "Sync now" } else { "立即同步" };
     let pause_label = if en { "Pause" } else { "暂停" };
@@ -89,9 +111,15 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             }
             "pause" => {
                 let state = app.state::<AppState>();
+                // 歌单与云盘任务可并行，暂停作用于当前在跑的任务（可能是两类同时）。
                 if state.sync_running.load(std::sync::atomic::Ordering::SeqCst) {
                     state
                         .pause_requested
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if state.cloud_running.load(std::sync::atomic::Ordering::SeqCst) {
+                    state
+                        .cloud_pause_requested
                         .store(true, std::sync::atomic::Ordering::SeqCst);
                 }
                 let _ = install(app);
@@ -101,13 +129,28 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
                 state
                     .pause_requested
                     .store(false, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .cloud_pause_requested
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
                 let _ = install(app);
             }
             "cancel" => {
                 let state = app.state::<AppState>();
-                state.cancel_requested.store(true, std::sync::atomic::Ordering::SeqCst);
+                if state.sync_running.load(std::sync::atomic::Ordering::SeqCst) {
+                    state
+                        .cancel_requested
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                if state.cloud_running.load(std::sync::atomic::Ordering::SeqCst) {
+                    state
+                        .cloud_cancel_requested
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 state
                     .pause_requested
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                state
+                    .cloud_pause_requested
                     .store(false, std::sync::atomic::Ordering::SeqCst);
                 let _ = install(app);
             }

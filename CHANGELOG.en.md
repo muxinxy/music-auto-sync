@@ -4,6 +4,20 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.1] - 2026-09-06
+
+### Added
+
+- The cloud song list is now cached on disk: after restarting the app the cloud page opens instantly with the last known list and refreshes in place in the background; the cache is invalidated when the account changes and cleared after uploads.
+
+### Fixed
+
+- The tray menu now refreshes as tasks start and end: previously the tray was only rebuilt at startup and on language change, so Pause/Resume/Cancel were effectively unusable once a task started; cloud tasks are now supported too — previously the tray could only control playlist sync, and cloud uploads/downloads could not be paused or canceled from the tray.
+
+### Changed
+
+- The release workflow now verifies zh/en locale key parity; out-of-sync locale keys fail the build.
+
 ## [0.8.0] - 2026-09-06
 
 ### Added

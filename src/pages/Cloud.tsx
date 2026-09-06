@@ -20,6 +20,7 @@ import {
   UploadOutlined,
 } from "@ant-design/icons";
 import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { formatError } from "../errors";
@@ -75,6 +76,17 @@ export default function CloudPage({
   useEffect(() => {
     load();
   }, [load]);
+
+  // 后台刷新完成推送（重启后先展示磁盘缓存旧数据，随后由此事件更新为最新）。
+  useEffect(() => {
+    const unlisten = listen<CloudListResult>("cloud://list", (event) => {
+      setResult(event.payload);
+      setLoading(false);
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
 
   // 云盘任务从运行转空闲时自动刷新列表（无论从本页还是别处发起/结束）。
   const prevRunning = useRef(running);

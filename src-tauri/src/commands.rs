@@ -655,12 +655,19 @@ pub async fn sync_all(
     })
 }
 
-/// 云盘歌曲列表（只读，全量分页拉取；共享 120s 缓存，force=true 穿透）。
+/// 云盘歌曲列表（只读）。三级缓存：内存 TTL → 磁盘缓存（重启后秒开旧数据 + 后台
+/// 刷新推送）→ 全量分页拉取；force=true 穿透全部缓存直拉。
 #[tauri::command]
-pub async fn list_cloud_songs(state: State<'_, AppState>, force: bool) -> Result<CloudListResult, String> {
-    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
-    let api = cached_api(&state, &config)?;
-    cloud::fetch_cloud_list(&api, force).await.map_err(anyhow_to_ui)
+pub async fn list_cloud_songs(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    force: bool,
+) -> Result<CloudListResult, String> {
+    let paths = state.paths.get();
+    let config = store::config::load(&paths.config_file).map_err(command_error)?;
+    cloud::list_for_ui(&app, state.api_cache.clone(), &paths.cache_dir, &config, force)
+        .await
+        .map_err(anyhow_to_ui)
 }
 
 /// 云盘上传预览（只读）：扫描音乐根目录并与云盘比对，产出待上传清单。

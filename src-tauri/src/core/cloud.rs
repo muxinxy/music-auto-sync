@@ -45,6 +45,81 @@ const CACHE_TTL_CLOUD: Duration = Duration::from_secs(120);
 /// 云盘任务的暂停/取消标志对（独立于歌单同步，二者可并行）。
 type CloudCtl<'a> = (&'a AtomicBool, &'a AtomicBool);
 
+// ---------------------------------------------------------------------------
+// 云盘列表磁盘缓存
+//
+// 内存 TTL 缓存（ApiCache）随进程消失，重启后云盘页只能干等全量分页拉取。
+// 这里把最近一次完整列表连同 cookie 指纹、抓取时间落到 cache 目录：
+// 重启后先秒开旧数据，后台再拉最新并通过 cloud://list 事件推给前端。
+// 指纹保证换账号/重新登录后旧缓存自动作废（cookie 变化 → 指纹不匹配）。
+// ---------------------------------------------------------------------------
+
+/// 磁盘缓存文件名（位于数据目录 cache/ 下）。
+const DISK_CACHE_FILE: &str = "cloud-list.json";
+/// 磁盘缓存最长有效期：超过后视为不可信（但拉取失败时仍可兜底展示）。
+const DISK_CACHE_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CloudDiskCache {
+    fingerprint: u64,
+    /// epoch 秒。
+    fetched_at: u64,
+    result: CloudListResult,
+}
+
+fn cookie_fingerprint(config: &store::config::Config) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    config.cookie.as_deref().unwrap_or("").hash(&mut hasher);
+    hasher.finish()
+}
+
+fn disk_cache_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.join(DISK_CACHE_FILE)
+}
+
+/// 读取磁盘缓存：指纹不匹配（换账号）或超过 7 天视为过期；解析失败按无缓存处理。
+pub fn load_disk_cache(cache_dir: &Path, config: &store::config::Config) -> Option<CloudListResult> {
+    let text = std::fs::read_to_string(disk_cache_path(cache_dir)).ok()?;
+    let cache: CloudDiskCache = serde_json::from_str(&text).ok()?;
+    let fingerprint = cookie_fingerprint(config);
+    let age_ok = cache
+        .fetched_at
+        .checked_add(DISK_CACHE_MAX_AGE_SECS)
+        .map(|limit| limit > now_secs())
+        .unwrap_or(false);
+    (cache.fingerprint == fingerprint && age_ok).then_some(cache.result)
+}
+
+/// 写入磁盘缓存（临时文件 + 原子替换，避免写一半损坏）；失败静默（缓存非关键路径）。
+pub fn save_disk_cache(cache_dir: &Path, config: &store::config::Config, result: &CloudListResult) {
+    let cache = CloudDiskCache {
+        fingerprint: cookie_fingerprint(config),
+        fetched_at: now_secs(),
+        result: result.clone(),
+    };
+    let Ok(text) = serde_json::to_string(&cache) else {
+        return;
+    };
+    let path = disk_cache_path(cache_dir);
+    let tmp = cache_dir.join(format!("{DISK_CACHE_FILE}.tmp"));
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// 删除磁盘缓存（上传任务会改动云盘内容，旧列表不可信）。
+pub fn clear_disk_cache(cache_dir: &Path) {
+    let _ = std::fs::remove_file(disk_cache_path(cache_dir));
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn cloud_is_canceled(ctl: CloudCtl<'_>) -> bool {
     ctl.1.load(Ordering::SeqCst)
 }
@@ -85,7 +160,7 @@ fn emit_cloud_progress(
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudSong {
     /// 云盘条目 songId（与匹配到的网易曲目 id 一致；未匹配为 0）。
@@ -111,7 +186,7 @@ impl CloudSong {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudStorageInfo {
     pub count: u64,
@@ -119,7 +194,7 @@ pub struct CloudStorageInfo {
     pub max_size: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CloudListResult {
     pub songs: Vec<CloudSong>,
@@ -216,6 +291,55 @@ pub async fn fetch_cloud_list(api: &NeteaseApi, force: bool) -> Result<CloudList
         },
         songs,
     })
+}
+
+/// 云盘页取列表的完整策略（供 `list_cloud_songs` 命令使用）：
+/// 1) 内存 TTL 命中 → 直接返回；2) 磁盘缓存可用 → 立即返回旧数据（重启后秒开），
+/// 后台拉最新并 emit `cloud://list` 由前端更新；3) 都没有 → 现场全量拉取并落盘。
+/// `force=true`（手动刷新）穿透全部缓存直拉。
+pub async fn list_for_ui(
+    app: &AppHandle,
+    api_cache: Arc<crate::ApiCache>,
+    cache_dir: &Path,
+    config: &store::config::Config,
+    force: bool,
+) -> Result<CloudListResult> {
+    if !force {
+        let api = NeteaseApi::from_config_with_cache(config, api_cache.clone())?;
+        if api.cache_get("user_cloud", "all", CACHE_TTL_CLOUD).is_some() {
+            return fetch_cloud_list(&api, false).await;
+        }
+        if let Some(cached) = load_disk_cache(cache_dir, config) {
+            // 后台刷新失败只记日志：用户手里还有旧数据，刷新按钮可重试。
+            let app = app.clone();
+            let cache_dir = cache_dir.to_path_buf();
+            let config = config.clone();
+            tauri::async_runtime::spawn(async move {
+                match refresh_and_persist(&api_cache, &cache_dir, &config).await {
+                    Ok(fresh) => {
+                        let _ = app.emit("cloud://list", &fresh);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "background cloud list refresh failed")
+                    }
+                }
+            });
+            return Ok(cached);
+        }
+    }
+    refresh_and_persist(&api_cache, cache_dir, config).await
+}
+
+/// 强制拉最新列表并写入内存缓存（fetch_cloud_list 内部）与磁盘缓存。
+async fn refresh_and_persist(
+    api_cache: &Arc<crate::ApiCache>,
+    cache_dir: &Path,
+    config: &store::config::Config,
+) -> Result<CloudListResult> {
+    let api = NeteaseApi::from_config_with_cache(config, api_cache.clone())?;
+    let fresh = fetch_cloud_list(&api, true).await?;
+    save_disk_cache(cache_dir, config, &fresh);
+    Ok(fresh)
 }
 
 /// 从 /user/cloud 单条数据解析云盘歌曲。字段逐级回退：
@@ -572,13 +696,16 @@ pub async fn sync_cloud(
         return Err(UiMessage::new("syncBusy"));
     }
     let _ = app.emit("cloud://state", true);
+    crate::runtime::tray::refresh(app);
     let (report, run_error) = sync_cloud_inner(Some(app), state, &source).await;
     state.cloud_running.store(false, Ordering::SeqCst);
     state.cloud_pause_requested.store(false, Ordering::SeqCst);
     let _ = app.emit("cloud://state", false);
+    crate::runtime::tray::refresh(app);
     let _ = app.emit("cloud://report", &report);
     // 云盘列表缓存已过期（有上传/秒传变更），让 UI 下次读取拿最新。
     state.api_cache.invalidate_namespace("user_cloud");
+    clear_disk_cache(&state.paths.get().cache_dir);
     match run_error {
         Some(message) => Err(message),
         None => Ok(report),
@@ -892,10 +1019,12 @@ pub async fn download_cloud_items(
         return Err(UiMessage::new("syncBusy"));
     }
     let _ = app.emit("cloud://state", true);
+    crate::runtime::tray::refresh(app);
     let (report, run_error) = download_items_inner(Some(app), state, items, target_dir).await;
     state.cloud_running.store(false, Ordering::SeqCst);
     state.cloud_pause_requested.store(false, Ordering::SeqCst);
     let _ = app.emit("cloud://state", false);
+    crate::runtime::tray::refresh(app);
     let _ = app.emit("cloud://report", &report);
     match run_error {
         Some(message) => Err(message),
@@ -1211,5 +1340,67 @@ mod tests {
         // 云盘没有 → 待上传，且第二次出现同 id 归为重复。
         assert_eq!(classify_match(&cloud_ids, &mut seen, 3), "to_upload");
         assert_eq!(classify_match(&cloud_ids, &mut seen, 3), "duplicate");
+    }
+
+    #[test]
+    fn disk_cache_roundtrip_and_fingerprint_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache_dir = temp.path();
+        let config = sample_config("cookie-A");
+        let result = CloudListResult {
+            songs: vec![CloudSong {
+                song_id: 42,
+                song_name: "t".into(),
+                artist: "a".into(),
+                album: "b".into(),
+                file_name: "t - s.mp3".into(),
+                file_size: 1,
+                bitrate: None,
+                add_time: None,
+                simple_song_id: Some(42),
+            }],
+            storage: CloudStorageInfo {
+                count: 1,
+                used_size: Some(1),
+                max_size: None,
+            },
+        };
+
+        save_disk_cache(cache_dir, &config, &result);
+        let loaded = load_disk_cache(cache_dir, &config).unwrap();
+        assert_eq!(loaded.songs.len(), 1);
+        assert_eq!(loaded.songs[0].song_id, 42);
+
+        // 换账号（cookie 变化）后旧缓存必须作废。
+        let other = sample_config("cookie-B");
+        assert!(load_disk_cache(cache_dir, &other).is_none());
+    }
+
+    #[test]
+    fn disk_cache_expired_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let config = sample_config("cookie-A");
+        let result = CloudListResult {
+            songs: vec![],
+            storage: CloudStorageInfo {
+                count: 0,
+                used_size: None,
+                max_size: None,
+            },
+        };
+        save_disk_cache(temp.path(), &config, &result);
+        // 把抓取时间改到 8 天前，超出 7 天有效期。
+        let path = disk_cache_path(temp.path());
+        let mut cache: CloudDiskCache =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        cache.fetched_at = now_secs().saturating_sub(DISK_CACHE_MAX_AGE_SECS + 86400);
+        std::fs::write(&path, serde_json::to_string(&cache).unwrap()).unwrap();
+        assert!(load_disk_cache(temp.path(), &config).is_none());
+    }
+
+    fn sample_config(cookie: &str) -> store::config::Config {
+        let mut config = store::config::Config::default();
+        config.cookie = Some(cookie.to_owned());
+        config
     }
 }

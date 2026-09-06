@@ -71,10 +71,12 @@ pub async fn sync_one(
         return Err(UiMessage::new("syncBusy"));
     }
     let _ = app.emit("sync://state", true);
+    crate::runtime::tray::refresh(app);
     let result = sync_one_inner(Some(app), state, playlist_id).await;
     state.sync_running.store(false, Ordering::SeqCst);
     state.pause_requested.store(false, Ordering::SeqCst);
     let _ = app.emit("sync://state", false);
+    crate::runtime::tray::refresh(app);
     match result {
         Ok(report) => {
             let _ = app.emit("sync://report", &report);
@@ -97,6 +99,7 @@ pub async fn sync_enabled_with_source(
         return Err(UiMessage::new("syncBusy"));
     }
     let _ = app.emit("sync://state", true);
+    crate::runtime::tray::refresh(app);
     let config = store::config::load(&state.paths.get().config_file).map_err(UiMessage::unknown)?;
     let ids: Vec<u64> = config
         .playlists
@@ -125,6 +128,7 @@ pub async fn sync_enabled_with_source(
     state.sync_running.store(false, Ordering::SeqCst);
     state.pause_requested.store(false, Ordering::SeqCst);
     let _ = app.emit("sync://state", false);
+    crate::runtime::tray::refresh(app);
     Ok(reports)
 }
 
