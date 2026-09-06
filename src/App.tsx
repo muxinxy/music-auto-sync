@@ -264,7 +264,7 @@ export default function App() {
               banner
               type="info"
               showIcon
-              message={t("playlists.updateAvailable", { version: updateVersion })}
+              message={t("playlists.updateAvailable", { version: `v${updateVersion}` })}
               action={
                 <Button
                   size="small"

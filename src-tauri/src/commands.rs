@@ -1278,6 +1278,7 @@ pub async fn check_for_update(state: State<'_, AppState>) -> Result<Option<Strin
         .await
         .map_err(|_| UiMessage::new("update_check_failed").to_json())?;
     let latest = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
+    // 只返回纯版本号（剥掉 tag 的 v 前缀）；前端展示/拼 URL 时自己加 v，避免重复。
     let latest_clean = latest.trim_start_matches('v');
     let is_newer = latest_clean
         .split('.')
@@ -1290,7 +1291,7 @@ pub async fn check_for_update(state: State<'_, AppState>) -> Result<Option<Strin
                 .collect::<Vec<_>>(),
         )
         == std::cmp::Ordering::Greater;
-    Ok((is_newer && !latest.is_empty()).then(|| latest.to_string()))
+    Ok((is_newer && !latest_clean.is_empty()).then(|| latest_clean.to_string()))
 }
 
 /// 设置开机自启（写入 HKCU\Software\Microsoft\Windows\CurrentVersion\Run）。

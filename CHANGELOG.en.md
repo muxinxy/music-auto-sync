@@ -4,6 +4,12 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.7.2] - 2026-09-06
+
+### Fixed
+
+- The "Download" link in the new-version banner had a doubled `v` (`.../tag/vv0.7.1` could not be opened): the new version is now returned as a bare version number and both the label and the link add the `v` prefix exactly once.
+
 ## [0.7.1] - 2026-09-06
 
 ### Changed
