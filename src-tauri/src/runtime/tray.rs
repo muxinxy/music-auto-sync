@@ -32,16 +32,22 @@ fn is_running(app: &AppHandle) -> bool {
             .load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// 任务运行/暂停状态变化后重建托盘菜单。**必须经此调度而不是直接调 install**：
-/// 托盘重建须在主线程；且在菜单事件回调里同步销毁/重建托盘会和菜单的内部状态
-/// 互锁，导致主线程卡死（应用未响应）。run_on_main_thread 把重建排队到当前
-/// 事件处理返回之后，两个问题同时规避。install 内部自带 remove_tray_by_id。
+/// 任务运行/暂停状态变化后重建托盘菜单。**不能在调用方线程直接重建**：
+/// 菜单事件回调跑在主线程，而 tauri 的 run_on_main_thread 在主线程上是
+/// **就地同步执行**的（tauri-runtime-wry 的 send_user_message 对主线程
+/// 不排队），在回调里销毁/重建托盘会和打开的菜单内部状态互锁死锁
+/// （应用未响应）。因此这里先落到一个短命工作线程，再由它经事件循环
+/// 代理把重建排队到当前事件处理返回之后——任何调用上下文都安全。
+/// install 内部自带 remove_tray_by_id 防重复。
 pub fn refresh(app: &AppHandle) {
     let handle = app.clone();
-    let _ = app.run_on_main_thread(move || {
-        if let Err(error) = install(&handle) {
-            tracing::warn!(%error, "tray refresh failed");
-        }
+    std::thread::spawn(move || {
+        let inner = handle.clone();
+        let _ = handle.run_on_main_thread(move || {
+            if let Err(error) = install(&inner) {
+                tracing::warn!(%error, "tray refresh failed");
+            }
+        });
     });
 }
 

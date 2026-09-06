@@ -4,6 +4,12 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.3] - 2026-09-07
+
+### Fixed
+
+- Tray Pause/Resume/Cancel still froze the app (the 0.8.2 fix was incomplete): per the tauri-runtime-wry source, `run_on_main_thread` executes inline when already on the main thread instead of queuing, so 0.8.2 still rebuilt the tray synchronously inside the menu callback. The rebuild now hops to a dedicated worker thread first and is then queued through the event loop, guaranteeing it runs only after the menu event handling has fully returned.
+
 ## [0.8.2] - 2026-09-07
 
 ### Fixed

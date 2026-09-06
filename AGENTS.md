@@ -40,7 +40,7 @@ Windows 便携网易云音乐歌单同步器（Tauri 2 + Rust 后端 + React/TS 
 - 双语 i18n：`src/locales/zh-CN.json` + `en.json`，**每次新增文案两个文件同步加键**。
 - 主题：Config `theme`(system/light/dark)；main.tsx ConfigProvider 按 `theme` + matchMedia 切 antd 深浅算法，设置改动后 `window.dispatchEvent(new Event("theme-changed"))` 让 Root 重读。
 - 启动默认停"账号登录"页（登录后该页即账号信息+统计）。默认关闭启动自动同步/定时轮询。
-- 托盘：左键开窗、右键菜单；暂停/继续/取消菜单项**只在有任务运行时出现**（歌单同步或云盘任务，二者可并行，pause/cancel 路由到在跑任务的标志）。任务运行态变化处（sync://state、cloud://state 发射点）要调 `runtime::tray::refresh(app)` 重建托盘；`install` 内部先 `remove_tray_by_id("main-tray")` 防重复，语言变化同样走 `install`。托盘重建必须在主线程（refresh 已处理）。
+- 托盘：左键开窗、右键菜单；暂停/继续/取消菜单项**只在有任务运行时出现**（歌单同步或云盘任务，二者可并行，pause/cancel 路由到在跑任务的标志）。任务运行态变化处（sync://state、cloud://state 发射点）要调 `runtime::tray::refresh(app)` 重建托盘。**永远不要直接调 `install`**（语言变化除外）：菜单回调跑在主线程，而 `run_on_main_thread` 在主线程上是就地同步执行的（tauri-runtime-wry 对主线程不排队），回调里同步销毁/重建托盘会和打开的菜单互锁死锁（应用未响应，0.8.1/0.8.2 两次踩坑）；`refresh` 内部先落工作线程再排队到主线程，任何上下文都安全。
 - 云盘列表三级缓存：内存 TTL（ApiCache "user_cloud"）→ 磁盘缓存（`core/cloud.rs` 的 `load/save/clear_disk_cache`，cache 目录 `cloud-list.json`，带 cookie 指纹与 7 天有效期）→ 全量拉取。上传任务结束会清磁盘缓存；新增改动云盘内容的路径记得同步处理。
 - 改动涉及歌单归属（创建 vs 收藏）用后端 `creator.userId` 与当前登录 uid 比对；收藏歌单不可写网易。
 
