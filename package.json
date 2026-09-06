@@ -1,7 +1,7 @@
 {
   "name": "music-auto-sync",
   "private": true,
-  "version": "0.7.0",
+  "version": "0.7.1",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -14,6 +14,7 @@
     "@ant-design/icons": "^5.5.1",
     "@tauri-apps/api": "^2.1.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@tauri-apps/plugin-opener": "^2.5.5",
     "antd": "^5.22.2",
     "i18next": "^26.4.1",
     "react": "^18.3.1",

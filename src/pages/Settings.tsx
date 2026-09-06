@@ -11,17 +11,19 @@ import {
   InputNumber,
   List,
   Modal,
-  Progress,
   Radio,
   Row,
   Select,
   Space,
+  Spin,
   Switch,
+  Tag,
   Typography,
   message as antMessage,
 } from "antd";
 import { FolderOpenOutlined, FileAddOutlined, ToolOutlined } from "@ant-design/icons";
 import { open } from "@tauri-apps/plugin-dialog";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import i18n, { normalizeLanguage } from "../i18n";
 import { api } from "../api";
 import { formatError } from "../errors";
@@ -372,7 +374,25 @@ export default function SettingsPage() {
             />
           </Form.Item>
           <Divider />
-          <Form.Item label={t("settings.labelApi")} name="apiBase" extra={t("settings.apiExtra")}>
+          <Form.Item
+            label={t("settings.labelApi")}
+            name="apiBase"
+            extra={
+              <>
+                {t("settings.apiExtraBefore")}{" "}
+                <Typography.Link
+                  onClick={() => {
+                    openUrl("https://github.com/neteasecloudmusicapienhanced/api-enhanced").catch(
+                      (e) => antMessage.error(formatError(e))
+                    );
+                  }}
+                >
+                  NeteaseCloudMusicApiEnhanced
+                </Typography.Link>
+                {t("settings.apiExtraAfter")}
+              </>
+            }
+          >
             <Input />
           </Form.Item>
           <Form.Item label={t("settings.labelProxy")} name="httpProxy" extra={t("settings.proxyExtra")}>
@@ -396,12 +416,10 @@ function NcmToolModal({ open: isOpen, onClose }: { open: boolean; onClose: () =>
   const [overwrite, setOverwrite] = useState(false);
   const [running, setRunning] = useState(false);
   const [done, setDone] = useState<NcmConvertReport | null>(null);
-  const [progress, setProgress] = useState<number>(0);
 
   const reset = () => {
     setFiles([]);
     setDone(null);
-    setProgress(0);
   };
 
   const close = () => {
@@ -438,8 +456,6 @@ function NcmToolModal({ open: isOpen, onClose }: { open: boolean; onClose: () =>
     try {
       const report = await api.convertNcmManual(files, keepSource, overwrite);
       setDone(report);
-      const total = report.converted + report.skipped + report.failed;
-      setProgress(total > 0 ? Math.round(((report.converted + report.skipped) / total) * 100) : 100);
       antMessage.success(
         t("settings.ncmToolDone", {
           converted: report.converted,
@@ -505,7 +521,14 @@ function NcmToolModal({ open: isOpen, onClose }: { open: boolean; onClose: () =>
                 {t("settings.ncmOverwrite")}
               </Checkbox>
             </Space>
-            {running && <Progress percent={progress} status="active" />}
+            {running && (
+              <Space>
+                <Spin size="small" />
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {t("settings.ncmConverting")}
+                </Typography.Text>
+              </Space>
+            )}
             {done && (
               <Alert
                 type={done.failed > 0 ? "warning" : "success"}
@@ -518,7 +541,7 @@ function NcmToolModal({ open: isOpen, onClose }: { open: boolean; onClose: () =>
                 description={
                   failureItems.length > 0 ? (
                     <Space direction="vertical" size={2}>
-                      {failureItems.slice(0, 5).map((f: NcmConvertItemResult, idx: number) => (
+                      {failureItems.map((f: NcmConvertItemResult, idx: number) => (
                         <Typography.Text key={idx} style={{ fontSize: 12 }}>
                           {f.source}：{f.error}
                         </Typography.Text>

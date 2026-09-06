@@ -27,6 +27,11 @@ const META_KEY: &[u8; 16] = &[
 /// 163 key 前缀。
 pub const KEY_PREFIX: &str = "163 key(Don't modify):";
 
+/// NCM 元数据段与 163 key 共用同一 AES 密钥（ncm.rs 复用，避免两处维护）。
+pub const fn meta_key() -> &'static [u8; 16] {
+    META_KEY
+}
+
 /// 供写 163 key 的歌曲元数据（与官方 music JSON 字段一一对应）。
 #[derive(Debug, Clone)]
 pub struct OfficialKeyMeta {

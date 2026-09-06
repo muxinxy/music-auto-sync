@@ -9,6 +9,7 @@ import {
   SettingOutlined,
 } from "@ant-design/icons";
 import { listen } from "@tauri-apps/api/event";
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTranslation } from "react-i18next";
 import i18n, { normalizeLanguage } from "./i18n";
 import { api } from "./api";
@@ -270,7 +271,7 @@ export default function App() {
                   type="link"
                   onClick={() => {
                     const url = `https://github.com/muxinxy/music-auto-sync/releases/tag/v${updateVersion}`;
-                    window.open(url, "_blank");
+                    openUrl(url).catch(() => {});
                   }}
                 >
                   {t("playlists.updateGo")}

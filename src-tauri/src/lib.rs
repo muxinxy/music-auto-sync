@@ -34,6 +34,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_single_instance::init(|app, _, _| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
@@ -100,9 +101,6 @@ pub fn run() {
             commands::restore_quarantine,
             commands::delete_quarantine,
             commands::manual_prune,
-            commands::get_liked_songs,
-            commands::get_purchased_songs,
-            commands::backup_songs,
             commands::preflight_playlist,
             commands::preview_local_match,
             commands::preview_local_folder,

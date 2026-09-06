@@ -168,17 +168,6 @@ export interface SyncErrorDetail {
   message: UiMessage;
 }
 
-export type BatchItemStatus = "downloaded" | "skipped" | "failed";
-
-export interface BatchItemResult {
-  trackId: number;
-  trackName: string;
-  outcome:
-    | { status: "downloaded"; data: string }
-    | { status: "skipped" }
-    | { status: "failed"; data: UiMessage };
-}
-
 export interface QuarantineItem {
   id: number;
   playlistName: string;

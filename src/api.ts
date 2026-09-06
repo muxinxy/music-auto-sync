@@ -2,7 +2,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountStats,
   AppInfo,
-  BatchItemResult,
   Config,
   DeletedLogEntry,
   LocalMatchPreview,
@@ -70,24 +69,6 @@ export const api = {
   restoreQuarantine: (id: number) => invoke<void>("restore_quarantine", { id }),
   deleteQuarantine: (id: number) => invoke<void>("delete_quarantine", { id }),
 
-  getLikedSongs: () => invoke<Record<string, unknown>[]>("get_liked_songs"),
-  getPurchasedSongs: () => invoke<Record<string, unknown>[]>("get_purchased_songs"),
-  backupSongs: (
-    kind: "liked" | "purchased",
-    label: string,
-    targetDir: string,
-    quality?: string | null,
-    writeLrc?: boolean | null,
-    overwrite?: boolean
-  ) =>
-    invoke<BatchItemResult[]>("backup_songs", {
-      kind,
-      label,
-      targetDir,
-      quality,
-      writeLrc,
-      overwrite,
-    }),
   preflightPlaylist: (id: number, force?: boolean) =>
     invoke<TrackAvailability[]>("preflight_playlist", { id, force: force ?? false }),
   previewLocalMatch: (id: number) =>

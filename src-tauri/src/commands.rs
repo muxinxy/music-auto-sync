@@ -7,11 +7,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use crate::{
     api::{
         ApiResponseMeta, LoginStatus, LoginStatusResponse, NeteaseApi, PlaylistInfo, QrCheckResult,
-        QrSession, Track,
+        QrSession,
     },
     core::{
         naming,
-        sync::{self, BatchItemResult, SyncReport},
+        sync::{self, SyncReport},
     },
     error::UiMessage,
     store::{
@@ -977,95 +977,6 @@ pub async fn login_with_captcha(
         user_id: None,
         avatar_url: None,
     }))
-}
-
-/// 获取“我喜欢”的歌曲详情列表。
-#[tauri::command]
-pub async fn get_liked_songs(state: State<'_, AppState>) -> Result<Vec<serde_json::Value>, String> {
-    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
-    let user = config
-        .cookie_user
-        .as_ref()
-        .context("请先登录")
-        .map_err(command_error)?;
-    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
-    let ids = api
-        .liked_song_ids(user.user_id)
-        .await
-        .map_err(command_error)?;
-    let details = api.song_detail_batch(&ids).await.map_err(command_error)?;
-    let mut out: Vec<serde_json::Value> = details.into_values().collect();
-    out.sort_by_key(|v| v.get("id").and_then(|x| x.as_u64()).unwrap_or(0));
-    Ok(out)
-}
-
-/// 获取已购单曲详情列表。
-#[tauri::command]
-pub async fn get_purchased_songs(
-    state: State<'_, AppState>,
-) -> Result<Vec<serde_json::Value>, String> {
-    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
-    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
-    let ids = api.purchased_songs().await.map_err(command_error)?;
-    let details = api.song_detail_batch(&ids).await.map_err(command_error)?;
-    let mut out: Vec<serde_json::Value> = details.into_values().collect();
-    out.sort_by_key(|v| v.get("id").and_then(|x| x.as_u64()).unwrap_or(0));
-    Ok(out)
-}
-
-/// 备份“我喜欢 / 已购”到指定目录（不纳入任何歌单的已同步状态）。
-#[tauri::command]
-pub async fn backup_songs(
-    app: AppHandle,
-    state: State<'_, AppState>,
-    kind: String,
-    label: String,
-    target_dir: String,
-    quality: Option<String>,
-    write_lrc: Option<bool>,
-    overwrite: bool,
-) -> Result<Vec<BatchItemResult>, String> {
-    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
-    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
-    let ids: Vec<u64> = match kind.as_str() {
-        "liked" => {
-            let user = config
-                .cookie_user
-                .as_ref()
-                .context("请先登录")
-                .map_err(command_error)?;
-            api.liked_song_ids(user.user_id)
-                .await
-                .map_err(command_error)?
-        }
-        "purchased" => api.purchased_songs().await.map_err(command_error)?,
-        other => {
-            return Err(UiMessage::with_params("invalid_kind", vec![other.to_owned()]).to_json())
-        }
-    };
-    if ids.is_empty() {
-        return Err(UiMessage::new("no_songs_to_backup").to_json());
-    }
-    // 批量详情一次拿全（避免逐首 /playlist/track/all）。
-    let details = api.song_detail_batch(&ids).await.map_err(command_error)?;
-    let tracks: Vec<Track> = ids
-        .iter()
-        .filter_map(|id| details.get(id))
-        .filter_map(|v| serde_json::from_value(v.clone()).ok())
-        .collect();
-    let dir = Path::new(&target_dir);
-    sync::download_track_ids(
-        Some(&app),
-        &state,
-        dir,
-        &label,
-        quality.as_deref(),
-        write_lrc,
-        overwrite,
-        tracks,
-    )
-    .await
-    .map_err(|m| m.to_json())
 }
 
 /// 手动把“不在歌单里的本地文件”隔离进 .quarantine。

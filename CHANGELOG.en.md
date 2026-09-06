@@ -4,6 +4,22 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.7.1] - 2026-09-06
+
+### Changed
+
+- Removed the "Back up to a local directory" button from the playlist page (and its backend logic).
+- NCM conversion now names the output file after the source .ncm file (instead of the embedded song name), so the converted file keeps the original name with a new extension.
+- The main window now opens centered on the screen.
+- The "Refresh stats" button on the account page now shows a spinner and a card overlay while refreshing, with clear success/failure feedback.
+- The NeteaseCloudMusicApiEnhanced link in Settings → "NetEase API address" is now clickable and opens the GitHub repo in the default browser; the "Download" button in the new-version banner is fixed the same way.
+
+### Fixed
+
+- NCM conversion failure: files such as `李荣浩 - 年少有为.ncm` previously failed with "invalid NCM AES padding" — the metadata decryption used the wrong key and the audio stream cipher did not match NetEase's implementation. Both are now corrected to match the official ncmdump output.
+- NCM converter modal: no longer shows a misleading 0% progress bar while running (replaced with a spinner); failure details are no longer truncated to the first 5.
+- The "current task" card no longer keeps showing a stale (0%) progress after a sync/conversion ends.
+
 ## [0.7.0] - 2026-09-05
 
 ### Added

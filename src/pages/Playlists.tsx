@@ -28,10 +28,8 @@ import {
   DownloadOutlined,
   EyeOutlined,
   FolderOpenOutlined,
-  HeartOutlined,
   HistoryOutlined,
   ReloadOutlined,
-  ShoppingOutlined,
   SyncOutlined,
 } from "@ant-design/icons";
 import type { ColumnsType } from "antd/es/table";
@@ -40,7 +38,6 @@ import { useTranslation } from "react-i18next";
 import { api } from "../api";
 import { formatError, translateUi, uiMessage } from "../errors";
 import type {
-  BatchItemResult,
   LocalMatchPreview,
   LoginStatus,
   PlaylistHistoryEntry,
@@ -427,29 +424,6 @@ export default function PlaylistsPage({ login, sync }: Props) {
     }
   };
 
-  const openBackup = async (kind: "liked" | "purchased") => {
-    const dir = (await open({
-      directory: true,
-      multiple: false,
-      title: t("playlists.backupChooseDir"),
-    })) as string | null;
-    if (!dir) return;
-    antMessage.loading({ key: "backup", content: t("playlists.backupRunning"), duration: 0 });
-    try {
-      const label =
-        kind === "liked" ? t("app.menu.likedShort") : t("app.menu.purchasedShort");
-      const results = await api.backupSongs(kind, label, dir);
-      const ok = results.filter((r) => r.outcome.status === "downloaded").length;
-      const skipped = results.filter((r) => r.outcome.status === "skipped").length;
-      const failed = results.filter((r) => r.outcome.status === "failed").length;
-      antMessage.destroy("backup");
-      antMessage.success(t("playlists.backupDone", { ok, skipped, failed }));
-    } catch (e) {
-      antMessage.destroy("backup");
-      antMessage.error(t("playlists.backupEmpty") + `：${formatError(e)}`);
-    }
-  };
-
   if (!login?.loggedIn) {
     return (
       <div style={{ padding: 24 }}>
@@ -701,17 +675,6 @@ export default function PlaylistsPage({ login, sync }: Props) {
             <Button icon={<FolderOpenOutlined />} onClick={() => openMatchPreview()} disabled={sync.running}>
               {t("playlists.matchPreviewGlobal")}
             </Button>
-            <Dropdown
-              menu={{
-                items: [
-                  { key: "liked", label: t("playlists.backupLiked"), icon: <HeartOutlined /> },
-                  { key: "purchased", label: t("playlists.backupPurchased"), icon: <ShoppingOutlined /> },
-                ],
-                onClick: ({ key }) => openBackup(key as "liked" | "purchased"),
-              }}
-            >
-              <Button icon={<CloudDownloadOutlined />}>{t("playlists.backupTitle")}</Button>
-            </Dropdown>
             <Button
               type="primary"
               icon={<SyncOutlined spin={sync.running} />}

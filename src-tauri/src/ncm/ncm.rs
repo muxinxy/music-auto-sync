@@ -1,3 +1,13 @@
+//! 网易云音乐 .ncm 文件解密转换（参考 ncmdump / ncm-to-mp3）。
+//!
+//! 格式：`CTENFDAM` 头 → 密钥段 → 元数据段 → 封面段 → RC4 加密音频。
+//!  - 密钥段：xor 0x64 → AES-128-ECB(CORE_KEY) 解密 → 剥 17 字节
+//!    `neteasecloudmusic` 前缀 → RC4 密钥；
+//!  - 元数据段：xor 0x63 → 文本 `163 key(Don't modify):<b64>` →
+//!    b64 解码 → AES-128-ECB(META_KEY) 解密 → `music:{json}`。
+//!    密钥与 163 key / NCM 元数据同款，即 `#14ljk_!\]&0U<('`（见 core::netease_key）。
+//!  - 音频：RC4 变体 keybox 流密码，逐字节双查表，与 ncmdump 一致。
+
 use aes::Aes128;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
@@ -7,8 +17,16 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const CORE_KEY: &[u8; 16] = b"hzHRAmso5kInbaxW";
-const META_KEY: &[u8; 16] = b"2331kjk2k3k4k5k6";
+/// 密钥段固定 17 字节前缀（AES 解密后剥离）。
+const KEY_BOX_PREFIX: &[u8] = b"neteasecloudmusic";
+
+const CORE_KEY: [u8; 16] = [
+    0x68, 0x7a, 0x48, 0x52, 0x41, 0x6d, 0x73, 0x6f, 0x35, 0x6b, 0x49, 0x6e, 0x62, 0x61, 0x78, 0x57,
+];
+
+/// 元数据段加密密钥：与 163 key 相同（netease_key 已持有并验证）。
+/// 这里复用其常量，避免两处维护同一密钥。
+const META_KEY: &[u8; 16] = crate::core::netease_key::meta_key();
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct NcmMetadata {
@@ -33,39 +51,75 @@ pub fn convert(input: &Path, output_dir: &Path) -> Result<NcmOutput> {
         return Err(anyhow!("not a supported NCM file"));
     }
     let mut offset = 10usize;
+
+    // ── 密钥段 ──
     let key_len = take_u32(&bytes, &mut offset)? as usize;
     let mut key_data = take(&bytes, &mut offset, key_len)?.to_vec();
     xor_all(&mut key_data, 0x64);
-    let key_box = aes_decrypt(&key_data, CORE_KEY)?;
-    if key_box.len() <= 17 {
+    let key_box_plain = aes_decrypt(&key_data, &CORE_KEY)?;
+    if key_box_plain.len() <= KEY_BOX_PREFIX.len() {
         return Err(anyhow!("invalid NCM key block"));
     }
-    let key = &key_box[17..];
-    let key_stream = make_key_box(key);
+    let rc4_key = &key_box_plain[KEY_BOX_PREFIX.len()..];
+    let key_stream = make_key_box(rc4_key);
 
+    // ── 元数据段（可能为空，老文件无元数据也能转）──
     let meta_len = take_u32(&bytes, &mut offset)? as usize;
-    let mut meta_data = take(&bytes, &mut offset, meta_len)?.to_vec();
-    xor_all(&mut meta_data, 0x63);
-    let meta_text = String::from_utf8(aes_decrypt(&meta_data, META_KEY)?)?;
-    let encrypted_meta = meta_text
-        .strip_prefix("163 key(Don't modify):")
-        .context("invalid NCM metadata")?;
-    let mut meta_bytes = base64::engine::general_purpose::STANDARD.decode(encrypted_meta)?;
-    xor_all(&mut meta_bytes, 0x63);
-    let json_text = String::from_utf8(aes_decrypt(&meta_bytes, META_KEY)?)?;
-    let metadata: NcmMetadata =
-        serde_json::from_str(json_text.strip_prefix("music:").unwrap_or(&json_text))?;
+    let mut metadata = None;
+    if meta_len > 0 {
+        let mut meta_data = take(&bytes, &mut offset, meta_len)?.to_vec();
+        xor_all(&mut meta_data, 0x63);
+        let meta_text = String::from_utf8_lossy(&meta_data);
+        let encrypted_meta = meta_text
+            .strip_prefix(crate::core::netease_key::KEY_PREFIX)
+            .context("invalid NCM metadata")?;
+        let mut meta_bytes = base64::engine::general_purpose::STANDARD
+            .decode(encrypted_meta)
+            .context("invalid NCM metadata base64")?;
+        // 个别文件密文非 16 倍数时截断到 16 倍数（与 163 key 读取一致）。
+        let usable = meta_bytes.len() - (meta_bytes.len() % 16);
+        meta_bytes.truncate(usable);
+        if usable >= 16 {
+            let json_text = String::from_utf8(aes_decrypt(&meta_bytes, META_KEY)?)
+                .context("NCM metadata not UTF-8")?;
+            let json_text = json_text.strip_prefix("music:").unwrap_or(&json_text);
+            metadata = Some(
+                serde_json::from_str::<NcmMetadata>(json_text)
+                    .context("invalid NCM metadata JSON")?,
+            );
+        }
+    }
+    let metadata = metadata.context("NCM file has no metadata")?;
 
+    // ── 跳过 CRC 与 gap（4+5 字节）──
+    offset += 9;
+
+    // ── 封面段 ──
     let image_len = take_u32(&bytes, &mut offset)? as usize;
-    let _image = take(&bytes, &mut offset, image_len)?;
+    if image_len > 0 {
+        let _ = take(&bytes, &mut offset, image_len)?;
+    }
+
+    // ── 音频段：RC4 变体流密码 ──
     let audio = &bytes[offset..];
     let mut decoded = Vec::with_capacity(audio.len());
+    // 与 ncmdump 一致：j = (i + 1) & 0xff，逐字节：
+    // plain[i] = enc[i] ^ box[ (box[j] + box[ (box[j] + j) & 0xff ]) & 0xff ]
     for (i, byte) in audio.iter().enumerate() {
-        decoded.push(byte ^ key_stream[(i + 1) & 0xff]);
+        let j = (i + 1) & 0xff;
+        let kj = key_stream[j] as usize;
+        let key = (key_stream[(kj + j) & 0xff] as usize + kj) & 0xff;
+        decoded.push(byte ^ key_stream[key]);
     }
 
     fs::create_dir_all(output_dir)?;
-    let file_name = format!("{}.{}", sanitize(&metadata.music_name), metadata.format);
+    // 输出名跟随源 .ncm 文件名（去 .ncm 后缀换实际格式），保持与原文件一致；
+    // 不用 NCM 内嵌 musicName，避免“李荣浩 - 年少有为.ncm”转出“年少有为.mp3”的错位。
+    let stem = input
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&metadata.music_name);
+    let file_name = format!("{}.{}", sanitize(stem), metadata.format);
     let target = unique_path(output_dir.join(file_name));
     fs::write(&target, decoded)?;
     Ok(NcmOutput {
@@ -100,6 +154,7 @@ fn xor_all(data: &mut [u8], value: u8) {
     }
 }
 
+/// 构建 RC4 变体 keybox（与 ncmdump 一致：状态只在 KSA 时置换，解流过程不改 box）。
 fn make_key_box(key: &[u8]) -> [u8; 256] {
     let mut box_ = [0u8; 256];
     for (i, value) in box_.iter_mut().enumerate() {
@@ -208,5 +263,38 @@ pub fn convert_file_with_marker(
             status: "failed".into(),
             error: Some(error.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 真实文件（华语高手/李荣浩 - 年少有为.ncm）应能解出元数据 + 合法音频头。
+    /// 测试机才存在该目录；不存在时跳过。
+    #[test]
+    fn converts_real_ncm_file() {
+        let input = Path::new(
+            r"D:\Drive\Music\网易云歌单\华语高手\李荣浩 - 年少有为.ncm",
+        );
+        if !input.is_file() {
+            eprintln!("skipping: real NCM file not present");
+            return;
+        }
+        let out_dir = std::env::temp_dir().join("ncm-test-music-auto-sync");
+        let _ = fs::remove_dir_all(&out_dir);
+        fs::create_dir_all(&out_dir).unwrap();
+        let output = convert(input, &out_dir).expect("convert real ncm");
+        assert_eq!(output.metadata.music_name, "年少有为");
+        assert_eq!(output.metadata.format, "mp3");
+        // 输出名跟随源 .ncm 文件名，而不是 NCM 内嵌歌名。
+        assert_eq!(
+            output.path.file_name().and_then(|s| s.to_str()),
+            Some("李荣浩 - 年少有为.mp3")
+        );
+        let bytes = fs::read(&output.path).unwrap();
+        // 解出的音频应为合法 ID3/MP3 头。
+        assert_eq!(&bytes[..3], b"ID3", "decoded audio must start with ID3");
+        fs::remove_dir_all(&out_dir).ok();
     }
 }

@@ -37,10 +37,22 @@ export const syncStore = {
     return () => runningListeners.delete(listener);
   },
   setRunning(value: boolean, nextPaused?: boolean) {
-    if (running === value && (nextPaused === undefined || paused === nextPaused)) return;
+    if (running === value && (nextPaused === undefined || paused === nextPaused)) {
+      // 任务已结束但还残留进度（如失败/取消后重复收到 state:false）也要清掉。
+      if (!value && progress !== null) {
+        progress = null;
+        emitProgress();
+      }
+      return;
+    }
     running = value;
     if (nextPaused !== undefined) paused = nextPaused;
     else if (!value) paused = false;
+    // 任务结束（无论成功/失败/取消）时清掉残留进度，避免“当前任务”卡停在旧阶段（0%）。
+    if (!running && progress !== null) {
+      progress = null;
+      emitProgress();
+    }
     emitRunning();
   },
   setPaused(value: boolean) {

@@ -51,25 +51,34 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
   const [loading, setLoading] = useState(false);
   const [account, setAccount] = useState<AccountStats | null>(null);
   const [localStats, setLocalStats] = useState<LocalStats | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
   const keyRef = useRef<string | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sessionRef = useRef(0);
 
   const loadStats = useCallback(async (force = false) => {
-    try {
-      const [a, l] = await Promise.all([
-        api.getAccountStats(force),
-        api.getLocalStats(),
-      ]);
-      setAccount(a);
-      setLocalStats(l);
-    } catch {
-      // 统计接口失败不影响登录页
-    }
+    const [a, l] = await Promise.all([
+      api.getAccountStats(force),
+      api.getLocalStats(),
+    ]);
+    setAccount(a);
+    setLocalStats(l);
   }, []);
 
+  const refreshStats = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await loadStats(true);
+      antMessage.success(t("login.statsRefreshed"));
+    } catch (e) {
+      antMessage.error(formatError(e));
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadStats, t]);
+
   useEffect(() => {
-    if (login?.loggedIn) loadStats();
+    if (login?.loggedIn) loadStats().catch(() => {});
   }, [login?.loggedIn, loadStats]);
 
   const stopPolling = useCallback(() => {
@@ -194,8 +203,8 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
           <div style={{ marginTop: 12 }}>
             <Button
               icon={<ReloadOutlined />}
-              loading={loadingStats}
-              onClick={() => loadStats(true)}
+              loading={refreshing}
+              onClick={() => refreshStats()}
               style={{ marginRight: 8 }}
             >
               {t("login.refreshStats")}
@@ -214,6 +223,7 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
             <Spin />
           </Card>
         ) : (
+          <Spin spinning={refreshing} tip={t("login.statsRefreshing")}>
           <Row gutter={[16, 16]}>
             {/* 网易数据 */}
             <Col xs={24} md={12}>
@@ -242,6 +252,7 @@ export default function LoginPage({ login, onLogin, onLogout }: Props) {
               </Card>
             </Col>
           </Row>
+          </Spin>
         )}
       </div>
     );
