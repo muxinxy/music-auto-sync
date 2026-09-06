@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { Alert, App as AntApp, Avatar, Button, Layout, Menu, Popconfirm, Select, Space, Tag, theme, Typography } from "antd";
 import {
   CloudSyncOutlined,
+  CloudUploadOutlined,
   DeleteOutlined,
   HistoryOutlined,
   LoginOutlined,
@@ -13,18 +14,21 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTranslation } from "react-i18next";
 import i18n, { normalizeLanguage } from "./i18n";
 import { api } from "./api";
-import type { LoginStatus, SyncProgress, UiMessage } from "./types";
+import type { CloudTaskRow, LoginStatus, SyncProgress, UiMessage } from "./types";
 import { translateUi } from "./errors";
 import { syncStore } from "./syncStore";
+import { cloudStore } from "./cloudStore";
+import { taskDisplayName } from "./taskName";
 import LoginPage from "./pages/Login";
 import PlaylistsPage from "./pages/Playlists";
+import CloudPage from "./pages/Cloud";
 import SyncPage from "./pages/Sync";
 import QuarantinePage from "./pages/Quarantine";
 import SettingsPage from "./pages/Settings";
 
 const { Sider, Content, Header } = Layout;
 
-export type PageKey = "login" | "playlists" | "sync" | "quarantine" | "settings";
+export type PageKey = "login" | "playlists" | "cloud" | "sync" | "quarantine" | "settings";
 
 export interface SyncEventState {
   running: boolean;
@@ -46,7 +50,9 @@ export default function App() {
   // 低频运行状态（running/paused）：来自进度外部 store，不随每曲目 progress 重渲染。
   const syncRunning = useSyncExternalStore(syncStore.subscribeRunning, syncStore.getRunning);
   const syncPaused = useSyncExternalStore(syncStore.subscribeRunning, syncStore.getPaused);
+  const cloudRunning = useSyncExternalStore(cloudStore.subscribeRunning, cloudStore.getRunning);
   const sync: SyncEventState = { running: syncRunning, paused: syncPaused };
+  const taskRunning = syncRunning || cloudRunning;
 
   const applyLanguage = useCallback(async () => {
     try {
@@ -94,8 +100,22 @@ export default function App() {
     const unlistenState = listen<boolean>("sync://state", (e) => {
       syncStore.setRunning(e.payload, e.payload ? syncStore.getPaused() : false);
     });
+    // 云盘任务：独立于歌单同步并行运行，走 cloud:// 事件通道。
+    // start 携带本轮 run id：日志详情对最近一次云盘任务直接复用内存明细。
+    const unlistenCloudStart = listen<number>("cloud://start", (e) => {
+      cloudStore.start(e.payload);
+    });
+    const unlistenCloudRow = listen<CloudTaskRow>("cloud://row", (e) => {
+      cloudStore.upsert(e.payload);
+    });
+    const unlistenCloudState = listen<boolean>("cloud://state", (e) => {
+      cloudStore.setRunning(e.payload, e.payload ? cloudStore.getPaused() : false);
+    });
+    const unlistenCloudProgress = listen<SyncProgress>("cloud://progress", (e) => {
+      cloudStore.setProgress(e.payload);
+    });
     // 轮询同步控制状态（暂停/继续），保持 UI 与后端一致。
-    // 仅在实际同步期间轮询；空闲时停表，避免常驻每 1 秒一次的 IPC 调用。
+    // 任一任务（歌单/云盘）运行期间轮询；空闲时停表，避免常驻每 1 秒一次的 IPC 调用。
     let poll: ReturnType<typeof setInterval> | null = null;
     const syncFromControl = async () => {
       try {
@@ -104,11 +124,20 @@ export default function App() {
       } catch {
         // 忽略轮询失败
       }
+      if (cloudStore.getRunning()) {
+        try {
+          const ctrl = await api.getCloudControl();
+          cloudStore.setRunning(ctrl.running, ctrl.running ? ctrl.paused : false);
+        } catch {
+          // 忽略轮询失败
+        }
+      }
     };
     const ensurePolling = () => {
-      if (syncStore.getRunning() && !poll) {
+      const anyRunning = syncStore.getRunning() || cloudStore.getRunning();
+      if (anyRunning && !poll) {
         poll = setInterval(syncFromControl, 1000);
-      } else if (!syncStore.getRunning() && poll) {
+      } else if (!anyRunning && poll) {
         clearInterval(poll);
         poll = null;
       }
@@ -118,13 +147,19 @@ export default function App() {
       ensurePolling();
       if (!syncStore.getRunning()) refreshLogin();
     });
+    const unsubCloudRunning = cloudStore.subscribeRunning(ensurePolling);
     ensurePolling();
 
     return () => {
       unlistenProgress.then((f) => f());
       unlistenState.then((f) => f());
+      unlistenCloudStart.then((f) => f());
+      unlistenCloudRow.then((f) => f());
+      unlistenCloudState.then((f) => f());
+      unlistenCloudProgress.then((f) => f());
       window.removeEventListener("theme-changed", onThemeChanged);
       unsubRunning();
+      unsubCloudRunning();
       if (poll) clearInterval(poll);
     };
   }, [applyLanguage, refreshLogin]);
@@ -164,6 +199,7 @@ export default function App() {
   const items = [
     { key: "login", icon: <LoginOutlined />, label: t("app.menu.login") },
     { key: "playlists", icon: <CloudSyncOutlined />, label: t("app.menu.playlists") },
+    { key: "cloud", icon: <CloudUploadOutlined />, label: t("app.menu.cloud") },
     { key: "sync", icon: <HistoryOutlined />, label: t("app.menu.sync") },
     { key: "quarantine", icon: <DeleteOutlined />, label: t("app.menu.quarantine") },
     { key: "settings", icon: <SettingOutlined />, label: t("app.menu.settings") },
@@ -184,7 +220,7 @@ export default function App() {
           onClick={(e) => setPage(e.key as PageKey)}
         />
         <div style={{ position: "absolute", bottom: 12, left: 16, color: "#888", fontSize: 12 }}>
-          {syncRunning ? <Tag color="processing">{t("app.syncing")}</Tag> : <Tag>{t("app.idle")}</Tag>}
+          {taskRunning ? <Tag color="processing">{t("app.syncing")}</Tag> : <Tag>{t("app.idle")}</Tag>}
         </div>
       </Sider>
       <Layout>
@@ -199,7 +235,12 @@ export default function App() {
             height: 48,
           }}
         >
-          <Space size={8}>
+          <Space
+            size={8}
+            style={{ cursor: "pointer" }}
+            onClick={() => setPage("login")}
+            title={t("app.menu.login")}
+          >
             {login?.loggedIn && login.avatarUrl && (
               <Avatar size={28} src={login.avatarUrl} />
             )}
@@ -286,6 +327,12 @@ export default function App() {
             <LoginPage login={login} onLogin={refreshLogin} onLogout={onLogout} />
           ) : page === "playlists" ? (
             <PlaylistsPage login={login} sync={sync} />
+          ) : page === "cloud" ? (
+            <CloudPage
+              login={login}
+              onGoSync={() => setPage("sync")}
+              onGoSettings={() => setPage("settings")}
+            />
           ) : page === "sync" ? (
             <SyncPage />
           ) : page === "quarantine" ? (
@@ -315,14 +362,14 @@ function SyncHeaderProgress({ running, paused }: { running: boolean; paused: boo
     <Typography.Text type={paused ? "warning" : "secondary"} style={{ fontSize: 12 }}>
       {paused
         ? t("app.syncPaused")
-        : progress
-          ? t("app.progressHeader", {
-              name: progress.playlistName,
-              phase: progressPhase,
-              current: progress.current,
-              total: progress.total,
-            })
-          : t("app.syncing")}
+          : progress
+            ? t("app.progressHeader", {
+                name: taskDisplayName(progress.playlistName),
+                phase: progressPhase,
+                current: progress.current,
+                total: progress.total,
+              })
+            : t("app.syncing")}
       {progress?.message && !paused
         ? ` · ${translateProgressMessage(progress.message)}`
         : ""}

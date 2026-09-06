@@ -47,15 +47,15 @@ mod tests {
 
     #[test]
     fn serializes_code_and_params() {
-        let message = UiMessage::with_params("file_exists", vec!["D:\\a.mp3"]);
+        let message = UiMessage::with_params("fileExists", vec!["D:\\a.mp3"]);
         let encoded = serde_json::to_string(&message).unwrap();
-        assert!(encoded.contains("\"code\":\"file_exists\""));
+        assert!(encoded.contains("\"code\":\"fileExists\""));
         assert!(encoded.contains("\"params\""));
     }
 
     #[test]
     fn omits_empty_params() {
-        let encoded = serde_json::to_string(&UiMessage::new("no_url")).unwrap();
+        let encoded = serde_json::to_string(&UiMessage::new("noUrl")).unwrap();
         assert!(!encoded.contains("\"params\""));
     }
 }

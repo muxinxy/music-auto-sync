@@ -2,6 +2,9 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountStats,
   AppInfo,
+  CloudDownloadItem,
+  CloudListResult,
+  CloudUploadPlan,
   Config,
   DeletedLogEntry,
   LocalMatchPreview,
@@ -13,6 +16,7 @@ import type {
   PlaylistSongsResult,
   QuarantineItem,
   QrCheckResult,
+  RunChangeEntry,
   SingleDownloadOptions,
   SyncChangeEntry,
   SyncReport,
@@ -54,6 +58,22 @@ export const api = {
 
   syncPlaylist: (id: number) => invoke<SyncReport>("sync_playlist", { id }),
   syncAll: () => invoke<SyncReport[]>("sync_all"),
+
+  listCloudSongs: (force?: boolean) =>
+    invoke<CloudListResult>("list_cloud_songs", { force: force ?? false }),
+  previewCloudUpload: () => invoke<CloudUploadPlan>("preview_cloud_upload"),
+  syncCloudUpload: () => invoke<SyncReport>("sync_cloud_upload"),
+  syncCloudManual: (paths: string[]) =>
+    invoke<SyncReport>("sync_cloud_manual", { paths }),
+  downloadCloudSongs: (items: CloudDownloadItem[], targetDir: string) =>
+    invoke<SyncReport>("download_cloud_songs", { items, targetDir }),
+  pauseCloudSync: () => invoke<boolean>("pause_cloud_sync"),
+  resumeCloudSync: () => invoke<boolean>("resume_cloud_sync"),
+  cancelCloudSync: () => invoke<boolean>("cancel_cloud_sync"),
+  getCloudControl: () =>
+    invoke<{ running: boolean; paused: boolean }>("get_cloud_control"),
+  getRunChanges: (runId: number) =>
+    invoke<RunChangeEntry[]>("get_run_changes", { runId }),
   cancelSync: () => invoke<boolean>("cancel_sync"),
   pauseSync: () => invoke<boolean>("pause_sync"),
   resumeSync: () => invoke<boolean>("resume_sync"),

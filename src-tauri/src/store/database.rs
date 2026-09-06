@@ -214,6 +214,25 @@ pub fn log(conn: &Connection, playlist_name: &str, status: &str, message: &str) 
     Ok(conn.last_insert_rowid())
 }
 
+/// 任务结束时**原地更新**启动时写入的那条 "running" 日志（一次任务只留一条记录），
+/// 状态改为 ok/error/canceled，正文换成结果摘要或失败原因。
+pub fn finish_log(conn: &Connection, id: i64, status: &str, message: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_logs SET status=?2, message=?3 WHERE id=?1",
+        params![id, status, message],
+    )?;
+    Ok(())
+}
+
+/// 日志行先于歌单曲目拉取写入（此时歌单名未知，用 #<id> 占位），拉取成功后回填真实名称。
+pub fn update_log_name(conn: &Connection, id: i64, playlist_name: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE sync_logs SET playlist_name=?2 WHERE id=?1",
+        params![id, playlist_name],
+    )?;
+    Ok(())
+}
+
 pub fn get_logs(conn: &Connection, limit: usize) -> Result<Vec<SyncLogEntry>> {
     let mut stmt = conn.prepare(
         "SELECT id, ts, playlist_name, status, message FROM sync_logs ORDER BY id DESC LIMIT ?1",
@@ -447,6 +466,70 @@ pub fn mark_deleted_restored(conn: &Connection, id: i64) -> Result<()> {
         params![now(), id],
     )?;
     Ok(())
+}
+
+/// 任务详情条目：某次同步（sync_run_id）的变更流水，附可恢复操作的 id。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunChangeEntry {
+    pub id: i64,
+    pub ts: String,
+    pub playlist_name: String,
+    pub direction: String,
+    pub action: String,
+    pub track_id: Option<i64>,
+    pub track_name: Option<String>,
+    pub local_path: Option<String>,
+    pub quarantined_path: Option<String>,
+    pub netease_id: Option<i64>,
+    pub note: Option<String>,
+    /// 可恢复时的凭据 id；restore_kind = "deleted"（deleted_log）| "quarantine"（quarantine）。
+    pub restore_id: Option<i64>,
+    pub restore_kind: Option<String>,
+}
+
+/// 按同步轮次查变更流水（任务详情用），并 LEFT JOIN 出尚未恢复的删除记录：
+/// 本地文件优先按 deleted_log（有 restored_at 可防重复恢复），其次 quarantine；
+/// 歌单曲目按 playlist_track + track_id + playlist_id 匹配。
+pub fn get_run_changes(conn: &Connection, run_id: i64) -> Result<Vec<RunChangeEntry>> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.ts, c.playlist_name, c.direction, c.action, c.track_id, c.track_name,
+                c.local_path, c.quarantined_path, c.netease_id, c.note,
+                d.id, q.id
+         FROM sync_changes c
+         LEFT JOIN deleted_log d
+                ON d.restored_at IS NULL
+               AND ((d.kind = 'local_file' AND d.quarantined_path IS NOT NULL AND d.quarantined_path = c.quarantined_path)
+                 OR (d.kind = 'playlist_track' AND c.action = 'removed_from_playlist' AND d.track_id = c.track_id AND d.playlist_id = c.playlist_id))
+         LEFT JOIN quarantine q
+                ON q.quarantine_path = c.quarantined_path
+         WHERE c.sync_run_id = ?1
+         ORDER BY c.id ASC",
+    )?;
+    let rows = stmt.query_map([run_id], |row| {
+        let deleted_id: Option<i64> = row.get(11)?;
+        let quarantine_id: Option<i64> = row.get(12)?;
+        let (restore_id, restore_kind) = match deleted_id {
+            Some(id) => (Some(id), Some("deleted".to_string())),
+            None => (quarantine_id, quarantine_id.map(|_| "quarantine".to_string())),
+        };
+        Ok(RunChangeEntry {
+            id: row.get(0)?,
+            ts: row.get(1)?,
+            playlist_name: row.get(2)?,
+            direction: row.get(3)?,
+            action: row.get(4)?,
+            track_id: row.get(5)?,
+            track_name: row.get(6)?,
+            local_path: row.get(7)?,
+            quarantined_path: row.get(8)?,
+            netease_id: row.get(9)?,
+            note: row.get(10)?,
+            restore_id,
+            restore_kind,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
 }
 
 /// 汇总本地同步统计（账号页展示）。

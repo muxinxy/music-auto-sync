@@ -1,6 +1,6 @@
 [package]
 name = "music-auto-sync"
-version = "0.7.2"
+version = "0.8.0"
 description = "Portable NetEase Cloud Music playlist synchronizer"
 license = "MIT"
 authors = ["muxinxy"]

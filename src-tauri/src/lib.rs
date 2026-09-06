@@ -21,6 +21,10 @@ pub struct AppState {
     pub cancel_requested: Arc<AtomicBool>,
     /// 暂停请求：同步任务在曲目边界检查该标志并等待（可继续/取消）。
     pub pause_requested: Arc<AtomicBool>,
+    /// 云盘任务与歌单同步**并行运行**（资源不同：上传 vs 下载），拥有独立的运行/暂停/取消标志。
+    pub cloud_running: AtomicBool,
+    pub cloud_cancel_requested: Arc<AtomicBool>,
+    pub cloud_pause_requested: Arc<AtomicBool>,
 }
 
 pub fn run() {
@@ -47,6 +51,9 @@ pub fn run() {
             sync_running: AtomicBool::new(false),
             cancel_requested: Arc::new(AtomicBool::new(false)),
             pause_requested: Arc::new(AtomicBool::new(false)),
+            cloud_running: AtomicBool::new(false),
+            cloud_cancel_requested: Arc::new(AtomicBool::new(false)),
+            cloud_pause_requested: Arc::new(AtomicBool::new(false)),
         })
         .setup(|app| {
             runtime::tray::install(app.handle())?;
@@ -92,6 +99,16 @@ pub fn run() {
             commands::get_playlist_settings,
             commands::sync_playlist,
             commands::sync_all,
+            commands::list_cloud_songs,
+            commands::preview_cloud_upload,
+            commands::sync_cloud_upload,
+            commands::sync_cloud_manual,
+            commands::download_cloud_songs,
+            commands::cancel_cloud_sync,
+            commands::pause_cloud_sync,
+            commands::resume_cloud_sync,
+            commands::get_cloud_control,
+            commands::get_run_changes,
             commands::cancel_sync,
             commands::pause_sync,
             commands::resume_sync,

@@ -145,6 +145,8 @@ export interface SyncProgress {
   current: number;
   total: number;
   message: UiMessage;
+  /** 本次任务的 sync_logs 行 id（= 变更流水 run id），歌单任务的任务详情据此查询。 */
+  runId?: number | null;
 }
 
 export interface SyncReport {
@@ -254,4 +256,93 @@ export interface NcmConvertReport {
   skipped: number;
   failed: number;
   items: NcmConvertItemResult[];
+}
+
+export interface CloudSong {
+  songId: number;
+  songName: string;
+  artist: string;
+  album: string;
+  fileName: string;
+  fileSize: number;
+  bitrate?: number | null;
+  /** 上传时间（epoch 毫秒）。 */
+  addTime?: number | null;
+  /** 匹配到的网易曲目 id（未匹配为 null）。 */
+  simpleSongId?: number | null;
+}
+
+export interface CloudStorageInfo {
+  count: number;
+  usedSize?: number | null;
+  maxSize?: number | null;
+}
+
+export interface CloudListResult {
+  songs: CloudSong[];
+  storage: CloudStorageInfo;
+}
+
+export interface CloudUploadItem {
+  path: string;
+  fileName: string;
+  fileSize: number;
+  neteaseId: number;
+  title: string;
+  artist: string;
+  album: string;
+}
+
+export interface CloudUploadPlan {
+  uploads: CloudUploadItem[];
+  /** 无法匹配网易曲目而将被跳过的本地文件路径。 */
+  unresolved: string[];
+  cloudCount: number;
+  localCount: number;
+}
+
+/** 云盘任务明细行（事件 cloud://row，按 path 合并）。result 取值见后端 CloudTaskRow。 */
+export interface CloudTaskRow {
+  path: string;
+  fileName: string;
+  title: string;
+  artist: string;
+  album: string;
+  neteaseId: number;
+  fileSize: number;
+  result:
+    | "in_cloud"
+    | "duplicate"
+    | "unresolved"
+    | "to_upload"
+    | "uploading"
+    | "uploaded"
+    | "instant"
+    | "downloading"
+    | "downloaded"
+    | "dl_skipped"
+    | "failed";
+  message?: UiMessage | null;
+}
+
+/** 某次同步任务的变更记录（get_run_changes，含可恢复 id）。 */
+export interface RunChangeEntry {
+  id: number;
+  ts: string;
+  playlistName: string;
+  direction: string;
+  action: string;
+  trackId?: number | null;
+  trackName?: string | null;
+  localPath?: string | null;
+  quarantinedPath?: string | null;
+  neteaseId?: number | null;
+  note?: string | null;
+  restoreId?: number | null;
+  restoreKind?: "deleted" | "quarantine" | null;
+}
+
+export interface CloudDownloadItem {
+  id: number;
+  fileName: string;
 }

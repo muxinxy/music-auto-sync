@@ -30,6 +30,9 @@ fn build_state() -> Result<AppState, String> {
         sync_running: AtomicBool::new(false),
         cancel_requested: Arc::new(AtomicBool::new(false)),
         pause_requested: Arc::new(AtomicBool::new(false)),
+        cloud_running: AtomicBool::new(false),
+        cloud_cancel_requested: Arc::new(AtomicBool::new(false)),
+        cloud_pause_requested: Arc::new(AtomicBool::new(false)),
     })
 }
 

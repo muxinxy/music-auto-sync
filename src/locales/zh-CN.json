@@ -18,6 +18,7 @@
     "menu": {
       "login": "账号登录",
       "playlists": "歌单同步",
+      "cloud": "音乐云盘",
       "sync": "同步任务",
       "quarantine": "隔离区",
       "settings": "设置"
@@ -28,7 +29,14 @@
     "phaseReadPlaylist": "读取歌单",
     "phaseDownload": "下载",
     "phaseQuarantine": "隔离",
-    "phaseConvertNcm": "转换 NCM"
+    "phaseConvertNcm": "转换 NCM",
+    "phase_read_playlist": "读取歌单",
+    "phase_download": "下载",
+    "phase_quarantine": "隔离",
+    "phase_convert_ncm": "转换 NCM",
+    "phase_scan_local": "扫描本地",
+    "phase_upload_cloud": "上传云盘",
+    "phase_download_cloud": "下载云盘"
   },
   "login": {
     "title": "网易云音乐扫码登录",
@@ -219,7 +227,8 @@
     "restoreAdd": "将新增 {{count}} 首",
     "restoreRemove": "将移除 {{count}} 首",
     "restoreNoChange": "与当前状态无差异",
-    "preRestoreNote": "恢复前会自动把当前歌单状态保存为一份新快照（标注“pre_restore”），可再次回滚。"
+    "preRestoreNote": "恢复前会自动把当前歌单状态保存为一份新快照（标注“pre_restore”），可再次回滚。",
+    "matchStart": "开始匹配"
   },
   "syncPage": {
     "loadLogsFailed": "加载日志失败：{{detail}}",
@@ -232,6 +241,8 @@
     "viewDetails": "失败详情（{{count}}）",
     "statusSuccess": "成功",
     "statusFailed": "失败",
+    "statusCanceled": "已取消",
+    "runEmpty": "该任务没有记录",
     "statusRunning": "进行中",
     "changesTitle": "变更记录",
     "noChanges": "暂无变更记录",
@@ -246,13 +257,16 @@
     "colName": "歌曲/文件",
     "direction": {
       "to_local": "歌单→本地",
-      "to_playlist": "本地→歌单"
+      "to_playlist": "本地→歌单",
+      "to_cloud": "本地→云盘"
     },
     "action": {
       "addedLocal": "新增下载到本地",
       "quarantinedLocal": "本地多余已隔离",
       "addedPlaylist": "已加入歌单",
       "removedFromPlaylist": "已从歌单移除",
+      "addedCloud": "已上传到云盘",
+      "instantImport": "秒传导入云盘",
       "failed": "失败"
     },
     "deletedTitle": "可恢复的删除记录",
@@ -278,7 +292,9 @@
     "deletedExplain": "这里列出的「可恢复的删除记录」：本地被隔离的文件可还原回原路径；网易歌单被移出的曲目可加回歌单。",
     "filterLog": "搜索日志",
     "filterDeleted": "搜索歌单/歌曲/路径",
-    "filterKind": "按类型筛选"
+    "filterKind": "按类型筛选",
+    "downloadedCloud": "云盘歌曲已下载",
+    "skippedExists": "文件已存在，跳过"
   },
   "quarantine": {
     "loadFailed": "加载隔离区失败：{{detail}}",
@@ -297,6 +313,55 @@
     "confirmCancel": "取消",
     "meta": "歌单：{{playlist}} · 隔离时间：{{time}}",
     "originalPath": "原路径：{{path}}"
+  },
+  "cloud": {
+    "taskName": "云盘上传",
+    "title": "音乐云盘",
+    "needLogin": "请先在「账号登录」页扫码登录，再使用云盘功能。",
+    "refresh": "刷新",
+    "loadFailed": "云盘列表加载失败：{{detail}}",
+    "searchPlaceholder": "搜索歌名/歌手/专辑/文件名",
+    "colSong": "歌曲",
+    "colArtist": "歌手",
+    "colAlbum": "专辑",
+    "colSize": "大小",
+    "colFile": "文件名",
+    "colAdded": "上传时间",
+    "statsCount": "云盘歌曲",
+    "statsSize": "云盘已用",
+    "statsQuota": "云盘容量",
+    "empty": "云盘还是空的",
+    "syncBtn": "同步到云盘",
+    "syncBtnTip": "开始同步并跳转到「同步任务」页查看实时进度与明细",
+    "taskDetail": "任务详情",
+    "detailEmpty": "暂无对比记录——开始同步到云盘后，这里会实时显示每一首的对比结果",
+    "detailColFile": "本地文件",
+    "detailColMatched": "识别结果",
+    "detailColSize": "大小",
+    "detailColResult": "状态",
+    "detailColNote": "备注",
+    "resultInCloud": "已在云盘",
+    "resultDuplicate": "重复跳过",
+    "resultUnresolved": "未识别",
+    "resultToUpload": "待上传",
+    "resultUploading": "上传中",
+    "resultUploaded": "已上传",
+    "resultInstant": "秒传",
+    "resultFailed": "失败",
+    "detailSummary": "对比 {{total}} · 待上传 {{upload}} · 已在云盘 {{inCloud}} · 重复 {{duplicate}} · 未识别 {{unresolved}} · 失败 {{failed}}",
+    "filterFile": "筛选文件名/路径",
+    "filterStatus": "按状态筛选",
+    "uploadFiles": "上传歌曲",
+    "uploadDir": "上传目录",
+    "uploadPickTip": "选择音频文件或目录上传到云盘（任务进度在「同步任务」页查看）",
+    "downloadSelected": "下载选中 ({{count}})",
+    "pickFiles": "选择音频文件",
+    "pickDir": "选择目录",
+    "resultDownloading": "下载中",
+    "resultDownloaded": "已下载",
+    "resultDlSkipped": "已存在，跳过",
+    "dlPickDir": "选择下载目录",
+    "taskNameDownload": "云盘下载"
   },
   "settings": {
     "loadFailed": "加载设置失败：{{detail}}",
@@ -454,6 +519,11 @@
     "readPlaylist": "正在读取歌单…",
     "track": "{{0}}",
     "sync_ok": "同步成功",
-    "sync_done_failed": "同步完成（{{0}} 首失败）"
+    "sync_done_failed": "同步完成（{{0}} 首失败）",
+    "cloudTicketInvalid": "云盘上传凭证不完整，请重试或检查 API 地址",
+    "cloudTokenFailed": "获取云盘上传凭证失败：{{0}}（{{1}}）",
+    "cloudUploadFailed": "上传到云盘失败：{{0}}",
+    "cloudCompleteFailed": "云盘导入失败：{{0}}（{{1}}）",
+    "cloudFileReadFailed": "读取本地文件失败：{{0}}（{{1}}）"
   }
 }

@@ -15,7 +15,8 @@ Windows 便携网易云音乐歌单同步器（Tauri 2 + Rust 后端 + React/TS 
 ## 架构与数据流
 
 - 前端通过 `src/api.ts` 的 `invoke` 调 Tauri 命令（`src-tauri/src/commands.rs` 注册于 `lib.rs` invoke_handler）。新增命令要：实现 → 注册 → `api.ts`/`types.ts` 加 wrapper。
-- 后端分层：`api/mod.rs`（NeteaseApi HTTP client）→ `core/sync.rs`（同步引擎）→ `store/`（config.rs / database.rs / paths.rs / 日志）。`ncm/`、`tags/`、`runtime/`（tray、scheduler）。
+- 后端分层：`api/mod.rs`（NeteaseApi HTTP client）→ `core/sync.rs`（同步引擎）→ `store/`（config.rs / database.rs / paths.rs / 日志）。`core/cloud.rs`（音乐云盘）、`ncm/`、`tags/`、`runtime/`（tray、scheduler）。
+- 云盘：列表 `/user/cloud` 分页 200/页；上传走**客户端直传**（`/cloud/upload/token` → POST 文件到 uploadUrl 带 `x-nos-token`+`Content-MD5` 头 → `/cloud/upload/complete`），不受 API 代理服务器请求体限制，complete 会校验音频可解析性（非音频/部分 wav 会 400）。比对键 = 网易曲目 id（`simpleSong.id`/条目 `songId`，导入后网易会自动匹配官方曲目）。哨兵任务名 `"cloud"` 由前端 `src/taskName.ts` 翻译。
 - 数据目录：`--data-dir` > exe 同级 `portable.ini` > exe 同级 `data/` > AppData。cookie/凭据只在本地 config.json；日志绝不写 cookie 明文。
 - 配置存 `config.json`（`store/config.rs`，serde camelCase）；**新字段必须带 `#[serde(default)]` 或 default fn** 否则旧配置解析失败。
 - SQLite `library.db`：`track_files` / `playlist_snapshots` / `quarantine` / `sync_logs` / `sync_runs` / `sync_changes` / `playlist_history` / `deleted_log`（建表幂等，加表在 `database.rs open()` 的 execute_batch 里）。
@@ -31,7 +32,7 @@ Windows 便携网易云音乐歌单同步器（Tauri 2 + Rust 后端 + React/TS 
 
 - 会话必须用 **query/body `cookie` 参数**，HTTP Cookie 头不生效。登录/验证码/歌曲地址路由不加 `randomCNIP`（会破坏会员判定）。
 - 登录：二维码 `/login/qr/*`；短信 `/captcha/sent` + `/login/cellphone`（需 timestamp cache-buster）。
-- 错误处理：后端返回 `UiMessage {code, params}` JSON 字符串（`error.rs`），前端 `errors.ts translateUi` 按 `errors.<code>` 翻译。**code 与 locale 键必须一致**（历史坑：后端发 `sync_ok` snake、locale 只有 `syncOk` camel，导致中文界面显示英文原码——两边键名要完全一致）。
+- 错误处理：后端返回 `UiMessage {code, params}` JSON 字符串（`error.rs`），前端 `errors.ts translateUi` 按 `errors.<code>` 翻译。**code 与 locale 键必须一致**（历史坑：后端发 `sync_ok` snake、locale 只有 `syncOk` camel，导致中文界面显示英文原码——两边键名要完全一致）。**新增错误码一律 camelCase**（如 `cloudUploadFailed`，直译 locale 键）；存量 snake 码（`sync_busy` 等）是历史遗留、界面上会显示英文原码，勿模仿新代码。
 - 音质预检用 `/song/detail` privilege；批量直链 `/song/url/v1`；本地文件匹配网易曲目用 `/search/match`。
 
 ## UI/产品约定

@@ -332,29 +332,15 @@ export default function PlaylistsPage({ login, sync }: Props) {
     }
   };
 
-  /** 打开本地匹配预览：给 playlistId 则预选该歌单，否则用列表中第一个。 */
-  const openMatchPreview = async (playlistId?: number) => {
-    const target = playlistId ?? playlists[0]?.id;
-    if (target == null) {
-      antMessage.info(t("playlists.matchPreviewNoPlaylist"));
-      return;
-    }
-    setMatchPlaylistId(target);
+  /** 打开本地匹配预览：给 playlistId 则预选该歌单。不自动匹配——选择歌单或点“开始匹配”后才跑。 */
+  const openMatchPreview = (playlistId?: number) => {
+    setMatchPlaylistId(playlistId ?? null);
     setMatchOpen(true);
-    setMatchLoading(true);
     setMatchList([]);
-    try {
-      const list = await api.previewLocalMatch(target);
-      setMatchList(list);
-    } catch (e) {
-      antMessage.error(t("playlists.matchPreviewFailed", { detail: formatError(e) }));
-      setMatchOpen(false);
-    } finally {
-      setMatchLoading(false);
-    }
+    setMatchLoading(false);
   };
 
-  /** 切换预览目标歌单。 */
+  /** 对指定歌单执行匹配（选择歌单或点击“开始匹配”触发）。 */
   const changeMatchPlaylist = async (id: number) => {
     setMatchPlaylistId(id);
     setMatchLoading(true);
@@ -951,7 +937,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
 
       <Modal
         title={t("playlists.matchPreviewTitle", {
-          name: songs?.playlistName ?? "",
+          name: playlists.find((p) => p.id === matchPlaylistId)?.name ?? "",
           count: matchList.length,
         })}
         open={matchOpen}
@@ -980,6 +966,18 @@ export default function PlaylistsPage({ login, sync }: Props) {
         {matchLoading ? (
           <div style={{ textAlign: "center", padding: 24 }}>
             <Spin />
+          </div>
+        ) : matchPlaylistId == null ? (
+          <div style={{ textAlign: "center", padding: 24 }}>
+            <Typography.Text type="secondary">
+              {t("playlists.matchPickPlaylist")}
+            </Typography.Text>
+          </div>
+        ) : matchList.length === 0 ? (
+          <div style={{ textAlign: "center", padding: 24 }}>
+            <Button type="primary" onClick={() => changeMatchPlaylist(matchPlaylistId)}>
+              {t("playlists.matchStart")}
+            </Button>
           </div>
         ) : (
           <>

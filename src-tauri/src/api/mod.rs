@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    path::Path,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -154,9 +155,20 @@ pub struct TrackAvailability {
     pub reason: Option<String>,
 }
 
+/// /cloud/upload/token 返回的上传凭证。songId 为长十六进制串、resourceId 为
+/// 数字串，统一按字符串处理（complete 原样回传）。
 #[derive(Debug, Clone, Default)]
-pub struct ApiResponseMeta {
-    pub duration_ms: u128,
+pub struct CloudUploadTicket {
+    /// false = 服务器已有同 MD5 文件（秒传），可跳过传输直接 complete。
+    pub need_upload: bool,
+    pub song_id: String,
+    pub upload_token: String,
+    pub upload_url: String,
+    pub resource_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ApiResponseMeta {    pub duration_ms: u128,
     pub http_status: Option<u16>,
     pub api_code: Option<i64>,
     pub server: Option<String>,
@@ -226,8 +238,18 @@ impl ApiCallError {
         if let Some(request_id) = &self.meta.request_id {
             params.push(request_id.clone());
         }
+        // 类名转前端 locale 键（camelCase）；未列出的（timeout/connect 等）本就一致。
+        let code = match self.class {
+            "http_403" => "http403",
+            "http_429" => "http429",
+            "http_5xx" => "http5xx",
+            "invalid_json" => "invalidJson",
+            "invalid_session_cookie" => "invalidSessionCookie",
+            "api_business" => "apiBusiness",
+            other => other,
+        };
         crate::error::UiMessage {
-            code: self.class.into(),
+            code: code.into(),
             params,
         }
     }
@@ -236,6 +258,21 @@ impl ApiCallError {
 impl NeteaseApi {
     pub fn download_source(&self) -> &str {
         &self.download_source
+    }
+
+    /// 读取共享 TTL 缓存（供 core 层聚合数据缓存，如云盘列表）。
+    pub fn cache_get(&self, namespace: &str, key: &str, ttl: Duration) -> Option<Value> {
+        self.api_cache.get(namespace, key, ttl)
+    }
+
+    /// 写入共享 TTL 缓存。
+    pub fn cache_put(&self, namespace: &str, key: &str, value: &Value) {
+        self.api_cache.put(namespace, key, value.clone());
+    }
+
+    /// 失效某命名空间的共享缓存。
+    pub fn cache_invalidate(&self, namespace: &str) {
+        self.api_cache.invalidate_namespace(namespace);
     }
 
     pub fn from_config(config: &Config) -> Result<Self> {
@@ -287,10 +324,7 @@ impl NeteaseApi {
         let mut query: Vec<(&str, String)> = params.to_vec();
         // 登录/验证码/下载地址路由保持 IP 一致性：随机 IP 会让会员权益判定失效，
         // 服务端会对歌曲地址接口返回试听片段。其余请求可选使用随机中国 IP。
-        let stable_ip_path = path.starts_with("/login")
-            || path.starts_with("/captcha")
-            || path.starts_with("/song/url")
-            || path.starts_with("/song/download");
+        let stable_ip_path = is_stable_ip_path(path);
         if self.random_cn_ip && !stable_ip_path {
             query.push(("randomCNIP", "true".into()));
         }
@@ -302,7 +336,34 @@ impl NeteaseApi {
                 .header("Cookie", cookie)
                 .query(&[("cookie", cookie.clone())]);
         }
+        self.execute_json(request).await
+    }
 
+    /// POST 表单变体。云盘上传的 token/complete 端点要求 cookie 等
+    /// 参数放在请求体（query/header 均不生效），故参数以 form body 发送。
+    async fn post_value(
+        &self,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> std::result::Result<(Value, Option<String>, ApiResponseMeta), ApiCallError> {
+        let url = format!("{}{}", self.base, path);
+        let mut query: Vec<(&str, String)> = Vec::new();
+        if self.random_cn_ip && !is_stable_ip_path(path) {
+            query.push(("randomCNIP", "true".into()));
+        }
+        let mut form: Vec<(&str, String)> = params.to_vec();
+        let mut request = self.client.post(&url).query(&query);
+        if let Some(cookie) = &self.cookie {
+            form.push(("cookie", cookie.clone()));
+            request = request.header("Cookie", cookie);
+        }
+        self.execute_json(request.form(&form)).await
+    }
+
+    async fn execute_json(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> std::result::Result<(Value, Option<String>, ApiResponseMeta), ApiCallError> {
         let started = Instant::now();
         let response = match request.send().await {
             Ok(response) => response,
@@ -347,6 +408,20 @@ impl NeteaseApi {
     async fn get(&self, path: &str, params: &[(&str, String)]) -> Result<(Value, Option<String>)> {
         let (json, set_cookie, meta) = self
             .get_value(path, params)
+            .await
+            .map_err(anyhow::Error::new)?;
+        ensure_success_code(&json).map_err(|_| {
+            anyhow::Error::new(ApiCallError {
+                class: "api_business",
+                meta,
+            })
+        })?;
+        Ok((json, set_cookie))
+    }
+
+    async fn post(&self, path: &str, params: &[(&str, String)]) -> Result<(Value, Option<String>)> {
+        let (json, set_cookie, meta) = self
+            .post_value(path, params)
             .await
             .map_err(anyhow::Error::new)?;
         ensure_success_code(&json).map_err(|_| {
@@ -796,7 +871,7 @@ impl NeteaseApi {
             } else if fee == Some(4) && download_level.is_none() {
                 Some("purchased".into())
             } else if download_level.is_none() && fee == Some(1) {
-                Some("no_right".into())
+                Some("noRight".into())
             } else {
                 None
             };
@@ -1045,7 +1120,7 @@ impl NeteaseApi {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or(set_cookie)
-            .ok_or_else(|| anyhow!(UiMessage::new("cookie_missing")))?;
+            .ok_or_else(|| anyhow!(UiMessage::new("cookieMissing")))?;
         let profile = json.get("profile");
         let status = LoginStatus {
             logged_in: true,
@@ -1154,6 +1229,179 @@ impl NeteaseApi {
         Ok(first
             .and_then(|song| song.get("id"))
             .and_then(Value::as_u64))
+    }
+
+    // ---------- 音乐云盘 ----------
+
+    /// 云盘列表单页（/user/cloud）。
+    /// 返回 (条目原始 JSON 数组, 云盘总数, 已用空间字节, 云盘总空间字节)。
+    /// 条目字段手册未记载，交由 core/cloud.rs 防御式解析。
+    pub async fn user_cloud_page(
+        &self,
+        limit: u64,
+        offset: u64,
+    ) -> Result<(Vec<Value>, u64, Option<u64>, Option<u64>)> {
+        let (json, _) = self
+            .get(
+                "/user/cloud",
+                &[
+                    ("limit", limit.to_string()),
+                    ("offset", offset.to_string()),
+                    ("timestamp", cache_buster()),
+                ],
+            )
+            .await?;
+        let items = json
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let count = json
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or(items.len() as u64);
+        let used_size = json.get("size").and_then(Value::as_u64);
+        let max_size = json.get("maxSize").and_then(Value::as_u64);
+        Ok((items, count, used_size, max_size))
+    }
+
+    /// 获取云盘上传凭证（/cloud/upload/token，cookie 等参数须在请求体）。
+    pub async fn cloud_upload_ticket(
+        &self,
+        md5: &str,
+        file_size: u64,
+        filename: &str,
+    ) -> Result<CloudUploadTicket> {
+        let (json, _) = self
+            .post(
+                "/cloud/upload/token",
+                &[
+                    ("md5", md5.to_owned()),
+                    ("fileSize", file_size.to_string()),
+                    ("filename", filename.to_owned()),
+                    ("timestamp", cache_buster()),
+                ],
+            )
+            .await?;
+        let data = json.get("data").cloned().unwrap_or(Value::Null);
+        let invalid = || anyhow!(UiMessage::new("cloudTicketInvalid"));
+        let ticket = CloudUploadTicket {
+            need_upload: data
+                .get("needUpload")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            song_id: json_field_string(&data, "songId").ok_or_else(invalid)?,
+            upload_token: json_field_string(&data, "uploadToken").unwrap_or_default(),
+            upload_url: json_field_string(&data, "uploadUrl").unwrap_or_default(),
+            resource_id: json_field_string(&data, "resourceId").ok_or_else(invalid)?,
+        };
+        if ticket.need_upload && ticket.upload_url.is_empty() {
+            return Err(invalid());
+        }
+        Ok(ticket)
+    }
+
+    /// 完成云盘导入（/cloud/upload/complete，cookie 等参数须在请求体）。
+    /// song/artist/album 为空时不下发，由网易按默认值（“未知”）填充。
+    pub async fn cloud_upload_complete(
+        &self,
+        ticket: &CloudUploadTicket,
+        md5: &str,
+        filename: &str,
+        song: Option<&str>,
+        artist: Option<&str>,
+        album: Option<&str>,
+    ) -> Result<()> {
+        let mut params = vec![
+            ("songId", ticket.song_id.clone()),
+            ("resourceId", ticket.resource_id.clone()),
+            ("md5", md5.to_owned()),
+            ("filename", filename.to_owned()),
+            ("timestamp", cache_buster()),
+        ];
+        for (key, value) in [("song", song), ("artist", artist), ("album", album)] {
+            if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
+                params.push((key, value.to_owned()));
+            }
+        }
+        self.post("/cloud/upload/complete", &params).await?;
+        Ok(())
+    }
+
+    /// 云盘直传专用 Client：上传目标与 API base 不同源且大文件耗时长，
+    /// 需要独立于 API 客户端的超时（API 客户端 30s 总超时会掐断大文件）与重定向策略。
+    pub fn build_upload_client(config: &Config) -> Result<Client> {
+        let mut builder = Client::builder()
+            .redirect(reqwest::redirect::Policy::limited(5))
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60 * 60));
+        if let Some(proxy_url) = config
+            .http_proxy
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            builder = builder.proxy(Proxy::all(proxy_url).context("HTTP(S) 代理地址无效")?);
+        }
+        Ok(builder.build()?)
+    }
+
+    /// 把文件直传到网易对象存储（凭证里的 uploadUrl）。
+    /// 上游参考实现（api-enhanced public/cloud.html 直传）为 POST + x-nos-token/Content-MD5 头。
+    pub async fn cloud_transfer_file(
+        client: &Client,
+        ticket: &CloudUploadTicket,
+        path: &Path,
+        md5: &str,
+    ) -> Result<()> {
+        let bytes = std::fs::read(path).map_err(|error| {
+            anyhow!(UiMessage::with_params(
+                "cloudFileReadFailed",
+                vec![path.display().to_string(), error.to_string()]
+            ))
+        })?;
+        let response = client
+            .post(&ticket.upload_url)
+            .header("x-nos-token", ticket.upload_token.clone())
+            .header("Content-MD5", md5)
+            .header("Content-Type", "audio/mpeg")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|error| {
+                anyhow!(UiMessage::with_params(
+                    "cloudUploadFailed",
+                    vec![error.to_string()]
+                ))
+            })?;
+        let status = response.status();
+        let _ = response.text().await;
+        if !status.is_success() {
+            return Err(anyhow!(UiMessage::with_params(
+                "cloudUploadFailed",
+                vec![format!("HTTP {}", status.as_u16())]
+            )));
+        }
+        Ok(())
+    }
+
+    /// 云盘歌曲下载直链（/song/cloud/download）。返回 (url, 文件字节大小)。
+    pub async fn cloud_download_url(&self, id: u64) -> Result<(String, Option<u64>)> {
+        let (json, _) = self
+            .get(
+                "/song/cloud/download",
+                &[("id", id.to_string()), ("timestamp", cache_buster())],
+            )
+            .await?;
+        let url = json
+            .get("url")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                anyhow!(UiMessage::with_params("songUrlFailed", vec![id.to_string()]))
+            })?;
+        let size = json.get("size").and_then(Value::as_u64);
+        Ok((url, size))
     }
 
     /// 用户详情（/user/detail）→ 返回 profile 顶层（level 等在 data 内）。
@@ -1398,6 +1646,24 @@ fn http_error_class(status: StatusCode) -> &'static str {
         StatusCode::TOO_MANY_REQUESTS => "http_429",
         _ if status.is_server_error() => "http_5xx",
         _ => "http",
+    }
+}
+
+/// 登录/验证码/下载地址路由要求 IP 一致性（随机 IP 会让会员权益判定失效，
+/// 服务端对歌曲地址接口返回试听片段），这些路径不追加 randomCNIP。
+fn is_stable_ip_path(path: &str) -> bool {
+    path.starts_with("/login")
+        || path.starts_with("/captcha")
+        || path.starts_with("/song/url")
+        || path.starts_with("/song/download")
+}
+
+/// 读取 JSON 对象字段为字符串；数字字段（如 resourceId）也接受并转为字符串。
+fn json_field_string(value: &Value, key: &str) -> Option<String> {
+    match value.get(key) {
+        Some(Value::String(text)) => Some(text.clone()),
+        Some(Value::Number(number)) => Some(number.to_string()),
+        _ => None,
     }
 }
 

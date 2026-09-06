@@ -181,8 +181,9 @@ export default function SettingsPage() {
         initialValues={defaultConfig}
         onValuesChange={scheduleAutoSave}
       >
-        <Row gutter={[24, 0]}>
-        <Col xs={24} xl={12}>
+        {/* 左栏内容更长：右栏顶对齐不拉伸，空白留在右下角。 */}
+        <Row gutter={[24, 0]} align="top">
+        <Col xs={24} xl={12} style={{ alignSelf: "flex-start" }}>
         <Card title={t("settings.cardData")} style={{ marginBottom: 16 }}>
           <Alert
             type={info?.dataDirPortable ? "success" : "info"}
@@ -262,7 +263,7 @@ export default function SettingsPage() {
           <Alert type="info" showIcon message={t("settings.syncModeHint")} />
         </Card>
         </Col>
-        <Col xs={24} xl={12}>
+        <Col xs={24} xl={12} style={{ alignSelf: "flex-start" }}>
         <Card title={t("settings.cardDownload")} style={{ marginBottom: 16 }}>
           <Form.Item label={t("settings.labelQuality")} name="quality">
             <Radio.Group>

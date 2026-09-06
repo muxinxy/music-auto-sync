@@ -18,6 +18,7 @@
     "menu": {
       "login": "Account Login",
       "playlists": "Playlists",
+      "cloud": "Cloud Disk",
       "sync": "Sync Tasks",
       "quarantine": "Quarantine",
       "settings": "Settings"
@@ -28,7 +29,14 @@
     "phaseReadPlaylist": "Loading playlist",
     "phaseDownload": "Download",
     "phaseQuarantine": "Quarantine",
-    "phaseConvertNcm": "Convert NCM"
+    "phaseConvertNcm": "Convert NCM",
+    "phase_read_playlist": "Loading playlist",
+    "phase_download": "Download",
+    "phase_quarantine": "Quarantine",
+    "phase_convert_ncm": "Convert NCM",
+    "phase_scan_local": "Scanning local files",
+    "phase_upload_cloud": "Uploading to cloud",
+    "phase_download_cloud": "Downloading from cloud"
   },
   "login": {
     "title": "NetEase QR Code Login",
@@ -219,7 +227,8 @@
     "restoreAdd": "{{count}} will be added",
     "restoreRemove": "{{count}} will be removed",
     "restoreNoChange": "No difference from the current state",
-    "preRestoreNote": "The current state is snapshotted as a new history entry (marked “pre_restore”) before restoring, so you can roll back again."
+    "preRestoreNote": "The current state is snapshotted as a new history entry (marked “pre_restore”) before restoring, so you can roll back again.",
+    "matchStart": "Start matching"
   },
   "syncPage": {
     "loadLogsFailed": "Failed to load logs: {{detail}}",
@@ -232,6 +241,8 @@
     "viewDetails": "Failure details ({{count}})",
     "statusSuccess": "Success",
     "statusFailed": "Failed",
+    "statusCanceled": "Canceled",
+    "runEmpty": "No records for this run",
     "statusRunning": "Running",
     "changesTitle": "Change history",
     "noChanges": "No changes yet",
@@ -246,13 +257,16 @@
     "colName": "Song/File",
     "direction": {
       "to_local": "Playlist → Local",
-      "to_playlist": "Local → Playlist"
+      "to_playlist": "Local → Playlist",
+      "to_cloud": "Local → Cloud"
     },
     "action": {
       "addedLocal": "Downloaded to local",
       "quarantinedLocal": "Quarantined local extra",
       "addedPlaylist": "Added to playlist",
       "removedFromPlaylist": "Removed from playlist",
+      "addedCloud": "Uploaded to cloud",
+      "instantImport": "Instant-imported to cloud",
       "failed": "Failed"
     },
     "deletedTitle": "Restorable deletions",
@@ -278,7 +292,9 @@
     "deletedExplain": "Restorable deletions: quarantined local files can be moved back to their original path; NetEase tracks removed from a playlist can be added back.",
     "filterLog": "Search logs",
     "filterDeleted": "Search playlist/song/path",
-    "filterKind": "Filter by type"
+    "filterKind": "Filter by type",
+    "downloadedCloud": "Downloaded from cloud",
+    "skippedExists": "Already exists, skipped"
   },
   "quarantine": {
     "loadFailed": "Failed to load quarantine: {{detail}}",
@@ -297,6 +313,55 @@
     "confirmCancel": "Cancel",
     "meta": "Playlist: {{playlist}} · Quarantined: {{time}}",
     "originalPath": "Original path: {{path}}"
+  },
+  "cloud": {
+    "taskName": "Cloud upload",
+    "title": "Cloud Disk",
+    "needLogin": "Sign in on the Account Login page first to use the cloud disk.",
+    "refresh": "Refresh",
+    "loadFailed": "Failed to load cloud disk: {{detail}}",
+    "searchPlaceholder": "Search song/artist/album/file name",
+    "colSong": "Song",
+    "colArtist": "Artist",
+    "colAlbum": "Album",
+    "colSize": "Size",
+    "colFile": "File name",
+    "colAdded": "Uploaded at",
+    "statsCount": "Cloud songs",
+    "statsSize": "Cloud used",
+    "statsQuota": "Cloud quota",
+    "empty": "Cloud disk is empty",
+    "syncBtn": "Sync to cloud",
+    "syncBtnTip": "Start the sync and jump to the Sync Tasks page for live progress and details",
+    "taskDetail": "Task details",
+    "detailEmpty": "No comparison records yet — rows appear here in real time once a cloud sync starts",
+    "detailColFile": "Local file",
+    "detailColMatched": "Matched as",
+    "detailColSize": "Size",
+    "detailColResult": "Status",
+    "detailColNote": "Note",
+    "resultInCloud": "Already in cloud",
+    "resultDuplicate": "Duplicate, skipped",
+    "resultUnresolved": "Unmatched",
+    "resultToUpload": "To upload",
+    "resultUploading": "Uploading",
+    "resultUploaded": "Uploaded",
+    "resultInstant": "Instant",
+    "resultFailed": "Failed",
+    "detailSummary": "Compared {{total}} · to upload {{upload}} · in cloud {{inCloud}} · duplicate {{duplicate}} · unmatched {{unresolved}} · failed {{failed}}",
+    "filterFile": "Filter by file name/path",
+    "filterStatus": "Filter by status",
+    "uploadFiles": "Upload files",
+    "uploadDir": "Upload folder",
+    "uploadPickTip": "Pick audio files or a folder to upload to the cloud disk (progress on the Sync Tasks page)",
+    "downloadSelected": "Download selected ({{count}})",
+    "pickFiles": "Pick audio files",
+    "pickDir": "Pick a folder",
+    "resultDownloading": "Downloading",
+    "resultDownloaded": "Downloaded",
+    "resultDlSkipped": "Already exists, skipped",
+    "dlPickDir": "Choose download folder",
+    "taskNameDownload": "Cloud download"
   },
   "settings": {
     "loadFailed": "Failed to load settings: {{detail}}",
@@ -454,6 +519,11 @@
     "readPlaylist": "Reading playlist…",
     "track": "{{0}}",
     "sync_ok": "Sync succeeded",
-    "sync_done_failed": "Sync finished ({{0}} failed)"
+    "sync_done_failed": "Sync finished ({{0}} failed)",
+    "cloudTicketInvalid": "Cloud upload ticket is incomplete; please retry or check the API address",
+    "cloudTokenFailed": "Failed to get cloud upload ticket: {{0}} ({{1}})",
+    "cloudUploadFailed": "Failed to upload to cloud disk: {{0}}",
+    "cloudCompleteFailed": "Failed to import into cloud disk: {{0}} ({{1}})",
+    "cloudFileReadFailed": "Failed to read local file: {{0}} ({{1}})"
   }
 }

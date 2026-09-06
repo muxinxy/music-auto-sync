@@ -22,7 +22,9 @@ else console.log("locale key parity OK:", Object.keys(zhFlat).length, "keys");
 
 const files = [
   "src/App.tsx",
+  "src/taskName.ts",
   "src/pages/Playlists.tsx",
+  "src/pages/Cloud.tsx",
   "src/pages/Sync.tsx",
   "src/pages/Login.tsx",
   "src/pages/Quarantine.tsx",

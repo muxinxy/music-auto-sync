@@ -10,6 +10,7 @@ use crate::{
         QrSession,
     },
     core::{
+        cloud::{self, CloudListResult, CloudUploadPlan},
         naming,
         sync::{self, SyncReport},
     },
@@ -50,11 +51,13 @@ fn cached_api(state: &State<'_, AppState>, config: &Config) -> Result<NeteaseApi
 }
 
 fn anyhow_to_ui(error: anyhow::Error) -> String {
-    if let Some(api_error) = error.downcast_ref::<crate::api::ApiCallError>() {
-        api_error.ui().to_json()
-    } else {
-        UiMessage::unknown(error).to_json()
+    if let Some(message) = error.downcast_ref::<UiMessage>() {
+        return message.to_json();
     }
+    if let Some(api_error) = error.downcast_ref::<crate::api::ApiCallError>() {
+        return api_error.ui().to_json();
+    }
+    UiMessage::unknown(error).to_json()
 }
 
 #[tauri::command]
@@ -161,7 +164,7 @@ pub async fn check_login_qr(
     log_login(&paths.logs_dir, qr_diagnostic);
 
     if result.state == "success" {
-        let cookie = cookie.ok_or_else(|| UiMessage::new("cookie_missing").to_json())?;
+        let cookie = cookie.ok_or_else(|| UiMessage::new("cookieMissing").to_json())?;
         let mut config = config;
         config.cookie = Some(cookie);
         config.cookie_user = None;
@@ -369,9 +372,9 @@ fn fill_last_sync(state: &State<'_, AppState>, playlists: &mut [PlaylistInfo]) {
         if let Some((finished_at, failed)) = latest.get(&playlist.id) {
             playlist.last_sync = Some(finished_at.clone());
             playlist.last_result = if *failed == 0 {
-                Some(UiMessage::new("sync_ok").to_json())
+                Some(UiMessage::new("syncOk").to_json())
             } else {
-                Some(UiMessage::with_params("sync_done_failed", vec![failed.to_string()]).to_json())
+                Some(UiMessage::with_params("syncDoneFailed", vec![failed.to_string()]).to_json())
             };
         }
     }
@@ -652,6 +655,152 @@ pub async fn sync_all(
     })
 }
 
+/// 云盘歌曲列表（只读，全量分页拉取；共享 120s 缓存，force=true 穿透）。
+#[tauri::command]
+pub async fn list_cloud_songs(state: State<'_, AppState>, force: bool) -> Result<CloudListResult, String> {
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let api = cached_api(&state, &config)?;
+    cloud::fetch_cloud_list(&api, force).await.map_err(anyhow_to_ui)
+}
+
+/// 云盘上传预览（只读）：扫描音乐根目录并与云盘比对，产出待上传清单。
+#[tauri::command]
+pub async fn preview_cloud_upload(state: State<'_, AppState>) -> Result<CloudUploadPlan, String> {
+    if state.sync_running.load(Ordering::SeqCst) || state.cloud_running.load(Ordering::SeqCst) {
+        return Err(UiMessage::new("syncBusy").to_json());
+    }
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let root = config
+        .music_root
+        .as_deref()
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| UiMessage::new("musicRootRequired").to_json())?;
+    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    cloud::build_upload_plan(None, None, &api, &root)
+        .await
+        .map_err(anyhow_to_ui)
+}
+
+/// 把本地音乐根目录中云盘没有的歌上传到云盘（复用暂停/取消/进度机制）。
+#[tauri::command]
+pub async fn sync_cloud_upload(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<SyncReport, String> {
+    let paths = state.paths.get();
+    let _ = store::app_log::log(&paths.logs_dir, "info", "cloud", "开始云盘上传");
+    cloud::sync_cloud(&app, &state, cloud::CloudSource::AutoScan)
+        .await
+        .map(|report| {
+            let _ = store::app_log::log(
+                &paths.logs_dir,
+                "info",
+                "cloud",
+                format!(
+                    "云盘上传完成：上传 {} 秒传 {} 失败 {}",
+                    report.added, report.skipped, report.failed
+                ),
+            );
+            report
+        })
+        .map_err(|message| {
+            let _ = store::app_log::log(
+                &paths.logs_dir,
+                "error",
+                "cloud",
+                format!("云盘上传失败：{message:?}"),
+            );
+            message.to_json()
+        })
+}
+
+/// 手动上传用户选择的文件/目录到云盘（目录递归扫描音频；与歌单同步可并行）。
+#[tauri::command]
+pub async fn sync_cloud_manual(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+) -> Result<SyncReport, String> {
+    let selected = paths.clone();
+    let paths = state.paths.get();
+    let _ = store::app_log::log(
+        &paths.logs_dir,
+        "info",
+        "cloud",
+        format!("开始手动上传云盘（{} 项）", selected.len()),
+    );
+    cloud::sync_cloud(&app, &state, cloud::CloudSource::ManualPaths(selected))
+        .await
+        .map(|report| {
+            let _ = store::app_log::log(
+                &paths.logs_dir,
+                "info",
+                "cloud",
+                format!(
+                    "手动上传完成：上传 {} 秒传 {} 失败 {}",
+                    report.added, report.skipped, report.failed
+                ),
+            );
+            report
+        })
+        .map_err(|message| {
+            let _ = store::app_log::log(
+                &paths.logs_dir,
+                "error",
+                "cloud",
+                format!("手动上传失败：{message:?}"),
+            );
+            message.to_json()
+        })
+}
+
+/// 多选下载云盘歌曲到指定目录（后台任务：与云盘上传同机制——写同步日志、
+/// 可暂停/取消、进度走 cloud:// 事件；与歌单同步可并行）。
+#[tauri::command]
+pub async fn download_cloud_songs(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    items: Vec<cloud::CloudDownloadItem>,
+    target_dir: String,
+) -> Result<SyncReport, String> {
+    let count = items.len();
+    let paths = state.paths.get();
+    let _ = store::app_log::log(
+        &paths.logs_dir,
+        "info",
+        "cloud",
+        format!("开始下载云盘歌曲（{count} 首）"),
+    );
+    cloud::download_cloud_items(
+        &app,
+        &state,
+        items,
+        std::path::PathBuf::from(target_dir),
+    )
+    .await
+    .map(|report| {
+        let _ = store::app_log::log(
+            &paths.logs_dir,
+            "info",
+            "cloud",
+            format!(
+                "云盘歌曲下载完成：下载 {} 跳过 {} 失败 {}",
+                report.added, report.skipped, report.failed
+            ),
+        );
+        report
+    })
+    .map_err(|message| {
+        let _ = store::app_log::log(
+            &paths.logs_dir,
+            "error",
+            "cloud",
+            format!("云盘歌曲下载失败：{message:?}"),
+        );
+        message.to_json()
+    })
+}
+
 #[tauri::command]
 pub fn cancel_sync(state: State<'_, AppState>) -> bool {
     if state.sync_running.load(Ordering::SeqCst) {
@@ -694,6 +843,58 @@ pub fn get_sync_control(state: State<'_, AppState>) -> serde_json::Value {
     })
 }
 
+// ---------- 云盘任务控制（独立于歌单同步，可并行） ----------
+
+#[tauri::command]
+pub fn cancel_cloud_sync(state: State<'_, AppState>) -> bool {
+    if state.cloud_running.load(Ordering::SeqCst) {
+        state.cloud_cancel_requested.store(true, Ordering::SeqCst);
+        state.cloud_pause_requested.store(false, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+#[tauri::command]
+pub fn pause_cloud_sync(state: State<'_, AppState>) -> bool {
+    if state.cloud_running.load(Ordering::SeqCst) {
+        state.cloud_pause_requested.store(true, Ordering::SeqCst);
+        true
+    } else {
+        false
+    }
+}
+
+#[tauri::command]
+pub fn resume_cloud_sync(state: State<'_, AppState>) -> bool {
+    if state.cloud_running.load(Ordering::SeqCst)
+        && state
+            .cloud_pause_requested
+            .swap(false, Ordering::SeqCst)
+    {
+        true
+    } else {
+        false
+    }
+}
+
+/// 查询云盘任务控制状态：running / paused。
+#[tauri::command]
+pub fn get_cloud_control(state: State<'_, AppState>) -> serde_json::Value {
+    serde_json::json!({
+        "running": state.cloud_running.load(Ordering::SeqCst),
+        "paused": state.cloud_pause_requested.load(Ordering::SeqCst),
+    })
+}
+
+/// 按同步轮次查变更流水（任务详情用，含可恢复 id）。
+#[tauri::command]
+pub fn get_run_changes(state: State<'_, AppState>, run_id: i64) -> Result<Vec<database::RunChangeEntry>, String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    database::get_run_changes(&conn, run_id).map_err(command_error)
+}
+
 #[tauri::command]
 pub fn get_sync_logs(
     state: State<'_, AppState>,
@@ -724,10 +925,10 @@ pub fn restore_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), Str
     let original = Path::new(&item.0);
     let quarantined = Path::new(&item.1);
     if !quarantined.is_file() {
-        return Err(UiMessage::new("quarantine_missing").to_json());
+        return Err(UiMessage::new("quarantineMissing").to_json());
     }
     if original.exists() {
-        return Err(UiMessage::new("quarantine_conflict").to_json());
+        return Err(UiMessage::new("quarantineConflict").to_json());
     }
     if let Some(parent) = original.parent() {
         fs::create_dir_all(parent).map_err(command_error)?;
@@ -749,7 +950,7 @@ pub fn delete_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), Stri
         )
         .optional()
         .map_err(command_error)?;
-    let path = path.ok_or_else(|| UiMessage::new("quarantine_record_missing").to_json())?;
+    let path = path.ok_or_else(|| UiMessage::new("quarantineRecordMissing").to_json())?;
     if Path::new(&path).is_file() {
         fs::remove_file(&path).map_err(command_error)?;
     }
@@ -765,7 +966,7 @@ pub fn open_login_log_directory(state: State<'_, AppState>) -> Result<(), String
     std::process::Command::new("explorer")
         .arg(&paths.logs_dir)
         .spawn()
-        .map_err(|_| UiMessage::new("log_open_failed").to_json())?;
+        .map_err(|_| UiMessage::new("logOpenFailed").to_json())?;
     Ok(())
 }
 
@@ -938,7 +1139,7 @@ pub async fn send_login_captcha(state: State<'_, AppState>, phone: String) -> Re
     let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
     let phone = phone.trim().to_owned();
     if phone.is_empty() {
-        return Err(UiMessage::new("phone_required").to_json());
+        return Err(UiMessage::new("phoneRequired").to_json());
     }
     NeteaseApi::from_config(&config)
         .map_err(command_error)?
@@ -959,7 +1160,7 @@ pub async fn login_with_captcha(
     let phone = phone.trim().to_owned();
     let captcha = captcha.trim().to_owned();
     if phone.is_empty() || captcha.is_empty() {
-        return Err(UiMessage::new("phone_or_code_required").to_json());
+        return Err(UiMessage::new("phoneOrCodeRequired").to_json());
     }
     let (cookie, status) = NeteaseApi::from_config(&config)
         .map_err(command_error)?
@@ -983,7 +1184,7 @@ pub async fn login_with_captcha(
 #[tauri::command]
 pub async fn manual_prune(state: State<'_, AppState>, id: u64) -> Result<usize, String> {
     if state.sync_running.load(Ordering::SeqCst) {
-        return Err(UiMessage::new("sync_busy").to_json());
+        return Err(UiMessage::new("syncBusy").to_json());
     }
     sync::prune_playlist_removed(&state, id)
         .await
@@ -1230,7 +1431,7 @@ pub async fn preflight_playlist(
 pub fn show_in_folder(state: State<'_, AppState>, path: String) -> Result<(), String> {
     let p = Path::new(&path);
     if !p.exists() {
-        return Err(UiMessage::with_params("path_missing", vec![path]).to_json());
+        return Err(UiMessage::with_params("pathMissing", vec![path]).to_json());
     }
     let _ = state;
     #[cfg(windows)]
@@ -1245,13 +1446,13 @@ pub fn show_in_folder(state: State<'_, AppState>, path: String) -> Result<(), St
             cmd.arg(&path);
         }
         cmd.spawn()
-            .map_err(|_| UiMessage::new("explorer_failed").to_json())?;
+            .map_err(|_| UiMessage::new("explorerFailed").to_json())?;
         return Ok(());
     }
     #[cfg(not(windows))]
     {
         let _ = path;
-        return Err(UiMessage::new("unsupported_platform").to_json());
+        return Err(UiMessage::new("unsupportedPlatform").to_json());
     }
 }
 
@@ -1271,12 +1472,12 @@ pub async fn check_for_update(state: State<'_, AppState>) -> Result<Option<Strin
         .send()
         .await
         .map_err(|error| {
-            UiMessage::with_params("update_check_failed", vec![error.to_string()]).to_json()
+            UiMessage::with_params("updateCheckFailed", vec![error.to_string()]).to_json()
         })?;
     let json: serde_json::Value = response
         .json()
         .await
-        .map_err(|_| UiMessage::new("update_check_failed").to_json())?;
+        .map_err(|_| UiMessage::new("updateCheckFailed").to_json())?;
     let latest = json.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
     // 只返回纯版本号（剥掉 tag 的 v 前缀）；前端展示/拼 URL 时自己加 v，避免重复。
     let latest_clean = latest.trim_start_matches('v');
@@ -1398,7 +1599,7 @@ pub async fn restore_deleted_item(
     id: i64,
 ) -> Result<String, String> {
     if state.sync_running.load(Ordering::SeqCst) {
-        return Err(UiMessage::new("sync_busy").to_json());
+        return Err(UiMessage::new("syncBusy").to_json());
     }
     let _ = app.emit("sync://state", true);
     let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
@@ -1406,7 +1607,7 @@ pub async fn restore_deleted_item(
         .query_row("SELECT kind FROM deleted_log WHERE id=?1", [id], |r| r.get(0))
         .optional()
         .map_err(command_error)?;
-    let kind = kind.ok_or_else(|| UiMessage::new("deleted_record_missing").to_json())?;
+    let kind = kind.ok_or_else(|| UiMessage::new("deletedRecordMissing").to_json())?;
     let result = if kind == "local_file" {
         sync::restore_deleted_local_item(&state, id)
             .await
@@ -1431,7 +1632,7 @@ pub async fn restore_playlist_snapshot_cmd(
     history_id: i64,
 ) -> Result<usize, String> {
     if state.sync_running.load(Ordering::SeqCst) {
-        return Err(UiMessage::new("sync_busy").to_json());
+        return Err(UiMessage::new("syncBusy").to_json());
     }
     let _ = app.emit("sync://state", true);
     let result = sync::restore_playlist_snapshot(&state, playlist_id, history_id)
@@ -1625,7 +1826,7 @@ pub async fn convert_ncm_manual(
     files.sort();
     files.dedup();
     if files.is_empty() {
-        return Err(UiMessage::new("ncm_no_files").to_json());
+        return Err(UiMessage::new("ncmNoFiles").to_json());
     }
     let report = tauri::async_runtime::spawn_blocking(move || {
         let mut report = NcmConvertReport::default();
@@ -1641,6 +1842,6 @@ pub async fn convert_ncm_manual(
         report
     })
     .await
-    .map_err(|error| UiMessage::with_params("ncm_convert_failed", vec![error.to_string()]).to_json())?;
+    .map_err(|error| UiMessage::with_params("ncmConvertFailed", vec![error.to_string()]).to_json())?;
     Ok(report)
 }

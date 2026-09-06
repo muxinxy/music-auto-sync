@@ -4,6 +4,33 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.0] - 2026-09-06
+
+### Added
+
+- **Cloud disk**: a new "Cloud Disk" page in the sidebar listing your NetEase cloud-disk songs (count/used-space stats, search filter, refresh) with a 120-second cache.
+- **Sync to cloud disk**: scans the local music root and uploads songs missing from the cloud disk. Uses client-side direct upload (token → object storage → complete), unaffected by API-proxy request-body limits, so FLAC and other large files work; files already on NetEase servers are instant-imported; jumps to Settings when the music root is not configured.
+- **Manual upload**: pick audio files (multi-select) or an entire folder on the Cloud Disk page to upload; folders are scanned recursively for audio.
+- **Multi-select download**: select cloud songs (selection preserved across pages) and download them to a folder of your choice (defaults to the music root; existing files are skipped).
+- **Parallel tasks**: cloud tasks (upload/download) and playlist sync run independently and simultaneously, each with its own progress and pause/resume/cancel; the sidebar status reflects any running task.
+- **Task details**: every sync-log entry can be opened to inspect that run — cloud tasks show per-song comparison (already in cloud / duplicate / unmatched) plus upload/download results; playlist tasks show downloads, quarantines, playlist push-backs and removals. Failed rows show the exact reason, deleted rows can be restored directly. Supports filtering by file name and status/action, tri-state column sorting (asc → desc → default), and live refresh while a task is running.
+- The avatar/nickname in the header is clickable and returns to the account login page.
+
+### Changed
+
+- One sync task now keeps exactly **one** sync-log entry: "running" at start, updated in place to success/failure/canceled at the end, with the failure/cancel reason written into the log body; the log list refreshes promptly when tasks start and finish.
+- The former "change records" and "restorable deletions" lists are merged into sync-log task details.
+- Sync logs support date-time range filtering; search matches translated task names (searching "cloud" finds cloud tasks).
+- Match preview no longer starts automatically: pick a playlist or press "Start matching" to run it.
+- Settings page columns are top-aligned with the whitespace in the bottom-right corner.
+- Error messages are now fully localized: backend error codes match translation keys, and HTTP/network errors no longer show raw English codes.
+
+### Fixed
+
+- A canceled playlist sync no longer leaves a stale "running" sync-log entry.
+- Playlists not registered in sync settings no longer show `#<playlist id>` as the task name.
+- The cloud-disk list cache previously never took effect (all pages were re-fetched on every visit).
+
 ## [0.7.2] - 2026-09-06
 
 ### Fixed

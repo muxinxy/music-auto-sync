@@ -31,6 +31,9 @@ pub struct SyncProgress {
     pub current: usize,
     pub total: usize,
     pub message: UiMessage,
+    /// 本次任务的 sync_logs 行 id（= 变更流水 run id），供前端“任务详情”直查。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<i64>,
 }
 
 /// 单曲失败明细：包含曲目标识，便于前端展示“哪些歌失败、为什么、能否重试”。
@@ -65,7 +68,7 @@ pub async fn sync_one(
     playlist_id: u64,
 ) -> Result<SyncReport, UiMessage> {
     if state.sync_running.swap(true, Ordering::SeqCst) {
-        return Err(UiMessage::new("sync_busy"));
+        return Err(UiMessage::new("syncBusy"));
     }
     let _ = app.emit("sync://state", true);
     let result = sync_one_inner(Some(app), state, playlist_id).await;
@@ -91,7 +94,7 @@ pub async fn sync_enabled_with_source(
     source: &str,
 ) -> Result<Vec<SyncReport>, UiMessage> {
     if state.sync_running.swap(true, Ordering::SeqCst) {
-        return Err(UiMessage::new("sync_busy"));
+        return Err(UiMessage::new("syncBusy"));
     }
     let _ = app.emit("sync://state", true);
     let config = store::config::load(&state.paths.get().config_file).map_err(UiMessage::unknown)?;
@@ -125,7 +128,7 @@ pub async fn sync_enabled_with_source(
     Ok(reports)
 }
 
-fn ui_from_error(error: anyhow::Error) -> UiMessage {
+pub(crate) fn ui_from_error(error: anyhow::Error) -> UiMessage {
     error
         .downcast_ref::<UiMessage>()
         .cloned()
@@ -136,14 +139,14 @@ fn ui_from_error(error: anyhow::Error) -> UiMessage {
 pub async fn wait_if_paused(state: &AppState) -> Result<(), UiMessage> {
     while state.pause_requested.load(Ordering::SeqCst) {
         if state.cancel_requested.load(Ordering::SeqCst) {
-            return Err(UiMessage::new("sync_canceled"));
+            return Err(UiMessage::new("syncCanceled"));
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
     Ok(())
 }
 
-fn is_canceled(state: &AppState) -> bool {
+pub(crate) fn is_canceled(state: &AppState) -> bool {
     state.cancel_requested.load(Ordering::SeqCst)
 }
 
@@ -177,19 +180,34 @@ async fn sync_one_inner_with_source(
         .music_root
         .as_deref()
         .map(PathBuf::from)
-        .ok_or_else(|| anyhow!(UiMessage::new("music_root_required")))?;
+        .ok_or_else(|| anyhow!(UiMessage::new("musicRootRequired")))?;
     let api = NeteaseApi::from_config(&config)?;
+    let setting = config.playlists.iter().find(|p| p.id == playlist_id);
+    // 日志先行（拉取歌单曲目之前）：任务一开始同步日志就出现"进行中"行，
+    // 前端收到 sync://state 后立刻刷新即可看到；失败/结束时原地更新这一行。
+    let log_name = setting
+        .map(|s| s.name.clone())
+        .unwrap_or_else(|| format!("#{playlist_id}"));
+    let mut conn = database::open(&paths.database_file)?;
+    let sync_run_id = database::log(
+        &conn,
+        &log_name,
+        "running",
+        &UiMessage::new("syncStart").to_json(),
+    )?;
     emit_progress(
         app,
         playlist_id,
-        "",
+        &log_name,
         "phase_read_playlist",
         0,
         0,
-        UiMessage::new("read_playlist"),
+        UiMessage::new("readPlaylist"),
+        Some(sync_run_id),
     );
     let playlist = api.playlist_tracks(playlist_id).await?;
-    let setting = config.playlists.iter().find(|p| p.id == playlist_id);
+    // 日志行当时用 #<id> 占位（歌单名未知），拉到曲目后回填真实名称。
+    database::update_log_name(&conn, sync_run_id, &playlist.name)?;
     let quality = setting
         .and_then(|x| x.quality_override.as_deref())
         .unwrap_or(&config.quality);
@@ -212,109 +230,127 @@ async fn sync_one_inner_with_source(
         started_at: now,
         finished_at: String::new(),
     };
-    let mut conn = database::open(&paths.database_file)?;
-    let sync_run_id = database::log(
-        &conn,
-        &playlist.name,
-        "running",
-        &UiMessage::new("sync_start").to_json(),
-    )?;
 
-    // 同步模式：歌单覆盖 → 全局默认。模式只作用于“歌单 → 本地”下载/隔离侧。
-    let mode = setting
-        .and_then(|x| x.mode_override.as_deref())
-        .unwrap_or(&config.sync_mode);
-    // 补录开关：歌单覆盖（Option<bool>）→ 全局默认。仅当“我创建”的歌单才可能补录。
-    let upload_manual = setting
-        .and_then(|x| x.upload_manual)
-        .unwrap_or(config.upload_manual);
-    let is_owned = match config.cookie_user.as_ref() {
-        Some(user) => api
-            .playlist_owned_by_me(playlist_id, user.user_id)
-            .await
-            .unwrap_or(false),
-        None => false,
-    };
+    // 主流程：任何一步失败（含取消）都不提前返回——统一收尾写日志/记录，
+    // 避免“进行中”的日志永久残留；错误原因写入日志正文。
+    let outcome: Result<()> = async {
+        // 同步模式：歌单覆盖 → 全局默认。模式只作用于“歌单 → 本地”下载/隔离侧。
+        let mode = setting
+            .and_then(|x| x.mode_override.as_deref())
+            .unwrap_or(&config.sync_mode);
+        // 补录开关：歌单覆盖（Option<bool>）→ 全局默认。仅当“我创建”的歌单才可能补录。
+        let upload_manual = setting
+            .and_then(|x| x.upload_manual)
+            .unwrap_or(config.upload_manual);
+        let is_owned = match config.cookie_user.as_ref() {
+            Some(user) => api
+                .playlist_owned_by_me(playlist_id, user.user_id)
+                .await
+                .unwrap_or(false),
+            None => false,
+        };
 
-    convert_ncm_files(app, state, &config, &playlist, &mut report).await?;
+        convert_ncm_files(app, state, &config, &playlist, &mut report, sync_run_id).await?;
 
-    // 歌单 → 本地：按模式下载缺失 / 隔离本地多余。
-    if mode != "delete_only" {
-        sync_tracks(
-            app,
-            state,
-            &api,
-            &config,
-            &playlist,
-            &paths.database_file,
-            &root,
-            folder_template,
-            quality,
-            artist_separator,
-            &paths.logs_dir,
-            sync_run_id,
-            &mut report,
-        )
-        .await?;
+        // 歌单 → 本地：按模式下载缺失 / 隔离本地多余。
+        if mode != "delete_only" {
+            sync_tracks(
+                app,
+                state,
+                &api,
+                &config,
+                &playlist,
+                &paths.database_file,
+                &root,
+                folder_template,
+                quality,
+                artist_separator,
+                &paths.logs_dir,
+                sync_run_id,
+                &mut report,
+            )
+            .await?;
+        }
+        if mode != "add_only" {
+            quarantine_removed(
+                app,
+                &playlist,
+                &root,
+                folder_template,
+                artist_separator,
+                &mut conn,
+                &mut report,
+                Some(sync_run_id),
+            )?;
+        }
+
+        // 可选补录：把手动放入歌单文件夹的本地音频加进网易歌单（仅新增；需我创建的歌单）。
+        if upload_manual && is_owned {
+            sync_from_local_to_playlist(
+                app,
+                &api,
+                &playlist,
+                &root,
+                folder_template,
+                artist_separator,
+                &mut conn,
+                &mut report,
+                sync_run_id,
+                source,
+            )
+            .await?;
+        }
+
+        if config.write_m3u8 {
+            write_m3u8(&playlist, &root, folder_template, artist_separator, &conn)?;
+        }
+
+        // 记录本次歌单全量快照（供历史回滚）。
+        record_history_snapshot(&conn, &playlist, source)?;
+        Ok(())
     }
-    if mode != "add_only" {
-        quarantine_removed(
-            app,
-            &playlist,
-            &root,
-            folder_template,
-            artist_separator,
-            &mut conn,
-            &mut report,
-        )?;
-    }
-
-    // 可选补录：把手动放入歌单文件夹的本地音频加进网易歌单（仅新增；需我创建的歌单）。
-    if upload_manual && is_owned {
-        sync_from_local_to_playlist(
-            app,
-            &api,
-            &playlist,
-            &root,
-            folder_template,
-            artist_separator,
-            &mut conn,
-            &mut report,
-            sync_run_id,
-            source,
-        )
-        .await?;
-    }
-
-    if config.write_m3u8 {
-        write_m3u8(&playlist, &root, folder_template, artist_separator, &conn)?;
-    }
-
-    // 记录本次歌单全量快照（供历史回滚）。
-    record_history_snapshot(&conn, &playlist, source)?;
+    .await;
 
     // 同步改变了歌单（可能新增/隔离/回写）→ 使该歌单的曲目与元数据缓存失效，
     // 让 UI 下一次读取拿到最新状态。
     state.api_cache.invalidate_namespace("playlist_tracks");
 
-    report.finished_at = database::now();
-    let status = if report.failed == 0 { "ok" } else { "error" };
-    database::log(
-        &conn,
-        &playlist.name,
-        status,
-        &UiMessage::with_params(
-            "sync_done",
-            vec![
-                report.added.to_string(),
-                report.quarantined.to_string(),
-                report.failed.to_string(),
-            ],
-        )
-        .to_json(),
-    )?;
-    database::record_sync_run(&conn, &report)?;
-    Ok(report)
+    match outcome {
+        Ok(()) => {
+            report.finished_at = database::now();
+            let status = if report.failed == 0 { "ok" } else { "error" };
+            database::finish_log(
+                &conn,
+                sync_run_id,
+                status,
+                &UiMessage::with_params(
+                    "syncDone",
+                    vec![
+                        report.added.to_string(),
+                        report.quarantined.to_string(),
+                        report.failed.to_string(),
+                    ],
+                )
+                .to_json(),
+            )?;
+            database::record_sync_run(&conn, &report)?;
+            Ok(report)
+        }
+        Err(error) => {
+            let message = ui_from_error(error);
+            let status = if message.code == "syncCanceled" {
+                "canceled"
+            } else {
+                "error"
+            };
+            // 失败/取消也原地收尾那条 "running" 日志（正文=原因），取消不再残留“进行中”。
+            report.finished_at = database::now();
+            report.errors.push(message.clone());
+            database::finish_log(&conn, sync_run_id, status, &message.to_json())?;
+            database::record_sync_run(&conn, &report)?;
+            Err(anyhow!(message))
+        }
+    }
 }
 
 
@@ -396,7 +432,7 @@ async fn sync_tracks(
         wait_if_paused(state).await.map_err(anyhow::Error::new)?;
         if is_canceled(state) {
             running.abort_all();
-            return Err(anyhow!(UiMessage::new("sync_canceled")));
+            return Err(anyhow!(UiMessage::new("syncCanceled")));
         }
         // 补满在途 worker（不超过并发上限）。
         while next_index < total && running.len() < concurrency {
@@ -477,7 +513,7 @@ enum TrackOutcome {
 fn is_transient_download_error(error: &anyhow::Error) -> bool {
     // 网络/超时/服务端瞬态错误值得重试；“文件过小”往往意味着版权/试听限制，不重试。
     match error.downcast_ref::<UiMessage>() {
-        Some(message) => message.code != "download_small_file",
+        Some(message) => message.code != "downloadSmallFile",
         None => true,
     }
 }
@@ -496,9 +532,9 @@ async fn fetch_download_url_for_track(
     }
     match fetch_download_url_with_retry(api, track_id, quality).await {
         Ok(Some(download)) => Ok(download),
-        Ok(None) => Err(UiMessage::with_params("no_url", vec![track_id.to_string()])),
+        Ok(None) => Err(UiMessage::with_params("noUrl", vec![track_id.to_string()])),
         Err(error) => Err(UiMessage::with_params(
-            "song_url_failed",
+            "songUrlFailed",
             vec![error.to_string()],
         )),
     }
@@ -517,7 +553,7 @@ async fn download_track_with_retry(url: &str, target: &Path, attempts: usize) ->
             Err(error) => return Err(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!(UiMessage::new("download_failed"))))
+    Err(last_error.unwrap_or_else(|| anyhow!(UiMessage::new("downloadFailed"))))
 }
 
 async fn fetch_download_url_with_retry(
@@ -536,7 +572,7 @@ async fn fetch_download_url_with_retry(
             Err(error) => return Err(error),
         }
     }
-    Err(last_error.unwrap_or_else(|| anyhow!(UiMessage::new("song_url_failed"))))
+    Err(last_error.unwrap_or_else(|| anyhow!(UiMessage::new("songUrlFailed"))))
 }
 
 fn record_track_file(
@@ -784,7 +820,7 @@ async fn sync_one_track_worker(
     let mut conn = match database::open(db_file) {
         Ok(conn) => conn,
         Err(error) => {
-            let message = UiMessage::with_params("download_failed", vec![error.to_string()]);
+            let message = UiMessage::with_params("downloadFailed", vec![error.to_string()]);
             log_entry.outcome("failed", &message);
             let _ = store::track_log::append(logs_dir, &log_entry);
             return TrackOutcome::Failed(message, None);
@@ -799,7 +835,7 @@ async fn sync_one_track_worker(
             let reason = availability
                 .reason
                 .clone()
-                .unwrap_or_else(|| "no_right".into());
+                .unwrap_or_else(|| "noRight".into());
             let message = UiMessage::with_params(reason, vec![track.name.clone()]);
             log_entry.outcome("failed", &message);
             let _ = store::track_log::append(logs_dir, &log_entry);
@@ -828,7 +864,7 @@ async fn sync_one_track_worker(
             .is_some_and(|path| Path::new(path).is_file())
         {
             let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
-            log_entry.outcome("skipped", &UiMessage::new("track_exists"));
+            log_entry.outcome("skipped", &UiMessage::new("trackExists"));
             let _ = store::track_log::append(logs_dir, &log_entry);
             return TrackOutcome::Skipped;
         }
@@ -868,7 +904,7 @@ async fn sync_one_track_worker(
         let _ = record_track_file(&mut conn, playlist, track, &target, &extension);
         let _ = write_sidecar(&target, playlist.id, track.id);
         let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
-        log_entry.outcome("skipped", &UiMessage::new("track_exists"));
+        log_entry.outcome("skipped", &UiMessage::new("trackExists"));
         let _ = store::track_log::append(logs_dir, &log_entry);
         return TrackOutcome::Skipped;
     }
@@ -900,7 +936,7 @@ async fn sync_one_track_worker(
                         let _ = record_track_file(&mut conn, playlist, track, &source_target, &source_ext);
                         let _ = write_sidecar(&source_target, playlist.id, track.id);
                         let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
-                        log_entry.outcome("skipped", &UiMessage::new("track_exists"));
+                        log_entry.outcome("skipped", &UiMessage::new("trackExists"));
                         let _ = store::track_log::append(logs_dir, &log_entry);
                         return TrackOutcome::Skipped;
                     }
@@ -917,6 +953,7 @@ async fn sync_one_track_worker(
         position,
         total,
         UiMessage::with_params("track", vec![track.name.clone()]),
+        Some(sync_run_id),
     );
 
     match download_track_with_retry(&download_url, &target, config.retry).await {
@@ -958,7 +995,7 @@ async fn sync_one_track_worker(
             TrackOutcome::Downloaded
         }
         Err(error) => {
-            let message = UiMessage::with_params("download_failed", vec![error.to_string()]);
+            let message = UiMessage::with_params("downloadFailed", vec![error.to_string()]);
             log_entry.outcome("failed", &message);
             let _ = store::track_log::append(logs_dir, &log_entry);
             TrackOutcome::Failed(
@@ -991,7 +1028,7 @@ pub async fn download_song_with_options(
     options: SingleDownloadOptions,
 ) -> Result<String, UiMessage> {
     if state.sync_running.load(Ordering::SeqCst) {
-        return Err(UiMessage::new("sync_busy"));
+        return Err(UiMessage::new("syncBusy"));
     }
     let paths = state.paths.get();
     let config = store::config::load(&paths.config_file).map_err(UiMessage::unknown)?;
@@ -1001,14 +1038,14 @@ pub async fn download_song_with_options(
     let api = NeteaseApi::from_config_with_cache(&config, state.api_cache.clone())
         .map_err(UiMessage::unknown)?;
     let playlist = api.playlist_tracks(playlist_id).await.map_err(|error| {
-        UiMessage::with_params("playlist_fetch_failed", vec![error.to_string()])
+        UiMessage::with_params("playlistFetchFailed", vec![error.to_string()])
     })?;
     let (index, track) = playlist
         .tracks
         .iter()
         .enumerate()
         .find(|(_, track)| track.id == track_id)
-        .ok_or_else(|| UiMessage::new("track_missing"))?;
+        .ok_or_else(|| UiMessage::new("trackMissing"))?;
     let setting = config
         .playlists
         .iter()
@@ -1039,6 +1076,7 @@ pub async fn download_song_with_options(
                 current: index + 1,
                 total: playlist.tracks.len(),
                 message: UiMessage::with_params("track", vec![track.name.clone()]),
+                run_id: None,
             },
         );
     }
@@ -1046,10 +1084,10 @@ pub async fn download_song_with_options(
     let (download_url, extension) =
         match fetch_download_url_with_retry(&api, track.id, quality).await {
             Ok(Some(download)) => download,
-            Ok(None) => return Err(UiMessage::with_params("no_url", vec![track.name.clone()])),
+            Ok(None) => return Err(UiMessage::with_params("noUrl", vec![track.name.clone()])),
             Err(error) => {
                 return Err(UiMessage::with_params(
-                    "song_url_failed",
+                    "songUrlFailed",
                     vec![error.to_string()],
                 ))
             }
@@ -1073,7 +1111,7 @@ pub async fn download_song_with_options(
                 config
                     .music_root
                     .as_deref()
-                    .ok_or_else(|| UiMessage::new("music_root_required"))?,
+                    .ok_or_else(|| UiMessage::new("musicRootRequired"))?,
             );
             naming::track_path(
                 &root,
@@ -1089,7 +1127,7 @@ pub async fn download_song_with_options(
     };
     if target.exists() && !options.overwrite {
         return Err(UiMessage::with_params(
-            "file_exists",
+            "fileExists",
             vec![target.to_string_lossy().into_owned()],
         ));
     }
@@ -1105,7 +1143,7 @@ pub async fn download_song_with_options(
             let _ = store::track_log::append(&paths.logs_dir, &log_entry);
         }
         Err(error) => {
-            let message = UiMessage::with_params("download_failed", vec![error.to_string()]);
+            let message = UiMessage::with_params("downloadFailed", vec![error.to_string()]);
             log_entry.outcome("failed", &message);
             let _ = store::track_log::append(&paths.logs_dir, &log_entry);
             return Err(message);
@@ -1151,10 +1189,10 @@ pub async fn prune_playlist_removed(
         .music_root
         .as_deref()
         .map(PathBuf::from)
-        .ok_or_else(|| UiMessage::new("music_root_required"))?;
+        .ok_or_else(|| UiMessage::new("musicRootRequired"))?;
     let api = NeteaseApi::from_config(&config).map_err(UiMessage::unknown)?;
     let playlist = api.playlist_tracks(playlist_id).await.map_err(|error| {
-        UiMessage::with_params("playlist_fetch_failed", vec![error.to_string()])
+        UiMessage::with_params("playlistFetchFailed", vec![error.to_string()])
     })?;
     let setting = config.playlists.iter().find(|p| p.id == playlist_id);
     let folder_template = setting
@@ -1184,6 +1222,7 @@ pub async fn prune_playlist_removed(
         artist_separator,
         &mut conn,
         &mut report,
+        None,
     )
     .map_err(UiMessage::unknown)?;
     Ok(report.quarantined)
@@ -1200,7 +1239,7 @@ async fn download_track(url: &str, target: &Path) -> Result<u64> {
     let response = client.get(url).send().await?.error_for_status()?;
     let bytes = response.bytes().await?;
     if bytes.len() < 1024 {
-        return Err(anyhow!(UiMessage::new("download_small_file")));
+        return Err(anyhow!(UiMessage::new("downloadSmallFile")));
     }
     fs::write(&part, &bytes)?;
     if target.exists() {
@@ -1270,6 +1309,7 @@ fn quarantine_removed(
     artist_separator: &str,
     conn: &mut rusqlite::Connection,
     report: &mut SyncReport,
+    sync_run_id: Option<i64>,
 ) -> Result<()> {
     let ids: HashSet<u64> = playlist.tracks.iter().map(|t| t.id).collect();
     let mut stmt =
@@ -1306,6 +1346,7 @@ fn quarantine_removed(
                         .unwrap_or_default()
                         .to_owned()],
                 ),
+                sync_run_id,
             );
             let quarantine_dir = root.join(".quarantine").join(&playlist_folder);
             fs::create_dir_all(&quarantine_dir)?;
@@ -1419,7 +1460,8 @@ async fn sync_from_local_to_playlist(
         "phase_scan_local",
         0,
         0,
-        UiMessage::new("scan_local_files"),
+        UiMessage::new("scanLocalFiles"),
+        Some(sync_run_id),
     );
 
     // 1) 歌单当前网易 id 集合（与 playlist.tracks 一致）。
@@ -1494,14 +1536,14 @@ async fn sync_from_local_to_playlist(
                 report.failed += 1;
                 report
                     .errors
-                    .push(UiMessage::with_params("playlist_push_failed", vec![error.to_string()]));
+                    .push(UiMessage::with_params("playlistPushFailed", vec![error.to_string()]));
             }
         }
     }
 
     if !unresolved.is_empty() {
         report.errors.push(UiMessage::with_params(
-            "local_unresolved_tracks",
+            "localUnresolvedTracks",
             vec![unresolved.len().to_string()],
         ));
     }
@@ -1510,7 +1552,7 @@ async fn sync_from_local_to_playlist(
 
 /// 从本地音频文件解析网易曲目 id：优先读 .netease.json 旁车；否则读 ID3
 /// `netease-id` comment；最后 tag+时长+md5 调 /search/match。返回 None 表示无法解析。
-async fn local_file_netease_id(api: &NeteaseApi, path: &Path) -> Result<Option<u64>> {
+pub(crate) async fn local_file_netease_id(api: &NeteaseApi, path: &Path) -> Result<Option<u64>> {
     // 1) 旁车标记。
     let sidecar = sidecar_path(path);
     if sidecar.is_file() {
@@ -1595,7 +1637,9 @@ pub(crate) fn read_comment_text(path: &Path) -> Option<String> {
 }
 
 /// 读本地音频元数据：标题/艺术家/专辑/时长(秒)。
-fn read_local_audio_meta(path: &Path) -> Result<Option<(String, String, String, f64)>> {
+pub(crate) fn read_local_audio_meta(
+    path: &Path,
+) -> Result<Option<(String, String, String, f64)>> {
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::probe::Probe;
     use lofty::tag::Accessor;
@@ -1622,7 +1666,7 @@ fn read_local_audio_meta(path: &Path) -> Result<Option<(String, String, String, 
     Ok(Some((title, artist, album, duration)))
 }
 
-fn file_md5(path: &Path) -> String {
+pub(crate) fn file_md5(path: &Path) -> String {
     use std::io::Read;
     let Ok(mut file) = fs::File::open(path) else {
         return String::new();
@@ -1678,6 +1722,7 @@ async fn convert_ncm_files(
     config: &Config,
     playlist: &PlaylistTracks,
     report: &mut SyncReport,
+    sync_run_id: i64,
 ) -> Result<()> {
     if !config.ncm_convert {
         return Ok(());
@@ -1725,6 +1770,7 @@ async fn convert_ncm_files(
                         .unwrap_or_default()
                         .to_owned()],
                 ),
+                Some(sync_run_id),
             );
             let output_dir = path.parent().context("NCM 文件缺少上级目录")?;
             match crate::ncm::ncm::convert(path, output_dir) {
@@ -1743,7 +1789,7 @@ async fn convert_ncm_files(
                 }
                 Err(error) => {
                     report.errors.push(UiMessage::with_params(
-                        "ncm_convert_failed",
+                        "ncmConvertFailed",
                         vec![path.to_string_lossy().into_owned(), error.to_string()],
                     ));
                     tracing::warn!(%error, path = %path.display(), "NCM conversion failed");
@@ -1754,7 +1800,8 @@ async fn convert_ncm_files(
     Ok(())
 }
 
-fn emit_progress(
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_progress(
     app: Option<&AppHandle>,
     playlist_id: u64,
     playlist_name: &str,
@@ -1762,6 +1809,7 @@ fn emit_progress(
     current: usize,
     total: usize,
     message: UiMessage,
+    run_id: Option<i64>,
 ) {
     if let Some(app) = app {
         let _ = app.emit(
@@ -1773,6 +1821,7 @@ fn emit_progress(
                 current,
                 total,
                 message,
+                run_id,
             },
         );
     }
@@ -1832,21 +1881,21 @@ pub async fn restore_deleted_local_item(
         .optional()
         .map_err(UiMessage::unknown)?;
     let (local_path, quarantined_path, restored_at) =
-        entry.ok_or_else(|| UiMessage::new("deleted_record_missing"))?;
+        entry.ok_or_else(|| UiMessage::new("deletedRecordMissing"))?;
     if restored_at.is_some() {
-        return Err(UiMessage::new("already_restored"));
+        return Err(UiMessage::new("alreadyRestored"));
     }
     let quarantined = PathBuf::from(&quarantined_path);
     let original = PathBuf::from(&local_path);
     if !quarantined.is_file() {
         return Err(UiMessage::with_params(
-            "quarantine_missing",
+            "quarantineMissing",
             vec![quarantined_path],
         ));
     }
     if original.exists() {
         return Err(UiMessage::with_params(
-            "restore_conflict",
+            "restoreConflict",
             vec![local_path.clone()],
         ));
     }
@@ -1880,11 +1929,11 @@ pub async fn restore_deleted_playlist_track(
         .optional()
         .map_err(UiMessage::unknown)?;
     let (_playlist_name, playlist_id, netease_id, track_name, restored_at) =
-        entry.ok_or_else(|| UiMessage::new("deleted_record_missing"))?;
+        entry.ok_or_else(|| UiMessage::new("deletedRecordMissing"))?;
     if restored_at.is_some() {
-        return Err(UiMessage::new("already_restored"));
+        return Err(UiMessage::new("alreadyRestored"));
     }
-    let netease_id = netease_id.ok_or_else(|| UiMessage::new("deleted_record_missing"))? as u64;
+    let netease_id = netease_id.ok_or_else(|| UiMessage::new("deletedRecordMissing"))? as u64;
     let config = store::config::load(&paths.config_file).map_err(UiMessage::unknown)?;
     // 只有我创建的歌单才能写回；否则报错提示。
     let api = NeteaseApi::from_config(&config).map_err(UiMessage::unknown)?;
@@ -1896,7 +1945,7 @@ pub async fn restore_deleted_playlist_track(
         None => false,
     };
     if !is_owned {
-        return Err(UiMessage::new("restore_needs_owned_playlist"));
+        return Err(UiMessage::new("restoreNeedsOwnedPlaylist"));
     }
     api.playlist_add_tracks(playlist_id as u64, &[netease_id])
         .await
@@ -1916,9 +1965,9 @@ pub async fn restore_playlist_snapshot(
     let conn = database::open(&paths.database_file).map_err(UiMessage::unknown)?;
     let history = database::get_playlist_history(&conn, history_id)
         .map_err(UiMessage::unknown)?
-        .ok_or_else(|| UiMessage::new("history_missing"))?;
+        .ok_or_else(|| UiMessage::new("historyMissing"))?;
     if history.playlist_id != playlist_id {
-        return Err(UiMessage::new("history_playlist_mismatch"));
+        return Err(UiMessage::new("historyPlaylistMismatch"));
     }
     let snapshot_ids: Vec<u64> = serde_json::from_str::<Vec<serde_json::Value>>(&history.snapshot)
         .map(|items| {
@@ -1940,12 +1989,12 @@ pub async fn restore_playlist_snapshot(
         None => false,
     };
     if !is_owned {
-        return Err(UiMessage::new("restore_needs_owned_playlist"));
+        return Err(UiMessage::new("restoreNeedsOwnedPlaylist"));
     }
     let current = api
         .playlist_tracks(playlist_id)
         .await
-        .map_err(|error| UiMessage::with_params("playlist_fetch_failed", vec![error.to_string()]))?;
+        .map_err(|error| UiMessage::with_params("playlistFetchFailed", vec![error.to_string()]))?;
     let current_ids: HashSet<u64> = current.tracks.iter().map(|t| t.id).collect();
 
     let to_add: Vec<u64> = snapshot_ids
@@ -1997,9 +2046,9 @@ pub async fn preview_playlist_restore(
     let conn = database::open(&paths.database_file).map_err(UiMessage::unknown)?;
     let history = database::get_playlist_history(&conn, history_id)
         .map_err(UiMessage::unknown)?
-        .ok_or_else(|| UiMessage::new("history_missing"))?;
+        .ok_or_else(|| UiMessage::new("historyMissing"))?;
     if history.playlist_id != playlist_id {
-        return Err(UiMessage::new("history_playlist_mismatch"));
+        return Err(UiMessage::new("historyPlaylistMismatch"));
     }
     let snapshot: Vec<serde_json::Value> =
         serde_json::from_str(&history.snapshot).unwrap_or_default();
@@ -2012,7 +2061,7 @@ pub async fn preview_playlist_restore(
     let current = api
         .playlist_tracks(playlist_id)
         .await
-        .map_err(|error| UiMessage::with_params("playlist_fetch_failed", vec![error.to_string()]))?;
+        .map_err(|error| UiMessage::with_params("playlistFetchFailed", vec![error.to_string()]))?;
     let current_ids: HashSet<u64> = current.tracks.iter().map(|t| t.id).collect();
     let to_add: Vec<serde_json::Value> = snapshot
         .iter()
