@@ -21,9 +21,24 @@
       "cloud": "Cloud Disk",
       "sync": "Sync Tasks",
       "quarantine": "Quarantine",
-      "settings": "Settings"
+      "settings": "Settings",
+      "about": "About"
     },
     "progressHeader": "{{name}} · {{phase}} {{current}}/{{total}}"
+  },
+  "about": {
+    "tagline": "Portable NetEase Cloud Music playlist synchronizer for Windows",
+    "version": "Version v{{version}}",
+    "cardTech": "Tech stack",
+    "techStack": "Tauri 2 · Rust · React + TypeScript",
+    "techDetail": "Local data lives in config.json and SQLite (library.db); NetEase communication goes through a self-hosted NeteaseCloudMusicApi Enhanced instance.",
+    "cardPrivacy": "Data & privacy",
+    "privacyLocal": "Your account cookie stays on this machine only — never written to logs or uploaded.",
+    "privacyDetail": "Song lists and account data used for sync, matching and cloud comparison go through the self-hosted API; downloaded quality depends on your account tier and copyright.",
+    "cardLinks": "Links",
+    "repo": "GitHub repository",
+    "releases": "Releases",
+    "apiRepo": "NetEase API Enhanced"
   },
   "phases": {
     "phaseReadPlaylist": "Loading playlist",
@@ -437,6 +452,8 @@
     "cancel": "Cancel",
     "cbCover": "Write album cover",
     "cbLyrics": "Embed lyrics tags",
+    "cbUpgradeQuality": "Auto-upgrade to lossless",
+    "upgradeQualityExtra": "When quality is set to lossless and a local file is lossy (mp3/m4a/etc.), sync re-downloads a lossless copy to replace it (lossy targets never trigger re-downloads)",
     "cbLrc": "Save a matching .lrc lyrics file",
     "on": "On",
     "off": "Off",

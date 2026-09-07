@@ -4,6 +4,13 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.6] - 2026-09-07
+
+### Added
+
+- New "About" page (sidebar bottom): version, tech stack, data & privacy notes, plus links to the GitHub repository, releases and the API repo.
+- New "Auto-upgrade to lossless" setting: when quality is lossless (hires/lossless) and an existing local file is lossy (mp3/m4a/etc.), sync re-downloads a lossless copy to replace it (also cleaning up the old .lrc and sidecar); lossy quality targets never trigger re-downloads.
+
 ## [0.8.5] - 2026-09-07
 
 ### Added

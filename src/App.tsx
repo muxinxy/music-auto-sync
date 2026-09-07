@@ -5,6 +5,7 @@ import {
   CloudUploadOutlined,
   DeleteOutlined,
   HistoryOutlined,
+  InfoCircleOutlined,
   LoginOutlined,
   ReloadOutlined,
   SettingOutlined,
@@ -25,10 +26,18 @@ import CloudPage from "./pages/Cloud";
 import SyncPage from "./pages/Sync";
 import QuarantinePage from "./pages/Quarantine";
 import SettingsPage from "./pages/Settings";
+import AboutPage from "./pages/About";
 
 const { Sider, Content, Header } = Layout;
 
-export type PageKey = "login" | "playlists" | "cloud" | "sync" | "quarantine" | "settings";
+export type PageKey =
+  | "login"
+  | "playlists"
+  | "cloud"
+  | "sync"
+  | "quarantine"
+  | "settings"
+  | "about";
 
 export interface SyncEventState {
   running: boolean;
@@ -203,6 +212,7 @@ export default function App() {
     { key: "sync", icon: <HistoryOutlined />, label: t("app.menu.sync") },
     { key: "quarantine", icon: <DeleteOutlined />, label: t("app.menu.quarantine") },
     { key: "settings", icon: <SettingOutlined />, label: t("app.menu.settings") },
+    { key: "about", icon: <InfoCircleOutlined />, label: t("app.menu.about") },
   ];
 
   return (
@@ -337,6 +347,8 @@ export default function App() {
             <SyncPage />
           ) : page === "quarantine" ? (
             <QuarantinePage />
+          ) : page === "about" ? (
+            <AboutPage />
           ) : (
             <SettingsPage />
           )}

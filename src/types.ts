@@ -41,6 +41,8 @@ export interface Config {
   ncmKeepSource: boolean;
   embedCover: boolean;
   embedLyrics: boolean;
+  /** 目标为无损且本地为有损时，重新下载无损替换。 */
+  upgradeQuality: boolean;
   writeLrc: boolean;
   writeM3u8: boolean;
   concurrency: number;

@@ -29,6 +29,7 @@ const files = [
   "src/pages/Login.tsx",
   "src/pages/Quarantine.tsx",
   "src/pages/Settings.tsx",
+  "src/pages/About.tsx",
 ];
 const re = /\bt\(\s*["'`]([A-Za-z0-9_.]+)["'`]/g;
 const usedMissing = [];

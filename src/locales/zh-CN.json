@@ -21,9 +21,24 @@
       "cloud": "音乐云盘",
       "sync": "同步任务",
       "quarantine": "隔离区",
-      "settings": "设置"
+      "settings": "设置",
+      "about": "关于"
     },
     "progressHeader": "{{name}} · {{phase}} {{current}}/{{total}}"
+  },
+  "about": {
+    "tagline": "Windows 便携网易云音乐歌单同步器",
+    "version": "版本 v{{version}}",
+    "cardTech": "技术栈",
+    "techStack": "Tauri 2 · Rust · React + TypeScript",
+    "techDetail": "本地数据存于 config.json 与 SQLite（library.db）；与网易云通信经由自建 NeteaseCloudMusicApi Enhanced 实例中转。",
+    "cardPrivacy": "数据与隐私",
+    "privacyLocal": "账号 Cookie 只保存在本机，绝不写入日志或上传。",
+    "privacyDetail": "同步、匹配、云盘比对等操作读取的歌曲列表与账号资料会经自建 API 中转；下载的音质受账号会员等级与版权限制。",
+    "cardLinks": "链接",
+    "repo": "GitHub 仓库",
+    "releases": "版本发布",
+    "apiRepo": "网易云 API Enhanced"
   },
   "phases": {
     "phaseReadPlaylist": "读取歌单",
@@ -437,6 +452,8 @@
     "cancel": "取消",
     "cbCover": "写入专辑封面",
     "cbLyrics": "嵌入歌词标签",
+    "cbUpgradeQuality": "无损音质自动升级",
+    "upgradeQualityExtra": "音质设为无损且本地已是 mp3/m4a 等有损时，同步会自动重下无损替换（有损目标不会触发重下）",
     "cbLrc": "保存同名 .lrc 歌词文件",
     "on": "开启",
     "off": "关闭",

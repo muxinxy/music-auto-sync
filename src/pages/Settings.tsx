@@ -57,6 +57,7 @@ const defaultConfig: Config = {
   ncmKeepSource: true,
   embedCover: true,
   embedLyrics: false,
+  upgradeQuality: false,
   writeLrc: true,
   writeM3u8: true,
   concurrency: 3,
@@ -273,6 +274,14 @@ export default function SettingsPage() {
                 </Radio.Button>
               ))}
             </Radio.Group>
+          </Form.Item>
+          <Form.Item
+            name="upgradeQuality"
+            valuePropName="checked"
+            label={t("settings.cbUpgradeQuality")}
+            extra={t("settings.upgradeQualityExtra")}
+          >
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
           </Form.Item>
           <Form.Item label={t("settings.labelDownloadSource")} name="downloadSource" extra={t("settings.downloadSourceExtra")}>
             <Select

@@ -92,6 +92,9 @@ pub struct Config {
     pub ncm_keep_source: bool,
     pub embed_cover: bool,
     pub embed_lyrics: bool,
+    /// 目标为无损（hires/lossless）且本地已是 mp3/m4a 等有损时，重新下载无损替换。
+    #[serde(default)]
+    pub upgrade_quality: bool,
     pub write_lrc: bool,
     pub write_m3u8: bool,
     pub concurrency: usize,
@@ -154,6 +157,7 @@ impl Default for Config {
             ncm_keep_source: true,
             embed_cover: true,
             embed_lyrics: false,
+            upgrade_quality: false,
             write_lrc: true,
             write_m3u8: true,
             concurrency: 3,

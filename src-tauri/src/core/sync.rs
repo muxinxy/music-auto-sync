@@ -522,6 +522,22 @@ fn is_transient_download_error(error: &anyhow::Error) -> bool {
     }
 }
 
+/// 判定该音质目标是否值得替换已有的有损文件。
+/// 仅当目标为无损（hires/lossless）且本地为有损（mp3/m4a/ogg/aac）时返回 true；
+/// exhigh/higher/standard 目标保持“已有即满足”，避免无谓的重下。
+/// `upgrade_quality` 总开关关闭时恒为 false。
+fn needs_lossless_upgrade(upgrade_quality: bool, quality: &str, existing_ext: &str) -> bool {
+    if !upgrade_quality {
+        return false;
+    }
+    let lossless_target = matches!(quality, "hires" | "lossless");
+    let existing_lossy = matches!(
+        existing_ext.to_ascii_lowercase().as_str(),
+        "mp3" | "m4a" | "ogg" | "aac"
+    );
+    lossless_target && existing_lossy
+}
+
 async fn fetch_download_url_for_track(
     api: &NeteaseApi,
     track_id: u64,
@@ -862,6 +878,9 @@ async fn sync_one_track_worker(
         }
     }
 
+    // 音质升级前已登记的有损文件路径（与本次目标不同时，下载成功后删除防残留）。
+    let mut legacy_lossy_path: Option<String> = None;
+
     if !overwrite {
         let known_path: Option<String> = conn
             .query_row(
@@ -871,14 +890,20 @@ async fn sync_one_track_worker(
             )
             .optional()
             .unwrap_or(None);
-        if known_path
-            .as_deref()
-            .is_some_and(|path| Path::new(path).is_file())
-        {
-            let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
-            log_entry.outcome("skipped", &UiMessage::new("trackExists"));
-            let _ = store::track_log::append(logs_dir, &log_entry);
-            return TrackOutcome::Skipped;
+        if let Some(path) = known_path.as_deref().filter(|p| Path::new(p).is_file()) {
+            // 音质升级：目标是无损、已登记文件却是有损（mp3 等）→ 不跳过，重新下载替换。
+            let existing_ext = Path::new(path)
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("mp3");
+            if !needs_lossless_upgrade(config.upgrade_quality, quality, existing_ext) {
+                let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
+                log_entry.outcome("skipped", &UiMessage::new("trackExists"));
+                let _ = store::track_log::append(logs_dir, &log_entry);
+                return TrackOutcome::Skipped;
+            }
+            // 走到这里 = 判定需要升级：记录旧有损文件，下载成功后删除避免残留。
+            legacy_lossy_path = known_path;
         }
     }
 
@@ -911,7 +936,18 @@ async fn sync_one_track_worker(
         artist_separator,
     );
 
-    if !overwrite && target.is_file() {
+    // 目标模板文件已存在且有损、目标为无损 → 本次升级重下（先删旧文件防残留同名）。
+    let upgrading = target.is_file()
+        && needs_lossless_upgrade(
+            config.upgrade_quality,
+            quality,
+            target
+                .extension()
+                .and_then(|x| x.to_str())
+                .unwrap_or("mp3"),
+        );
+
+    if !overwrite && !upgrading && target.is_file() {
         // 本地已存在按当前模板命名的文件：登记为已同步并跳过下载，避免覆盖用户文件。
         let _ = record_track_file(&mut conn, playlist, track, &target, &extension);
         let _ = write_sidecar(&target, playlist.id, track.id);
@@ -923,7 +959,7 @@ async fn sync_one_track_worker(
 
     // DB 与模板均未命中：检查歌单文件夹里是否已有同一首歌（旧模板/手放文件）。
     // 命中则登记为已同步并把文件重命名到当前模板，避免重复下载。
-    if !overwrite {
+    if !overwrite && !upgrading {
         if let Some(source) = local_map.get(&track.id) {
             if source.is_file() {
                 let source_ext = source
@@ -1005,6 +1041,15 @@ async fn sync_one_track_worker(
                             tracing::warn!(%error, path = %target.display(), "lyrics embed failed");
                         }
                     }
+                }
+            }
+            // 音质升级：删除旧有损文件及其伴生文件（新无损已写入 target）。
+            if let Some(old) = legacy_lossy_path {
+                let old_path = PathBuf::from(&old);
+                if old_path != target {
+                    let _ = fs::remove_file(&old_path);
+                    let _ = fs::remove_file(old_path.with_extension("lrc"));
+                    let _ = fs::remove_file(sidecar_path(&old_path));
                 }
             }
             let _ = record_track_file(&mut conn, playlist, track, &target, &extension);
@@ -2142,4 +2187,24 @@ pub async fn preview_playlist_restore(
         to_add,
         to_remove,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lossless_upgrade_requires_switch_and_lossless_target() {
+        // 开关关 → 永不升级。
+        assert!(!needs_lossless_upgrade(false, "lossless", "mp3"));
+        // 开关开 + 目标无损 + 现存有损 → 升级。
+        assert!(needs_lossless_upgrade(true, "lossless", "mp3"));
+        assert!(needs_lossless_upgrade(true, "hires", "m4a"));
+        // 目标无损但本地已是无损 → 无需（flac 已满足）。
+        assert!(!needs_lossless_upgrade(true, "lossless", "flac"));
+        assert!(!needs_lossless_upgrade(true, "hires", "wav"));
+        // 有损目标（exhigh 等）不自动替换，避免无谓重下。
+        assert!(!needs_lossless_upgrade(true, "exhigh", "mp3"));
+        assert!(!needs_lossless_upgrade(true, "standard", "mp3"));
+    }
 }
