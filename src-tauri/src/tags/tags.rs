@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use lofty::{
     config::WriteOptions,
     file::TaggedFileExt,
+    picture::{Picture, PictureType},
     probe::Probe,
     tag::{Accessor, ItemKey, TagExt, TagType},
 };
@@ -37,6 +38,47 @@ pub fn write_basic_tags(
         tag.set_track(position as u32);
         tag.save_to_path(path, WriteOptions::default())?;
     }
+    Ok(())
+}
+
+/// 把专辑封面写入文件主标签（ID3 APIC / Vorbis METADATA_BLOCK_PICTURE 等）。
+/// 先异步下载封面字节（15s 超时、UA），再同步嵌入——调用方为 async 下载路径。
+/// 失败返回 Err，由调用方决定是否仅告警。
+pub async fn write_album_cover(path: &Path, pic_url: &str) -> Result<()> {
+    // 大图（原图）可能数 MB，请求带尺寸参数的精简图即可满足播放器/资源管理器封面。
+    let url = if pic_url.contains('?') {
+        pic_url.to_owned()
+    } else {
+        format!("{pic_url}?param=500y500")
+    };
+    let bytes = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .bytes()
+        .await?;
+    embed_cover_bytes(path, &bytes)
+}
+
+/// 已持有封面字节时同步嵌入（供重复嵌入避免二次下载）。
+fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+    if bytes.len() < 1024 {
+        anyhow::bail!("album art too small ({} bytes)", bytes.len());
+    }
+    let mut picture = Picture::from_reader(&mut &bytes[..])?;
+    picture.set_pic_type(PictureType::CoverFront);
+    let mut tagged_file = Probe::open(path)
+        .with_context(|| format!("cannot open tag of {}", path.display()))?
+        .read()?;
+    let Some(tag) = tagged_file.primary_tag_mut() else {
+        anyhow::bail!("file has no primary tag");
+    };
+    tag.set_picture(0, picture);
+    tag.save_to_path(path, WriteOptions::default())?;
     Ok(())
 }
 
@@ -152,5 +194,78 @@ mod tests {
             off += 10 + fsize;
         }
         assert!(found, "COMM frame not found");
+    }
+
+    #[tokio::test]
+    async fn embeds_real_album_cover_from_network() {
+        // 用真实 mp3 副本 + 网络拉一张真实封面验证（任一缺失即跳过）。
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        if !src.exists() {
+            eprintln!("skip: source mp3 not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("test.mp3");
+        fs::copy(src, &copy).unwrap();
+
+        // 先写基础标签（保证有主标签可挂 APIC）。
+        let track = crate::api::Track {
+            id: 1303019637,
+            name: "说书人".into(),
+            ar: vec![crate::api::Artist {
+                name: "暗杠".into(),
+            }],
+            al: crate::api::Album {
+                id: 0,
+                name: String::new(),
+                pic_url: None,
+            },
+            dt: 0,
+            no: 1,
+        };
+        write_basic_tags(&copy, &track, 1, "、").unwrap();
+
+        // 真实封面 URL：网易 1303019637 曲目（若网络不可用则跳过）。
+        let url = "https://p1.music.126.net/8G2rC6qLtGQ8kVNq6dX0qg==/109951163128957853.jpg";
+        let bytes = match reqwest::Client::builder()
+            .user_agent("Mozilla/5.0")
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+        {
+            Ok(client) => match client.get(url).send().await {
+                Ok(resp) => match resp.error_for_status() {
+                    Ok(resp) => match resp.bytes().await {
+                        Ok(bytes) => bytes.to_vec(),
+                        Err(_) => {
+                            eprintln!("skip: could not read album art (network?)");
+                            return;
+                        }
+                    },
+                    Err(_) => {
+                        eprintln!("skip: album art fetch failed (network?)");
+                        return;
+                    }
+                },
+                Err(_) => {
+                    eprintln!("skip: album art fetch failed (network?)");
+                    return;
+                }
+            },
+            Err(_) => {
+                eprintln!("skip: could not build client");
+                return;
+            }
+        };
+        embed_cover_bytes(&copy, &bytes).unwrap();
+
+        // 读回：主标签应含 1 张 CoverFront 图片。
+        let tagged = Probe::open(&copy).unwrap().read().unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        let pictures = tag.pictures();
+        assert_eq!(pictures.len(), 1, "expected one embedded picture");
+        assert_eq!(
+            pictures[0].pic_type(),
+            lofty::picture::PictureType::CoverFront
+        );
     }
 }

@@ -4,6 +4,12 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.4] - 2026-09-07
+
+### Added
+
+- Downloaded songs now embed album art (ID3 APIC / FLAC picture) so players and Windows Explorer show covers. Both playlist sync and single-song downloads (including custom directories) embed art; fetching is async and never blocks the download itself.
+
 ## [0.8.3] - 2026-09-07
 
 ### Fixed

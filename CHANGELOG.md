@@ -4,6 +4,12 @@
 
 本文件记录面向用户的版本更新。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循[语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.8.4] - 2026-09-07
+
+### Added
+
+- 下载的歌曲现在会写入专辑封面（ID3 APIC / FLAC picture），播放器和资源管理器可正常显示封面图。歌单同步与单曲下载（含自定义目录）都会嵌入；封面异步拉取，失败不影响下载本身。
+
 ## [0.8.3] - 2026-09-07
 
 ### Fixed

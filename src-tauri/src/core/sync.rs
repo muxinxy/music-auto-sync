@@ -967,6 +967,16 @@ async fn sync_one_track_worker(
             {
                 tracing::warn!(%error, path = %target.display(), "metadata write failed");
             }
+            // 写入专辑封面（ID3 APIC / Vorbis picture）。异步拉图：失败只记日志不阻塞下载。
+            if let Some(pic_url) = track.al.pic_url.as_deref() {
+                let target = target.to_path_buf();
+                let pic_url = pic_url.to_owned();
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
+                        tracing::warn!(%error, path = %target.display(), "album cover write failed");
+                    }
+                });
+            }
             // 写入官方格式 163 key（含 musicId），供后续精确匹配；失败仅告警。
             if let Err(error) = write_official_key_after_download(api, &target, track, &extension).await
             {
@@ -1176,6 +1186,16 @@ pub async fn download_song_with_options(
         tags::write_basic_tags(&target, track, index + 1, artist_separator)
     {
         tracing::warn!(%error, path = %target.display(), "metadata write failed");
+    }
+    // 单曲下载也嵌入专辑封面（自定义目录路径不进 finalize_track，这里统一处理）。
+    if let Some(pic_url) = track.al.pic_url.as_deref() {
+        let target = target.to_path_buf();
+        let pic_url = pic_url.to_owned();
+        tauri::async_runtime::spawn(async move {
+            if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
+                tracing::warn!(%error, path = %target.display(), "album cover write failed");
+            }
+        });
     }
     Ok(target.to_string_lossy().into_owned())
 }
