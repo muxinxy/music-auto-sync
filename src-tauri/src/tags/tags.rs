@@ -82,6 +82,22 @@ fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// 把歌词嵌入文件主标签（通用 Tag 写入：ID3v2 → USLT 帧、Vorbis/FLAC → LYRICS 字段，
+/// lofty 按主标签类型自动映射）。`lrc_text` 为网易 .lrc 原文（可含时间戳行，播放器整段显示）。
+pub fn write_embedded_lyrics(path: &Path, lrc_text: &str) -> Result<()> {
+    let mut tagged_file = Probe::open(path)
+        .with_context(|| format!("cannot open tag of {}", path.display()))?
+        .read()?;
+    let Some(tag) = tagged_file.primary_tag_mut() else {
+        anyhow::bail!("file has no primary tag");
+    };
+    // 覆盖旧值，避免重复嵌入累积。
+    tag.remove_key(&ItemKey::Lyrics);
+    tag.insert_text(ItemKey::Lyrics, lrc_text.to_owned());
+    tag.save_to_path(path, WriteOptions::default())?;
+    Ok(())
+}
+
 /// 把官方格式的 163 key 写入 ID3v2 备注（COMM）帧，**字节级复刻网易官方**：
 /// enc=0(Latin1) + lang="XXX" + description 空 + `163 key(Don't modify):<b64>`。
 /// 用拉丁 1 编码是因为 Windows 资源管理器不解析 UTF-8 编码的 COMM（会显示备注为空）。
@@ -267,5 +283,30 @@ mod tests {
             pictures[0].pic_type(),
             lofty::picture::PictureType::CoverFront
         );
+    }
+
+    #[test]
+    fn embeds_and_reads_back_lyrics_on_real_mp3() {
+        // 用真实 mp3 副本验证歌词可嵌入并被读回（文件缺失即跳过）。
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        if !src.exists() {
+            eprintln!("skip: source mp3 not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("test.mp3");
+        fs::copy(src, &copy).unwrap();
+
+        let lrc = "[00:01.00]第一行歌词\n[00:05.00]第二行歌词\n";
+        write_embedded_lyrics(&copy, lrc).unwrap();
+
+        // 读回：lofty 通用 Tag 里按 Lyrics 键应能取到我们写入的文本。
+        let tagged = Probe::open(&copy).unwrap().read().unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        let stored = tag
+            .get(&lofty::tag::ItemKey::Lyrics)
+            .map(|item| item.value().text().unwrap_or_default())
+            .unwrap_or_default();
+        assert!(stored.contains("第一行歌词"), "lyrics not read back");
     }
 }

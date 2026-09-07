@@ -4,6 +4,16 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.5] - 2026-09-07
+
+### Added
+
+- The "Embed lyrics tags" setting now actually works: when enabled, downloaded songs get their lyrics written into the audio file's own tags (USLT frame for MP3, LYRICS field for FLAC/others), independent from — and stackable with — "Save a matching .lrc file". Embedding failures never block the download. Previously the option was toggleable in the UI but never read by the backend, so it had no effect.
+
+### Fixed
+
+- The "Write album cover" setting was also ineffective: covers were embedded unconditionally, so turning the option off still embedded them. Cover embedding now honors the switch.
+
 ## [0.8.4] - 2026-09-07
 
 ### Added

@@ -677,14 +677,22 @@ async fn finalize_track(
     write_lrc: bool,
     artist_separator: &str,
     conn: &mut rusqlite::Connection,
+    embed_lyrics: bool,
 ) {
     if let Err(error) = tags::write_basic_tags(target, track, position, artist_separator)
     {
         tracing::warn!(%error, path = %target.display(), "metadata write failed");
     }
-    if write_lrc {
+    if write_lrc || embed_lyrics {
         if let Ok(Some(lyrics)) = api.lyric(track.id).await {
-            let _ = fs::write(target.with_extension("lrc"), lyrics);
+            if write_lrc {
+                let _ = fs::write(target.with_extension("lrc"), &lyrics);
+            }
+            if embed_lyrics {
+                if let Err(error) = tags::write_embedded_lyrics(target, &lyrics) {
+                    tracing::warn!(%error, path = %target.display(), "lyrics embed failed");
+                }
+            }
         }
     }
     let _ = record_track_file(conn, playlist, track, target, extension);
@@ -968,23 +976,35 @@ async fn sync_one_track_worker(
                 tracing::warn!(%error, path = %target.display(), "metadata write failed");
             }
             // 写入专辑封面（ID3 APIC / Vorbis picture）。异步拉图：失败只记日志不阻塞下载。
-            if let Some(pic_url) = track.al.pic_url.as_deref() {
-                let target = target.to_path_buf();
-                let pic_url = pic_url.to_owned();
-                tauri::async_runtime::spawn(async move {
-                    if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
-                        tracing::warn!(%error, path = %target.display(), "album cover write failed");
-                    }
-                });
+            if config.embed_cover {
+                if let Some(pic_url) = track.al.pic_url.as_deref() {
+                    let target = target.to_path_buf();
+                    let pic_url = pic_url.to_owned();
+                    tauri::async_runtime::spawn(async move {
+                        if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
+                            tracing::warn!(%error, path = %target.display(), "album cover write failed");
+                        }
+                    });
+                }
             }
             // 写入官方格式 163 key（含 musicId），供后续精确匹配；失败仅告警。
             if let Err(error) = write_official_key_after_download(api, &target, track, &extension).await
             {
                 tracing::warn!(%error, path = %target.display(), "163 key write failed");
             }
-            if config.write_lrc {
+            // 歌词只拉取一次：按设置写入 .lrc 旁车和/或嵌入文件标签（USLT/Vorbis LYRICS）。
+            if config.write_lrc || config.embed_lyrics {
                 if let Ok(Some(lyrics)) = api.lyric(track.id).await {
-                    let _ = fs::write(target.with_extension("lrc"), lyrics);
+                    if config.write_lrc {
+                        let _ = fs::write(target.with_extension("lrc"), &lyrics);
+                    }
+                    if config.embed_lyrics {
+                        if let Err(error) =
+                            tags::write_embedded_lyrics(&target, &lyrics)
+                        {
+                            tracing::warn!(%error, path = %target.display(), "lyrics embed failed");
+                        }
+                    }
                 }
             }
             let _ = record_track_file(&mut conn, playlist, track, &target, &extension);
@@ -1175,11 +1195,19 @@ pub async fn download_song_with_options(
             write_lrc,
             artist_separator,
             &mut conn,
+            config.embed_lyrics,
         )
         .await;
-    } else if write_lrc {
+    } else if write_lrc || config.embed_lyrics {
         if let Ok(Some(lyrics)) = api.lyric(track.id).await {
-            let _ = fs::write(target.with_extension("lrc"), lyrics);
+            if write_lrc {
+                let _ = fs::write(target.with_extension("lrc"), &lyrics);
+            }
+            if config.embed_lyrics {
+                if let Err(error) = tags::write_embedded_lyrics(&target, &lyrics) {
+                    tracing::warn!(%error, path = %target.display(), "lyrics embed failed");
+                }
+            }
         }
     }
     if let Err(error) =
@@ -1188,14 +1216,16 @@ pub async fn download_song_with_options(
         tracing::warn!(%error, path = %target.display(), "metadata write failed");
     }
     // 单曲下载也嵌入专辑封面（自定义目录路径不进 finalize_track，这里统一处理）。
-    if let Some(pic_url) = track.al.pic_url.as_deref() {
-        let target = target.to_path_buf();
-        let pic_url = pic_url.to_owned();
-        tauri::async_runtime::spawn(async move {
-            if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
-                tracing::warn!(%error, path = %target.display(), "album cover write failed");
-            }
-        });
+    if config.embed_cover {
+        if let Some(pic_url) = track.al.pic_url.as_deref() {
+            let target = target.to_path_buf();
+            let pic_url = pic_url.to_owned();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
+                    tracing::warn!(%error, path = %target.display(), "album cover write failed");
+                }
+            });
+        }
     }
     Ok(target.to_string_lossy().into_owned())
 }
