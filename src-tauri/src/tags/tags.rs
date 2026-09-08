@@ -10,6 +10,13 @@ use std::path::Path;
 
 use crate::{api::Track, core::naming::artists_with};
 
+/// 写选项：新写的 ID3v2 一律用 **v2.3**（与网易官方下载一致）。Windows 资源管理器
+/// 对 ID3v2.4 的 APIC 支持差，会显示“无封面”；v2.3 兼容性最好。非 ID3v2 标签
+/// （Vorbis/MP4）会忽略该选项，不受影响。
+fn v23_write_options() -> WriteOptions {
+    WriteOptions::new().use_id3v23(true)
+}
+
 pub fn write_basic_tags(
     path: &Path,
     track: &Track,
@@ -25,7 +32,7 @@ pub fn write_basic_tags(
         tag.set_album(track.al.name.clone());
         tag.set_track(position as u32);
         // 不再写纯文本 netease-id；网易 id 以官方 163 key 形式写入（见 write_netease_key）。
-        tag.save_to_path(path, WriteOptions::default())?;
+        tag.save_to_path(path, v23_write_options())?;
     } else {
         let mut tag = lofty::tag::Tag::new(if tag_type == TagType::Id3v2 {
             tag_type
@@ -36,7 +43,7 @@ pub fn write_basic_tags(
         tag.set_artist(artist);
         tag.set_album(track.al.name.clone());
         tag.set_track(position as u32);
-        tag.save_to_path(path, WriteOptions::default())?;
+        tag.save_to_path(path, v23_write_options())?;
     }
     Ok(())
 }
@@ -65,6 +72,9 @@ pub async fn write_album_cover(path: &Path, pic_url: &str) -> Result<()> {
 }
 
 /// 已持有封面字节时同步嵌入（供重复嵌入避免二次下载）。
+/// ID3v2 主标签用**原生 AttachedPictureFrame 且描述 Latin1 编码（enc=0）**——Windows
+/// 资源管理器对 UTF-16 编码的 APIC 支持差（会显示“无封面”），官方网易文件也是 enc=0。
+/// 非 ID3v2（flac/ogg/m4a 等）走通用 Tag（对应格式无此兼容问题）。
 fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if bytes.len() < 1024 {
         anyhow::bail!("album art too small ({} bytes)", bytes.len());
@@ -74,11 +84,26 @@ fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     let mut tagged_file = Probe::open(path)
         .with_context(|| format!("cannot open tag of {}", path.display()))?
         .read()?;
+
+    if tagged_file.primary_tag_type() == TagType::Id3v2 {
+        use lofty::id3::v2::{AttachedPictureFrame, Frame, Id3v2Tag};
+        use lofty::TextEncoding;
+        if let Some(generic) = tagged_file.primary_tag().cloned() {
+            let mut id3: Id3v2Tag = generic.into();
+            id3.remove_picture_type(PictureType::CoverFront);
+            let frame = AttachedPictureFrame::new(TextEncoding::Latin1, picture);
+            id3.insert(Frame::Picture(frame));
+            id3.save_to_path(path, v23_write_options())?;
+            return Ok(());
+        }
+    }
+
+    // 非 ID3v2（flac/ogg/m4a）：通用 Tag 写入（无编码兼容问题）。
     let Some(tag) = tagged_file.primary_tag_mut() else {
         anyhow::bail!("file has no primary tag");
     };
     tag.set_picture(0, picture);
-    tag.save_to_path(path, WriteOptions::default())?;
+    tag.save_to_path(path, v23_write_options())?;
     Ok(())
 }
 
@@ -94,7 +119,7 @@ pub fn write_embedded_lyrics(path: &Path, lrc_text: &str) -> Result<()> {
     // 覆盖旧值，避免重复嵌入累积。
     tag.remove_key(&ItemKey::Lyrics);
     tag.insert_text(ItemKey::Lyrics, lrc_text.to_owned());
-    tag.save_to_path(path, WriteOptions::default())?;
+    tag.save_to_path(path, v23_write_options())?;
     Ok(())
 }
 
@@ -126,7 +151,7 @@ pub fn write_netease_key(path: &Path, key_text: &str) -> Result<()> {
                 key_text.to_owned(),
             );
             id3.insert(Frame::Comment(frame));
-            id3.save_to_path(path, WriteOptions::default())?;
+            id3.save_to_path(path, v23_write_options())?;
             return Ok(());
         }
     }
@@ -141,7 +166,7 @@ pub fn write_netease_key(path: &Path, key_text: &str) -> Result<()> {
             }
         }
         tag.insert_text(ItemKey::Comment, key_text.to_owned());
-        tag.save_to_path(path, WriteOptions::default())?;
+        tag.save_to_path(path, v23_write_options())?;
     }
     Ok(())
 }
@@ -308,5 +333,79 @@ mod tests {
             .map(|item| item.value().text().unwrap_or_default())
             .unwrap_or_default();
         assert!(stored.contains("第一行歌词"), "lyrics not read back");
+    }
+
+    #[test]
+    fn writes_id3v23_header_for_windows_compatibility() {
+        // 关键兼容性约束：Windows 资源管理器/多数播放器不认 ID3v2.4 的 APIC，
+        // 新写标签必须落成 v2.3（与网易官方下载一致），否则封面“看不见”。
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        if !src.exists() {
+            eprintln!("skip: source mp3 not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("test.mp3");
+        fs::copy(src, &copy).unwrap();
+        let track = crate::api::Track {
+            id: 1303019637,
+            name: "说书人".into(),
+            ar: vec![crate::api::Artist {
+                name: "暗杠".into(),
+            }],
+            al: crate::api::Album {
+                id: 0,
+                name: String::new(),
+                pic_url: None,
+            },
+            dt: 0,
+            no: 1,
+        };
+        write_basic_tags(&copy, &track, 1, "、").unwrap();
+        write_embedded_lyrics(&copy, "[00:01.00]行\n").unwrap();
+
+        let fd = fs::read(&copy).unwrap();
+        assert_eq!(&fd[..3], b"ID3");
+        assert_eq!(fd[3], 3, "ID3 major version must be 3 (v2.3)");
+    }
+
+    #[test]
+    fn writes_cover_and_track_frames_are_preserved_through_sequence() {
+        // 下载后的完整写标签序列（歌词→基础标签→163key→封面）不得丢失 TRCK/APIC。
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        if !src.exists() {
+            eprintln!("skip: source mp3 not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("t.mp3");
+        fs::copy(src, &copy).unwrap();
+        let track = crate::api::Track {
+            id: 1303019637,
+            name: "说书人".into(),
+            ar: vec![crate::api::Artist {
+                name: "暗杠".into(),
+            }],
+            al: crate::api::Album {
+                id: 0,
+                name: String::new(),
+                pic_url: None,
+            },
+            dt: 0,
+            no: 1,
+        };
+        write_basic_tags(&copy, &track, 1, "、").unwrap();
+        write_embedded_lyrics(&copy, "[00:01.00]行\n").unwrap();
+        write_netease_key(&copy, "163 key(Don't modify):dummy").unwrap();
+        write_basic_tags(&copy, &track, 1, "、").unwrap();
+
+        // 用 lofty 读回：TRCK 与已写帧必须完整保留。
+        let tagged = lofty::probe::Probe::open(&copy).unwrap().read().unwrap();
+        let tag = tagged.primary_tag().unwrap();
+        let track_no = tag
+            .get(&lofty::tag::ItemKey::TrackNumber)
+            .map(|item| item.value().text().unwrap_or_default().to_owned())
+            .unwrap_or_default();
+        assert_eq!(track_no, "1", "TRCK must survive the tag sequence");
     }
 }

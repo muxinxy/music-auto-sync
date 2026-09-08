@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "music-auto-sync"
-version = "0.8.7"
+version = "0.8.8"
 dependencies = [
  "aes",
  "anyhow",

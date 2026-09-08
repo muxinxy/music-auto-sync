@@ -4,6 +4,13 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.8] - 2026-09-08
+
+### Fixed
+
+- Downloaded songs showed no cover art in Windows Explorer: the APIC frame description was written as UTF-16, which Explorer handles poorly; it is now written as Latin1 (matching official NetEase files) so covers display correctly.
+- Newly written MP3 tags now use ID3v2.3 (matching official NetEase downloads); fresh downloads previously defaulted to v2.4, which Explorer also handles poorly for APIC.
+
 ## [0.8.7] - 2026-09-08
 
 ### Fixed
