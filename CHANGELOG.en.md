@@ -4,6 +4,16 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.8.7] - 2026-09-08
+
+### Fixed
+
+- Downloaded songs could end up without cover art: the cover embed previously ran as a background task concurrently with the "163 key" tag write, and the two writers racing on the same file could overwrite each other (missing covers). Cover embedding now runs strictly after the 163 key write. Already-downloaded files are not backfilled automatically — re-download them (or enable quality auto-upgrade) to add covers.
+
+### Changed
+
+- "Auto-upgrade quality" now works for any target tier, not just lossless: when a local file's actual bitrate (read from the file) is below the configured target, sync re-downloads a higher-quality copy (e.g. 128k→320k, 192k→320k, mp3→lossless). When the account tier or copyright limits mean NetEase cannot serve a higher tier (preflight available level below target), it does not repeatedly re-download the same file.
+
 ## [0.8.6] - 2026-09-07
 
 ### Added

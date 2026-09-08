@@ -522,20 +522,93 @@ fn is_transient_download_error(error: &anyhow::Error) -> bool {
     }
 }
 
-/// 判定该音质目标是否值得替换已有的有损文件。
-/// 仅当目标为无损（hires/lossless）且本地为有损（mp3/m4a/ogg/aac）时返回 true；
-/// exhigh/higher/standard 目标保持“已有即满足”，避免无谓的重下。
-/// `upgrade_quality` 总开关关闭时恒为 false。
-fn needs_lossless_upgrade(upgrade_quality: bool, quality: &str, existing_ext: &str) -> bool {
+/// 音质等级（数值越大越高）。网易实际档位：standard/higher/exhigh/lossless/hires。
+fn quality_rank(quality: &str) -> Option<u8> {
+    match quality {
+        "hires" => Some(4),
+        "lossless" => Some(3),
+        "exhigh" => Some(2),
+        "higher" => Some(1),
+        "standard" => Some(0),
+        _ => None,
+    }
+}
+
+/// 有损码率映射等级：与网易档位对齐（320k≈exhigh、192k≈higher、128k≈standard）。
+/// VBR 高码率可能落在 240~320 之间，故 exhigh 阈值取 250 而非 320，避免误判需升级。
+/// 读取不到码率时返回 None（由调用方保守处理）。
+fn kbps_to_rank(kbps: Option<u32>) -> Option<u8> {
+    let kbps = kbps?;
+    if kbps >= 250 {
+        Some(2)
+    } else if kbps >= 160 {
+        Some(1)
+    } else {
+        Some(0)
+    }
+}
+
+/// 读取本地音频“等级”：无损容器（flac/wav）视为最高（hires 级可满足一切目标）；
+/// 有损按实际码率映射。读取失败返回 None（表示无法判定，调用方按“不升级”处理）。
+fn local_file_quality_rank(path: &Path) -> Option<u8> {
+    let ext = path
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "flac" | "wav") {
+        return Some(4);
+    }
+    if !matches!(ext.as_str(), "mp3" | "m4a" | "ogg" | "aac") {
+        return None; // 不认识的格式不动它。
+    }
+    let tagged = lofty::probe::Probe::open(path).ok()?.read().ok()?;
+    use lofty::file::AudioFile;
+    let bitrate = tagged.properties().overall_bitrate();
+    kbps_to_rank(bitrate)
+}
+
+/// 判定是否值得把本地文件升级到目标音质。
+/// - 开关关 / 目标无等级（如标准或未知值）→ false；
+/// - 账号可用上限（预检 download_level）低于目标 → false（网易给不了，避免每轮重下）；
+/// - 本地等级达到目标 → false；
+/// - 其余（本地明显低于目标且服务器可达）→ true。
+/// 生产/单测共用决策：本地等级低于目标、服务器可达且开关开启时才升级。
+fn should_upgrade(
+    upgrade_quality: bool,
+    target_quality: &str,
+    available_level: Option<&str>,
+    local_rank: Option<u8>,
+) -> bool {
     if !upgrade_quality {
         return false;
     }
-    let lossless_target = matches!(quality, "hires" | "lossless");
-    let existing_lossy = matches!(
-        existing_ext.to_ascii_lowercase().as_str(),
-        "mp3" | "m4a" | "ogg" | "aac"
-    );
-    lossless_target && existing_lossy
+    let Some(target) = quality_rank(target_quality) else {
+        return false;
+    };
+    // 目标“标准”是最低档，不存在更低的可升级对象。
+    if target == 0 {
+        return false;
+    }
+    // 预检说账号对这首歌最多只能到某级：目标更高则网易给不了，别白下载。
+    if let Some(level) = available_level {
+        if let Some(available) = quality_rank(level) {
+            if available < target {
+                return false;
+            }
+        }
+    }
+    local_rank.is_some_and(|local| local < target)
+}
+
+fn needs_quality_upgrade(
+    upgrade_quality: bool,
+    target_quality: &str,
+    available_level: Option<&str>,
+    existing_path: &Path,
+) -> bool {
+    let local_rank = local_file_quality_rank(existing_path);
+    should_upgrade(upgrade_quality, target_quality, available_level, local_rank)
 }
 
 async fn fetch_download_url_for_track(
@@ -891,18 +964,21 @@ async fn sync_one_track_worker(
             .optional()
             .unwrap_or(None);
         if let Some(path) = known_path.as_deref().filter(|p| Path::new(p).is_file()) {
-            // 音质升级：目标是无损、已登记文件却是有损（mp3 等）→ 不跳过，重新下载替换。
-            let existing_ext = Path::new(path)
-                .extension()
-                .and_then(|x| x.to_str())
-                .unwrap_or("mp3");
-            if !needs_lossless_upgrade(config.upgrade_quality, quality, existing_ext) {
+            // 音质升级：本地等级低于目标（且网易可达）→ 不跳过，重新下载替换。
+            let existing = Path::new(path);
+            let avail_level = availability.as_ref().and_then(|a| a.download_level.as_deref());
+            if !needs_quality_upgrade(
+                config.upgrade_quality,
+                quality,
+                avail_level,
+                existing,
+            ) {
                 let _ = update_snapshot(&conn, playlist.id, track.id, position - 1);
                 log_entry.outcome("skipped", &UiMessage::new("trackExists"));
                 let _ = store::track_log::append(logs_dir, &log_entry);
                 return TrackOutcome::Skipped;
             }
-            // 走到这里 = 判定需要升级：记录旧有损文件，下载成功后删除避免残留。
+            // 走到这里 = 判定需要升级：记录旧文件，下载成功后删除避免残留。
             legacy_lossy_path = known_path;
         }
     }
@@ -936,16 +1012,10 @@ async fn sync_one_track_worker(
         artist_separator,
     );
 
-    // 目标模板文件已存在且有损、目标为无损 → 本次升级重下（先删旧文件防残留同名）。
+    // 目标模板文件已存在但音质低于目标（且网易可达）→ 升级重下（download 会覆盖旧文件）。
+    let avail_level = availability.as_ref().and_then(|a| a.download_level.as_deref());
     let upgrading = target.is_file()
-        && needs_lossless_upgrade(
-            config.upgrade_quality,
-            quality,
-            target
-                .extension()
-                .and_then(|x| x.to_str())
-                .unwrap_or("mp3"),
-        );
+        && needs_quality_upgrade(config.upgrade_quality, quality, avail_level, &target);
 
     if !overwrite && !upgrading && target.is_file() {
         // 本地已存在按当前模板命名的文件：登记为已同步并跳过下载，避免覆盖用户文件。
@@ -1011,22 +1081,21 @@ async fn sync_one_track_worker(
             {
                 tracing::warn!(%error, path = %target.display(), "metadata write failed");
             }
-            // 写入专辑封面（ID3 APIC / Vorbis picture）。异步拉图：失败只记日志不阻塞下载。
-            if config.embed_cover {
-                if let Some(pic_url) = track.al.pic_url.as_deref() {
-                    let target = target.to_path_buf();
-                    let pic_url = pic_url.to_owned();
-                    tauri::async_runtime::spawn(async move {
-                        if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
-                            tracing::warn!(%error, path = %target.display(), "album cover write failed");
-                        }
-                    });
-                }
-            }
             // 写入官方格式 163 key（含 musicId），供后续精确匹配；失败仅告警。
             if let Err(error) = write_official_key_after_download(api, &target, track, &extension).await
             {
                 tracing::warn!(%error, path = %target.display(), "163 key write failed");
+            }
+            // 写入专辑封面（ID3 APIC / Vorbis picture）。顺序 await：多个 lofty 写操作
+            // 并发改同一文件会互相覆盖（曾出现封面/163 key 竞态丢失），故排在 163 key 之后。
+            if config.embed_cover {
+                if let Some(pic_url) = track.al.pic_url.as_deref() {
+                    if let Err(error) =
+                        tags::write_album_cover(&target, pic_url).await
+                    {
+                        tracing::warn!(%error, path = %target.display(), "album cover write failed");
+                    }
+                }
             }
             // 歌词只拉取一次：按设置写入 .lrc 旁车和/或嵌入文件标签（USLT/Vorbis LYRICS）。
             if config.write_lrc || config.embed_lyrics {
@@ -1263,13 +1332,9 @@ pub async fn download_song_with_options(
     // 单曲下载也嵌入专辑封面（自定义目录路径不进 finalize_track，这里统一处理）。
     if config.embed_cover {
         if let Some(pic_url) = track.al.pic_url.as_deref() {
-            let target = target.to_path_buf();
-            let pic_url = pic_url.to_owned();
-            tauri::async_runtime::spawn(async move {
-                if let Err(error) = tags::write_album_cover(&target, &pic_url).await {
-                    tracing::warn!(%error, path = %target.display(), "album cover write failed");
-                }
-            });
+            if let Err(error) = tags::write_album_cover(&target, pic_url).await {
+                tracing::warn!(%error, path = %target.display(), "album cover write failed");
+            }
         }
     }
     Ok(target.to_string_lossy().into_owned())
@@ -2194,17 +2259,46 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lossless_upgrade_requires_switch_and_lossless_target() {
+    fn quality_rank_maps_all_tiers() {
+        assert_eq!(quality_rank("standard"), Some(0));
+        assert_eq!(quality_rank("higher"), Some(1));
+        assert_eq!(quality_rank("exhigh"), Some(2));
+        assert_eq!(quality_rank("lossless"), Some(3));
+        assert_eq!(quality_rank("hires"), Some(4));
+        assert_eq!(quality_rank("unknown"), None);
+    }
+
+    #[test]
+    fn kbps_to_rank_maps_bitrates() {
+        assert_eq!(kbps_to_rank(Some(320)), Some(2));
+        assert_eq!(kbps_to_rank(Some(256)), Some(2));
+        assert_eq!(kbps_to_rank(Some(192)), Some(1));
+        assert_eq!(kbps_to_rank(Some(160)), Some(1));
+        assert_eq!(kbps_to_rank(Some(128)), Some(0));
+        assert_eq!(kbps_to_rank(Some(96)), Some(0));
+        assert_eq!(kbps_to_rank(None), None);
+    }
+
+    #[test]
+    fn upgrade_matrix_gates_by_switch_target_and_availability() {
         // 开关关 → 永不升级。
-        assert!(!needs_lossless_upgrade(false, "lossless", "mp3"));
-        // 开关开 + 目标无损 + 现存有损 → 升级。
-        assert!(needs_lossless_upgrade(true, "lossless", "mp3"));
-        assert!(needs_lossless_upgrade(true, "hires", "m4a"));
-        // 目标无损但本地已是无损 → 无需（flac 已满足）。
-        assert!(!needs_lossless_upgrade(true, "lossless", "flac"));
-        assert!(!needs_lossless_upgrade(true, "hires", "wav"));
-        // 有损目标（exhigh 等）不自动替换，避免无谓重下。
-        assert!(!needs_lossless_upgrade(true, "exhigh", "mp3"));
-        assert!(!needs_lossless_upgrade(true, "standard", "mp3"));
+        assert!(!should_upgrade(false, "lossless", None, Some(0)));
+        // 目标 standard 是底线 → 不升级。
+        assert!(!should_upgrade(true, "standard", None, Some(0)));
+        // 目标高于本地（任何有损目标都可升级）→ 升级。
+        assert!(should_upgrade(true, "exhigh", None, Some(0))); // 128k → 320k
+        assert!(should_upgrade(true, "exhigh", None, Some(1))); // 192k → 320k
+        assert!(should_upgrade(true, "lossless", None, Some(2))); // 320k mp3 → flac
+        assert!(should_upgrade(true, "hires", None, Some(3))); // flac → hires
+        // 本地已达目标 → 不升级。
+        assert!(!should_upgrade(true, "exhigh", None, Some(2)));
+        assert!(!should_upgrade(true, "lossless", None, Some(4))); // 已是无损
+        // 账号可用上限低于目标（网易给不了）→ 不升级，防每轮重下。
+        assert!(!should_upgrade(true, "lossless", Some("exhigh"), Some(0)));
+        assert!(!should_upgrade(true, "hires", Some("lossless"), Some(2)));
+        // 可用上限达到目标 → 放行。
+        assert!(should_upgrade(true, "lossless", Some("lossless"), Some(2)));
+        // 未知本地等级（读不出码率）→ 保守不升级。
+        assert!(!should_upgrade(true, "exhigh", None, None));
     }
 }
