@@ -11,10 +11,40 @@ use std::path::Path;
 use crate::{api::Track, core::naming::artists_with};
 
 /// 写选项：新写的 ID3v2 一律用 **v2.3**（与网易官方下载一致）。Windows 资源管理器
-/// 对 ID3v2.4 的 APIC 支持差，会显示“无封面”；v2.3 兼容性最好。非 ID3v2 标签
+/// 对 ID3v2.4 的 APIC 支持差，会显示"无封面"；v2.3 兼容性最好。非 ID3v2 标签
 /// （Vorbis/MP4）会忽略该选项，不受影响。
 fn v23_write_options() -> WriteOptions {
     WriteOptions::new().use_id3v23(true)
+}
+
+/// 通用 `Tag` 与 `Id3v2Tag` 互转会丢掉帧级编码信息：图片帧被写成 UTF-16（enc=1）、
+/// 163 key 备注被写成 UTF-8（enc=3）——Windows 资源管理器对二者都不解析，
+/// 表现为"无封面 / 备注为空"。保存前统一重建为官方格式（enc=0 + lang XXX + 空描述）。
+fn reassert_official_frame_encodings(id3: &mut lofty::id3::v2::Id3v2Tag) {
+    use lofty::id3::v2::Frame;
+    use lofty::tag::items::UNKNOWN_LANGUAGE;
+    use lofty::TextEncoding;
+
+    let frames: Vec<Frame<'static>> = std::mem::take(id3)
+        .into_iter()
+        .map(|frame| match frame {
+            Frame::Picture(mut pic) => {
+                pic.encoding = TextEncoding::Latin1;
+                Frame::Picture(pic)
+            }
+            Frame::Comment(mut comment) => {
+                // 本应用写入的备注只有官方 163 key，按官方格式恢复。
+                comment.encoding = TextEncoding::Latin1;
+                comment.language = UNKNOWN_LANGUAGE;
+                comment.description = String::new();
+                Frame::Comment(comment)
+            }
+            other => other,
+        })
+        .collect();
+    for frame in frames {
+        id3.insert(frame);
+    }
 }
 
 pub fn write_basic_tags(
@@ -24,15 +54,21 @@ pub fn write_basic_tags(
     artist_separator: &str,
 ) -> Result<()> {
     let artist = artists_with(track, artist_separator);
-    let mut tagged_file = Probe::open(path)?.read()?;
+    let tagged_file = Probe::open(path)?.read()?;
     let tag_type = tagged_file.primary_tag_type();
-    if let Some(tag) = tagged_file.primary_tag_mut() {
-        tag.set_title(track.name.clone());
-        tag.set_artist(artist.clone());
-        tag.set_album(track.al.name.clone());
-        tag.set_track(position as u32);
+    if let Some(generic) = tagged_file.primary_tag().cloned() {
+        // 走 Id3v2Tag 专用路径：通用 Tag 保存会丢帧级编码（见 reassert_official_frame_encodings）。
+        let mut id3: lofty::id3::v2::Id3v2Tag = generic.into();
+        id3.set_title(track.name.clone());
+        id3.set_artist(artist.clone());
+        id3.set_album(track.al.name.clone());
+        // position=0 表示无曲目序号（NCM 转换产物），不写 TRCK。
+        if position > 0 {
+            id3.set_track(position as u32);
+        }
         // 不再写纯文本 netease-id；网易 id 以官方 163 key 形式写入（见 write_netease_key）。
-        tag.save_to_path(path, v23_write_options())?;
+        reassert_official_frame_encodings(&mut id3);
+        id3.save_to_path(path, v23_write_options())?;
     } else {
         let mut tag = lofty::tag::Tag::new(if tag_type == TagType::Id3v2 {
             tag_type
@@ -42,7 +78,9 @@ pub fn write_basic_tags(
         tag.set_title(track.name.clone());
         tag.set_artist(artist);
         tag.set_album(track.al.name.clone());
-        tag.set_track(position as u32);
+        if position > 0 {
+            tag.set_track(position as u32);
+        }
         tag.save_to_path(path, v23_write_options())?;
     }
     Ok(())
@@ -73,9 +111,9 @@ pub async fn write_album_cover(path: &Path, pic_url: &str) -> Result<()> {
 
 /// 已持有封面字节时同步嵌入（供重复嵌入避免二次下载）。
 /// ID3v2 主标签用**原生 AttachedPictureFrame 且描述 Latin1 编码（enc=0）**——Windows
-/// 资源管理器对 UTF-16 编码的 APIC 支持差（会显示“无封面”），官方网易文件也是 enc=0。
+/// 资源管理器对 UTF-16 编码的 APIC 支持差（会显示"无封面"），官方网易文件也是 enc=0。
 /// 非 ID3v2（flac/ogg/m4a 等）走通用 Tag（对应格式无此兼容问题）。
-fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
+pub(crate) fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if bytes.len() < 1024 {
         anyhow::bail!("album art too small ({} bytes)", bytes.len());
     }
@@ -90,7 +128,14 @@ fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
         use lofty::TextEncoding;
         if let Some(generic) = tagged_file.primary_tag().cloned() {
             let mut id3: Id3v2Tag = generic.into();
-            id3.remove_picture_type(PictureType::CoverFront);
+            // 清掉全部旧图片帧（不同 PictureType 的旧封面会残留），再写入新封面。
+            let kept: Vec<Frame<'static>> = std::mem::take(&mut id3)
+                .into_iter()
+                .filter(|frame| !matches!(frame, Frame::Picture(_)))
+                .collect();
+            for frame in kept {
+                id3.insert(frame);
+            }
             let frame = AttachedPictureFrame::new(TextEncoding::Latin1, picture);
             id3.insert(Frame::Picture(frame));
             id3.save_to_path(path, v23_write_options())?;
@@ -107,12 +152,41 @@ fn embed_cover_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 把歌词嵌入文件主标签（通用 Tag 写入：ID3v2 → USLT 帧、Vorbis/FLAC → LYRICS 字段，
+/// 把歌词嵌入文件主标签（ID3v2 → USLT 帧、Vorbis/FLAC → LYRICS 字段，
 /// lofty 按主标签类型自动映射）。`lrc_text` 为网易 .lrc 原文（可含时间戳行，播放器整段显示）。
 pub fn write_embedded_lyrics(path: &Path, lrc_text: &str) -> Result<()> {
     let mut tagged_file = Probe::open(path)
         .with_context(|| format!("cannot open tag of {}", path.display()))?
         .read()?;
+
+    // ID3v2 专用路径：通用 Tag 保存会丢帧级编码，把既有封面/163 key 写坏（见 reassert）。
+    if tagged_file.primary_tag_type() == TagType::Id3v2 {
+        use lofty::id3::v2::{Frame, Id3v2Tag, UnsynchronizedTextFrame};
+        use lofty::tag::items::UNKNOWN_LANGUAGE;
+        use lofty::TextEncoding;
+        if let Some(generic) = tagged_file.primary_tag().cloned() {
+            let mut id3: Id3v2Tag = generic.into();
+            // 通用转换已把旧 Lyrics 变成 USLT 帧，全部移除防叠加，再写新歌词。
+            let kept: Vec<Frame<'static>> = std::mem::take(&mut id3)
+                .into_iter()
+                .filter(|frame| !matches!(frame, Frame::UnsynchronizedText(_)))
+                .collect();
+            for frame in kept {
+                id3.insert(frame);
+            }
+            let frame = UnsynchronizedTextFrame::new(
+                TextEncoding::UTF16,
+                UNKNOWN_LANGUAGE,
+                String::new(),
+                lrc_text.to_owned(),
+            );
+            id3.insert(Frame::UnsynchronizedText(frame));
+            reassert_official_frame_encodings(&mut id3);
+            id3.save_to_path(path, v23_write_options())?;
+            return Ok(());
+        }
+    }
+
     let Some(tag) = tagged_file.primary_tag_mut() else {
         anyhow::bail!("file has no primary tag");
     };
@@ -151,6 +225,8 @@ pub fn write_netease_key(path: &Path, key_text: &str) -> Result<()> {
                 key_text.to_owned(),
             );
             id3.insert(Frame::Comment(frame));
+            // 转换过程可能把既有封面/备注写成 UTF-16/UTF-8，统一恢复官方格式。
+            reassert_official_frame_encodings(&mut id3);
             id3.save_to_path(path, v23_write_options())?;
             return Ok(());
         }
@@ -180,7 +256,7 @@ mod tests {
     #[test]
     fn writes_latin1_comment_frame_like_official() {
         // 用真实 mp3 副本验证（文件存在才跑，避免 CI 无此路径失败）。
-        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\书影视音乐\毛不易 - 不染.mp3");
         if !src.exists() {
             eprintln!("skip: source mp3 not present");
             return;
@@ -216,10 +292,10 @@ mod tests {
         let mut found = false;
         while off + 10 <= 10 + sz {
             let id = std::str::from_utf8(&mb[off..off + 4]).unwrap_or("");
-            let fsize = ((mb[off + 4] as usize & 0x7f) << 21)
-                | ((mb[off + 5] as usize & 0x7f) << 14)
-                | ((mb[off + 6] as usize & 0x7f) << 7)
-                | (mb[off + 7] as usize & 0x7f);
+            let fsize = ((mb[off + 4] as usize) << 24)
+                | ((mb[off + 5] as usize) << 16)
+                | ((mb[off + 6] as usize) << 8)
+                | mb[off + 7] as usize;
             if id == "COMM" {
                 let raw = &mb[off + 10..off + 10 + fsize];
                 assert_eq!(raw[0], 0, "COMM encoding should be Latin1(0)");
@@ -240,7 +316,7 @@ mod tests {
     #[tokio::test]
     async fn embeds_real_album_cover_from_network() {
         // 用真实 mp3 副本 + 网络拉一张真实封面验证（任一缺失即跳过）。
-        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\书影视音乐\毛不易 - 不染.mp3");
         if !src.exists() {
             eprintln!("skip: source mp3 not present");
             return;
@@ -313,7 +389,7 @@ mod tests {
     #[test]
     fn embeds_and_reads_back_lyrics_on_real_mp3() {
         // 用真实 mp3 副本验证歌词可嵌入并被读回（文件缺失即跳过）。
-        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\书影视音乐\毛不易 - 不染.mp3");
         if !src.exists() {
             eprintln!("skip: source mp3 not present");
             return;
@@ -335,11 +411,80 @@ mod tests {
         assert!(stored.contains("第一行歌词"), "lyrics not read back");
     }
 
+    /// 回归：先写封面（Latin1 APIC + 163 key 备注），再嵌歌词——通用 Tag 保存
+    /// 会把帧级编码重置为 UTF-16/UTF-8，资源管理器随即"无封面/无备注"。
+    /// 所有 ID3v2 写路径保存前必须恢复官方编码。
+    #[test]
+    fn lyrics_write_keeps_apic_and_comment_latin1() {
+        // 用真实 mp3 副本验证（文件缺失即跳过）。
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\书影视音乐\毛不易 - 不染.mp3");
+        if !src.exists() {
+            eprintln!("skip: source mp3 not present");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let copy = dir.path().join("t.mp3");
+        fs::copy(src, &copy).unwrap();
+
+
+        // 内置 1x1 合法 JPEG 作为嵌入素材（避免依赖源文件封面）。
+        use base64::Engine as _;
+        let mut cover = base64::engine::general_purpose::STANDARD            .decode(
+                "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwcJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAABAAEDASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwD3+iiigD//2Q==",
+            )
+            .unwrap();
+        // 尾部补零越过 1024 字节最小体积校验（JPEG 解码忽略 EOI 后的数据）。
+        cover.extend(std::iter::repeat(0u8).take(2048 - cover.len()));
+        // 与真实下载流程同序：基础标签 → 封面 → 163 key → 歌词。
+        write_basic_tags(
+            &copy,
+            &crate::api::Track {
+                id: 1303019637,
+                name: "说书人".into(),
+                ar: vec![crate::api::Artist { name: "暗杠".into() }],
+                al: Default::default(),
+                dt: 0,
+                no: 1,
+            },
+            1,
+            "、",
+        )
+        .unwrap();
+        embed_cover_bytes(&copy, &cover).unwrap();
+
+        // 封面先落盘（enc=0），随后写 163 key 与歌词；歌词写入不得破坏既有编码。
+        write_netease_key(&copy, "163 key(Don't modify):dummy").unwrap();
+        write_embedded_lyrics(&copy, "[00:01.00]行\n").unwrap();
+
+        // 逐帧解析：APIC 与 COMM 的 enc 都必须仍是 0。
+        let fd = fs::read(&copy).unwrap();
+        let sz = ((fd[6] as usize) << 21) | ((fd[7] as usize) << 14) | ((fd[8] as usize) << 7) | fd[9] as usize;
+        let mut off = 10usize;
+        let mut apic_enc: Option<u8> = None;
+        let mut comm_enc: Option<u8> = None;
+        while off + 10 <= 10 + sz {
+            let id = std::str::from_utf8(&fd[off..off + 4]).unwrap_or("");
+            let fsize = ((fd[off + 4] as usize) << 24)
+                | ((fd[off + 5] as usize) << 16)
+                | ((fd[off + 6] as usize) << 8)
+                | fd[off + 7] as usize;
+            if id == "APIC" {
+                apic_enc = Some(fd[off + 10]);
+            }
+            if id == "COMM" {
+                comm_enc = Some(fd[off + 10]);
+            }
+            off += 10 + fsize;
+        }
+        assert_eq!(apic_enc, Some(0), "APIC must stay Latin1 after lyrics write");
+        assert_eq!(comm_enc, Some(0), "COMM must stay Latin1 after lyrics write");
+    }
+
     #[test]
     fn writes_id3v23_header_for_windows_compatibility() {
         // 关键兼容性约束：Windows 资源管理器/多数播放器不认 ID3v2.4 的 APIC，
-        // 新写标签必须落成 v2.3（与网易官方下载一致），否则封面“看不见”。
-        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        // 新写标签必须落成 v2.3（与网易官方下载一致），否则封面"看不见"。
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\书影视音乐\毛不易 - 不染.mp3");
         if !src.exists() {
             eprintln!("skip: source mp3 not present");
             return;
@@ -372,7 +517,7 @@ mod tests {
     #[test]
     fn writes_cover_and_track_frames_are_preserved_through_sequence() {
         // 下载后的完整写标签序列（歌词→基础标签→163key→封面）不得丢失 TRCK/APIC。
-        let src = Path::new(r"D:\Drive\Music\网易云歌单\古风戏腔\暗杠、寅子 - 说书人.mp3");
+        let src = Path::new(r"D:\Drive\Music\网易云歌单\书影视音乐\毛不易 - 不染.mp3");
         if !src.exists() {
             eprintln!("skip: source mp3 not present");
             return;

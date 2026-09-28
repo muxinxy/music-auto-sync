@@ -8,6 +8,7 @@ import {
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTranslation } from "react-i18next";
 import { api } from "../api";
+import appIcon from "../assets/app-icon.png";
 import type { AppInfo } from "../types";
 
 const REPO_URL = "https://github.com/muxinxy/music-auto-sync";
@@ -27,18 +28,21 @@ export default function AboutPage() {
   };
 
   return (
-    <div style={{ maxWidth: 640, padding: 8 }}>
+    <div style={{ maxWidth: 720, margin: "0 auto", padding: 24 }}>
       <Card size="small" style={{ marginBottom: 16 }}>
-        <Space direction="vertical" size={4}>
+        <Space direction="vertical" size={6} style={{ width: "100%", textAlign: "center" }}>
+          <img
+            src={appIcon}
+            alt={t("app.brand")}
+            width={72}
+            height={72}
+            style={{ display: "block", margin: "8px auto 0" }}
+          />
           <Typography.Title level={4} style={{ marginBottom: 0 }}>
             {t("app.brand")}
           </Typography.Title>
-          <Typography.Text type="secondary">
-            {t("about.tagline")}
-          </Typography.Text>
-          <Typography.Text>
-            {t("about.version", { version: info?.version ?? "-" })}
-          </Typography.Text>
+          <Typography.Text type="secondary">{t("about.tagline")}</Typography.Text>
+          <Typography.Text>{t("about.version", { version: info?.version ?? "-" })}</Typography.Text>
         </Space>
       </Card>
 

@@ -9,5 +9,9 @@ export function taskDisplayName(name: string | null | undefined): string {
   if (!name) return "";
   if (name === "cloud") return i18n.t("cloud.taskName");
   if (name === "cloud_download") return i18n.t("cloud.taskNameDownload");
+  if (name === "repair") return i18n.t("tools.taskName");
+  if (name === "ncm_convert") return i18n.t("tools.taskNameNcm");
+  if (name === "cleanup_scan") return i18n.t("tools.taskNameScan");
+  if (name === "cleanup") return i18n.t("tools.taskNameCleanup");
   return name;
 }

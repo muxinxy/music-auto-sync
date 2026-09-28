@@ -50,6 +50,9 @@ import type {
   UiMessage,
 } from "../types";
 import type { SyncEventState } from "../App";
+import { listPagination, tablePagination } from "../listConfig";
+import { loadFilters, saveFilters } from "../filterMemory";
+import SearchWithHistory from "../SearchWithHistory";
 
 interface Props {
   login: LoginStatus | null;
@@ -98,8 +101,12 @@ export default function PlaylistsPage({ login, sync }: Props) {
   const { t } = useTranslation();
   const [playlists, setPlaylists] = useState<PlaylistInfo[]>([]);
   const [loading, setLoading] = useState(false);
-  const [filter, setFilter] = useState("");
-  const [group, setGroup] = useState<"all" | "created" | "subscribed">("all");
+  const savedPlaylistFilters = loadFilters("filters.playlists", {
+    filter: "",
+    group: "all" as "all" | "created" | "subscribed",
+  });
+  const [filter, setFilter] = useState(savedPlaylistFilters.filter);
+  const [group, setGroup] = useState<"all" | "created" | "subscribed">(savedPlaylistFilters.group);
   const [detailId, setDetailId] = useState<number | null>(null);
   const [songs, setSongs] = useState<PlaylistSongsResult | null>(null);
   const [songsLoading, setSongsLoading] = useState(false);
@@ -129,6 +136,10 @@ export default function PlaylistsPage({ login, sync }: Props) {
   const dlPauseRef = useRef(false);
   const dlCancelRef = useRef(false);
   const [dlPaused, setDlPaused] = useState(false);
+
+  useEffect(() => {
+    saveFilters("filters.playlists", { filter, group });
+  }, [filter, group]);
 
   const load = useCallback(
     async (force = false) => {
@@ -634,12 +645,13 @@ export default function PlaylistsPage({ login, sync }: Props) {
                 }}
               />
             </Space>
-            <Input.Search
-              placeholder={t("playlists.searchPlaceholder")}
-              allowClear
-              style={{ width: 220 }}
+            <SearchWithHistory
+              storageKey="search.playlists"
+              value={filter}
+              onChange={setFilter}
               onSearch={setFilter}
-              onChange={(e) => !e.target.value && setFilter("")}
+              placeholder={t("playlists.searchPlaceholder")}
+              style={{ width: 240 }}
             />
             <Segmented
               value={group}
@@ -650,6 +662,15 @@ export default function PlaylistsPage({ login, sync }: Props) {
                 { value: "subscribed", label: t("playlists.groupSubscribed") },
               ]}
             />
+            <Button
+              size="small"
+              onClick={() => {
+                setFilter("");
+                setGroup("all");
+              }}
+            >
+              {t("filters.clear")}
+            </Button>
             <Typography.Text type="secondary">
               {t("playlists.countHint", { count: shown.length })}
             </Typography.Text>
@@ -731,7 +752,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
         <List
           loading={loading}
           dataSource={shown}
-          pagination={{ pageSize: 15, showSizeChanger: true, pageSizeOptions: [15, 30, 60], showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}` }}
+          pagination={listPagination}
           renderItem={(p) => {
             const percent = p.trackCount ? Math.round((p.synced / p.trackCount) * 100) : 0;
             const lastResult = displayLastResult(p.lastResult);
@@ -931,7 +952,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
             selectedRowKeys: selectedSongs,
             onChange: (keys) => setSelectedSongs(keys as number[]),
           }}
-          pagination={{ pageSize: 50, showSizeChanger: false }}
+          pagination={tablePagination}
         />
       </Drawer>
 

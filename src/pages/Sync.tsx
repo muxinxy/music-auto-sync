@@ -7,6 +7,7 @@ import {
   Input,
   List,
   Modal,
+  Pagination,
   Popconfirm,
   Progress,
   Select,
@@ -27,7 +28,11 @@ import { syncStore } from "../syncStore";
 import { cloudStore } from "../cloudStore";
 import { formatError, translateUi } from "../errors";
 import { taskDisplayName } from "../taskName";
+import { toolStore, type ToolState } from "../toolStore";
 import type { CloudTaskRow, RunChangeEntry, SyncErrorDetail, SyncProgress, SyncReport, UiMessage } from "../types";
+import { listPagination, tablePagination } from "../listConfig";
+import SearchWithHistory from "../SearchWithHistory";
+import { loadFilters, saveFilters } from "../filterMemory";
 
 interface LogEntry {
   id: number;
@@ -35,6 +40,11 @@ interface LogEntry {
   playlistName: string;
   status: string;
   message: string;
+}
+
+/** 移除翻译后残留的未填充占位符（如 {3}、{{3}}）。 */
+function stripLeftoverPlaceholders(text: string): string {
+  return text.replace(/\{\{?\d+\}?\}/g, "").trim();
 }
 
 function renderMessage(raw: string): string {
@@ -49,6 +59,7 @@ function renderMessage(raw: string): string {
     } else {
       result = raw;
     }
+    result = stripLeftoverPlaceholders(result);
     if (messageCache.size > 2000) messageCache.clear(); // 防长会话膨胀
     messageCache.set(raw, result);
     return result;
@@ -74,7 +85,20 @@ export default function SyncPage() {
   const [reports, setReports] = useState<SyncReport[]>([]);
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [expanded, setExpanded] = useState<string | null>(null);
-  const [logFilter, setLogFilter] = useState("");
+  const savedLogFilters = loadFilters("filters.syncLogs", { logFilter: "", taskType: "" });
+  const [logFilter, setLogFilter] = useState(savedLogFilters.logFilter);
+  const [taskType, setTaskType] = useState(savedLogFilters.taskType);
+  const [logPage, setLogPage] = useState(1);
+  const [logPageSize, setLogPageSize] = useState(20);
+  const taskTypeOptions = [
+    { value: "sync", label: t("syncPage.taskType.sync") },
+    { value: "cloud", label: taskDisplayName("cloud") },
+    { value: "cloud_download", label: taskDisplayName("cloud_download") },
+    { value: "ncm_convert", label: taskDisplayName("ncm_convert") },
+    { value: "cleanup_scan", label: taskDisplayName("cleanup_scan") },
+    { value: "cleanup", label: taskDisplayName("cleanup") },
+    { value: "repair", label: taskDisplayName("repair") },
+  ];
   const [logRange, setLogRange] = useState<[Dayjs | null, Dayjs | null] | null>(null);
   const [cloudDetailOpen, setCloudDetailOpen] = useState(false);
   const [runDetail, setRunDetail] = useState<{ runId: number; name: string } | null>(null);
@@ -99,13 +123,52 @@ export default function SyncPage() {
     // 等后端写完/更新完那条唯一的任务日志再拉取。
     const un4 = listen<boolean>("sync://state", () => setTimeout(loadLogs, 500));
     const un5 = listen<boolean>("cloud://state", () => setTimeout(loadLogs, 500));
+    // 工具箱任务（NCM 转换/重复清理/属性修复）结束 → 刷新日志。
+    const un6 = listen<{ kind: string; running: boolean }>("tool://state", (e) => {
+      if (!e.payload.running) setTimeout(loadLogs, 300);
+    });
+    // 全局轮询检测到工具任务结束（兜底）→ 刷新日志。
+    const onToolFinished = () => setTimeout(loadLogs, 300);
+    window.addEventListener("tool-task-finished", onToolFinished);
     return () => {
       un2.then((f) => f());
       un3.then((f) => f());
       un4.then((f) => f());
       un5.then((f) => f());
+      un6.then((f) => f());
+      window.removeEventListener("tool-task-finished", onToolFinished);
     };
   }, [loadLogs]);
+
+  useEffect(() => {
+    saveFilters("filters.syncLogs", { logFilter, taskType });
+  }, [logFilter, taskType]);
+
+  const filteredLogs = logs.filter((l) => {
+    if (logRange && logRange[0] && logRange[1]) {
+      const ts = dayjs(l.ts);
+      if (ts.isBefore(logRange[0].startOf("second")) || ts.isAfter(logRange[1].endOf("second"))) {
+        return false;
+      }
+    }
+    if (taskType) {
+      // 同步歌单的日志用真实歌单名，其余为任务哨兵名。
+      const sentinels = ["cloud", "cloud_download", "ncm_convert", "cleanup_scan", "cleanup", "repair"];
+      if (taskType === "sync") {
+        if (sentinels.includes(l.playlistName)) return false;
+      } else if (l.playlistName !== taskType) {
+        return false;
+      }
+    }
+    if (logFilter) {
+      const kw = logFilter.toLowerCase();
+      // 任务名用翻译后的名称参与搜索，使“云盘”能命中哨兵名 "cloud" 的日志。
+      const hay = `${taskDisplayName(l.playlistName)} ${renderMessage(l.message)}`.toLowerCase();
+      return hay.includes(kw);
+    }
+    return true;
+  });
+  const pagedLogs = filteredLogs.slice((logPage - 1) * logPageSize, logPage * logPageSize);
 
   const clearLogs = async () => {
     try {
@@ -118,7 +181,7 @@ export default function SyncPage() {
   };
 
   return (
-    <div style={{ padding: 24 }}>
+    <div style={{ padding: 24, height: "100%", display: "flex", flexDirection: "column", minHeight: 0 }}>
       <CurrentTaskCard
         onOpenCloudDetail={() => setCloudDetailOpen(true)}
         onOpenRunDetail={(runId, name) => setRunDetail({ runId, name })}
@@ -149,7 +212,7 @@ export default function SyncPage() {
       </Modal>
 
       {reports.length > 0 && (
-        <Card title={t("syncPage.recentResults")} style={{ marginBottom: 16 }} size="small">
+        <Card title={t("syncPage.recentResults")} style={{ marginBottom: 16, flexShrink: 0 }} size="small">
           <List
             size="small"
             dataSource={reports}
@@ -226,7 +289,17 @@ export default function SyncPage() {
       <Card
         title={t("syncPage.syncLogs")}
         size="small"
-        styles={{ body: { padding: 0 } }}
+        style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}
+        styles={{
+          body: {
+            padding: 0,
+            display: "flex",
+            flexDirection: "column",
+            flex: 1,
+            minHeight: 0,
+            overflow: "hidden",
+          },
+        }}
         extra={
           logs.length > 0 ? (
             <Popconfirm
@@ -242,43 +315,59 @@ export default function SyncPage() {
           ) : undefined
         }
       >
-        <div style={{ padding: 12 }}>
+        <div style={{ padding: 12, flexShrink: 0 }}>
           <Space wrap>
-            <Input.Search
+            <SearchWithHistory
+              storageKey="search.syncLogs"
+              value={logFilter}
+              onChange={setLogFilter}
+              onSearch={(word) => {
+                setLogFilter(word);
+                setLogPage(1);
+              }}
               placeholder={t("syncPage.filterLog")}
-              allowClear
               style={{ width: 240 }}
-              onSearch={setLogFilter}
-              onChange={(e) => !e.target.value && setLogFilter("")}
             />
+            <Select
+              allowClear
+              placeholder={t("syncPage.filterTaskType")}
+              style={{ minWidth: 180 }}
+              value={taskType || undefined}
+              onChange={(v) => {
+                setTaskType(v ?? "");
+                setLogPage(1);
+              }}
+              options={taskTypeOptions}
+            />
+            <Button
+              size="small"
+              onClick={() => {
+                setLogFilter("");
+                setTaskType("");
+                setLogRange(null);
+                setLogPage(1);
+              }}
+            >
+              {t("filters.clear")}
+            </Button>
             <DatePicker.RangePicker
               showTime={{ format: "HH:mm" }}
               format="YYYY-MM-DD HH:mm"
               value={logRange}
-              onChange={(value) => setLogRange(value as [Dayjs | null, Dayjs | null] | null)}
+              onChange={(value) => {
+                setLogRange(value as [Dayjs | null, Dayjs | null] | null);
+                setLogPage(1);
+              }}
               allowClear
               size="small"
             />
           </Space>
         </div>
+        <div style={{ flex: 1, overflowY: "auto", paddingLeft: 12, paddingRight: 12 }}>
         <List
           size="small"
-          dataSource={logs.filter((l) => {
-            if (logRange && logRange[0] && logRange[1]) {
-              const ts = dayjs(l.ts);
-              if (ts.isBefore(logRange[0].startOf("second")) || ts.isAfter(logRange[1].endOf("second"))) {
-                return false;
-              }
-            }
-            if (logFilter) {
-              const kw = logFilter.toLowerCase();
-              // 任务名用翻译后的名称参与搜索，使“云盘”能命中哨兵名 "cloud" 的日志。
-              const hay = `${taskDisplayName(l.playlistName)} ${renderMessage(l.message)}`.toLowerCase();
-              return hay.includes(kw);
-            }
-            return true;
-          })}
-          pagination={{ pageSize: 20, showSizeChanger: true, pageSizeOptions: [20, 50, 100], showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}` }}
+          dataSource={pagedLogs}
+          pagination={false}
           locale={{ emptyText: t("syncPage.noLogs") }}
           renderItem={(l) => {
             const tag =
@@ -311,7 +400,14 @@ export default function SyncPage() {
                       {tag} {taskDisplayName(l.playlistName) || "-"}
                     </Typography.Text>
                   }
-                  description={renderMessage(l.message)}
+                  description={
+                    <Typography.Text
+                      ellipsis={{ tooltip: renderMessage(l.message) }}
+                      style={{ fontSize: 12, maxWidth: 720 }}
+                    >
+                      {renderMessage(l.message)}
+                    </Typography.Text>
+                  }
                 />
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                   {l.ts}
@@ -320,6 +416,30 @@ export default function SyncPage() {
             );
           }}
         />
+        </div>
+        <div
+          style={{
+            flexShrink: 0,
+            padding: "8px 16px",
+            borderTop: "1px solid rgba(128,128,128,0.2)",
+            display: "flex",
+            justifyContent: "flex-end",
+          }}
+        >
+          <Pagination
+            size="small"
+            current={logPage}
+            pageSize={logPageSize}
+            total={filteredLogs.length}
+            showSizeChanger
+            pageSizeOptions={[20, 50, 100]}
+            showTotal={(total, range) => `${range[0]}-${range[1]} / ${total}`}
+            onChange={(page, size) => {
+              setLogPage(size !== logPageSize ? 1 : page);
+              setLogPageSize(size);
+            }}
+          />
+        </div>
       </Card>
     </div>
   );
@@ -554,12 +674,7 @@ function CloudTaskRowsTable({ rows }: { rows: CloudTaskRow[] }) {
         rowKey="path"
         dataSource={sorted}
         columns={columns}
-        pagination={{
-          pageSize: 20,
-          showSizeChanger: true,
-          pageSizeOptions: [20, 50, 100],
-          showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
-        }}
+        pagination={tablePagination}
       />
     </>
   );
@@ -610,11 +725,90 @@ function CurrentTaskCard({
 
   const cloudActive = cloudRunning && cloudProgress;
   const playlistActive = running && progress;
+  const toolSnapshot = useSyncExternalStore(toolStore.subscribe, toolStore.getSnapshot);
+  // 运行中，或刚结束 20 秒内（短任务一闪而过，保留展示便于确认结果）。
+  const visibleTools = (Object.entries(toolSnapshot) as [string, ToolState][]).filter(([, s]) => {
+    if (!s.progress) return false;
+    if (s.running && !s.progress.done) return true;
+    return s.progress.done && s.finishedAt !== undefined && Date.now() - s.finishedAt < 20000;
+  });
+
 
   return (
-    <Card title={t("syncPage.currentTask")} size="small" style={{ marginBottom: 16 }}>
-      {cloudActive || playlistActive ? (
+    <Card title={t("syncPage.currentTask")} size="small" style={{ marginBottom: 16, flexShrink: 0 }}>
+      {cloudActive || playlistActive || visibleTools.length > 0 ? (
         <Space direction="vertical" style={{ width: "100%" }} size={16}>
+          {visibleTools.map(([kind, s]) => {
+            const p = s.progress!;
+            const paused = p.paused;
+            const hasDone = p.done;
+            const hasCanceled = p.canceled;
+            return (
+              <div key={kind}>
+                <Typography.Paragraph style={{ marginBottom: 4 }}>
+                  <Tag color={hasDone ? "success" : paused ? "warning" : "processing"}>
+                    {hasDone
+                      ? hasCanceled
+                        ? t("app.cancel")
+                        : t("tools.taskFinished")
+                      : paused
+                        ? t("tools.taskPaused")
+                        : t("tools.taskRunning")}
+                  </Tag>
+                  {taskDisplayName(kind)} —— {hasDone ? t("tools.taskFinishedHint") : p.currentFile || t("tools.taskPreparing")}
+                </Typography.Paragraph>
+                <Progress
+                  percent={p.total ? Math.round((p.current / p.total) * 100) : 0}
+                  status={paused ? "normal" : "active"}
+                />
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                  {t("tools.repairProgress", {
+                    current: p.current,
+                    total: p.total,
+                    repaired: p.ok,
+                    skipped: p.skipped,
+                    failed: p.failed,
+                  })}
+                </Typography.Text>
+                {!hasDone && (
+                <Space style={{ marginTop: 6 }} wrap>
+                  <Button
+                    size="small"
+                    onClick={async () => {
+                      try {
+                        if (paused) {
+                          await api.resumeTool(kind);
+                        } else {
+                          await api.pauseTool(kind);
+                        }
+                      } catch (e) {
+                        antMessage.error(formatError(e));
+                      }
+                    }}
+                  >
+                    {paused ? t("app.resume") : t("app.pause")}
+                  </Button>
+                  <Popconfirm
+                    title={t("app.cancelConfirm")}
+                    okText={t("app.cancel")}
+                    cancelText={t("playlists.cancel")}
+                    onConfirm={async () => {
+                      try {
+                        await api.cancelTool(kind);
+                      } catch (e) {
+                        antMessage.error(formatError(e));
+                      }
+                    }}
+                  >
+                    <Button size="small" danger>
+                      {t("app.cancelTask")}
+                    </Button>
+                  </Popconfirm>
+                </Space>
+                )}
+              </div>
+            );
+          })}
           {cloudActive && (
             <TaskProgressRow progress={cloudProgress} paused={cloudPaused}>
               <Button size="small" onClick={onOpenCloudDetail}>
@@ -699,6 +893,9 @@ function actionColor(action: string): string {
   if (action === "added_local" || action === "added_playlist" || action === "added_cloud") {
     return "green";
   }
+  if (action === "repaired" || action === "converted") {
+    return "green";
+  }
   if (action === "quarantined_local" || action === "removed_from_playlist") {
     return "orange";
   }
@@ -715,6 +912,9 @@ function i18nKey(action: string): string {
     added_playlist: i18n.t("syncPage.action.addedPlaylist"),
     removed_from_playlist: i18n.t("syncPage.action.removedFromPlaylist"),
     added_cloud: i18n.t("syncPage.action.addedCloud"),
+    repaired: i18n.t("syncPage.action.repaired"),
+    converted: i18n.t("syncPage.action.converted"),
+    skipped: i18n.t("syncPage.action.skipped"),
     instant_import: i18n.t("syncPage.action.instantImport"),
     failed: i18n.t("syncPage.action.failed"),
   };
@@ -750,11 +950,14 @@ function RunChangesTable({ runId }: { runId: number }) {
   // 数据库模式下任务进行中每 2 秒刷新一次，详情随任务推进实时填充。
   const syncRunning = useSyncExternalStore(syncStore.subscribeRunning, syncStore.getRunning);
   const cloudRunning = useSyncExternalStore(cloudStore.subscribeRunning, cloudStore.getRunning);
+  // 工具箱任务（属性修复/NCM/清理扫描）进行中同样实时刷新。
+  const toolSnapshotForRun = useSyncExternalStore(toolStore.subscribe, toolStore.getSnapshot);
+  const anyToolRunning = Object.values(toolSnapshotForRun).some((toolRow) => toolRow.running);
   useEffect(() => {
-    if (useLive || (!syncRunning && !cloudRunning)) return;
+    if (useLive || (!syncRunning && !cloudRunning && !anyToolRunning)) return;
     const timer = setInterval(load, 2000);
     return () => clearInterval(timer);
-  }, [load, useLive, syncRunning, cloudRunning]);
+  }, [load, useLive, syncRunning, cloudRunning, anyToolRunning]);
 
   if (useLive) {
     return <CloudTaskRowsTable rows={liveRows} />;
@@ -838,7 +1041,15 @@ function RunChangesTable({ runId }: { runId: number }) {
       ellipsis: true,
       render: (v: string | undefined, c) => (
         <div>
-          <div>{v ?? c.trackId ?? "-"}</div>
+          <div>
+            <Typography.Text
+              ellipsis
+              style={{ maxWidth: 220 }}
+              title={v ?? String(c.trackId ?? "-")}
+            >
+              {v ?? c.trackId ?? "-"}
+            </Typography.Text>
+          </div>
           {c.action === "failed" && c.note && (
             <Typography.Text type="danger" style={{ fontSize: 12 }}>
               {renderMessage(c.note)}
@@ -852,6 +1063,17 @@ function RunChangesTable({ runId }: { runId: number }) {
       dataIndex: "playlistName",
       width: 130,
       ellipsis: true,
+      render: (name: string, c: RunChangeEntry) => {
+        // 歌单同步：显示真实歌单名；工具任务：显示该文件所在目录名（任务名见弹窗标题）。
+        const sentinels = ["cloud", "cloud_download", "ncm_convert", "cleanup_scan", "cleanup", "repair"];
+        if (sentinels.includes(name)) {
+          const path = c.localPath ?? c.quarantinedPath ?? "";
+          const dir = path.replace(/[\\/][^\\/]*$/, "");
+          const dirName = dir.replace(/.*[\\/]/, "");
+          return dirName || "-";
+        }
+        return taskDisplayName(name) || "-";
+      },
     },
     {
       title: <SortHeader label={t("syncPage.colDirection")} field="direction" tri={tri} />,
@@ -914,6 +1136,7 @@ function RunChangesTable({ runId }: { runId: number }) {
         rowKey="id"
         dataSource={sorted}
         columns={columns}
+        scroll={{ y: "calc(100vh - 360px)" }}
         pagination={{
           pageSize: 20,
           showSizeChanger: true,

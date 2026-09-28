@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use rusqlite::OptionalExtension;
 use serde::Serialize;
-use std::{collections::HashMap, fs, path::Path, sync::atomic::Ordering};
+use std::{collections::HashMap, fs, path::Path, path::PathBuf, sync::atomic::Ordering};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::{
@@ -920,39 +920,45 @@ pub fn list_quarantine(
     state: State<'_, AppState>,
 ) -> Result<Vec<database::QuarantineItem>, String> {
     let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    // 顺带做一次旧格式隔离文件迁移（补 .quarantined 后缀 + 隐藏属性，幂等），
+    // 包括无数据库记录的孤儿文件（按 music_root/.quarantine 兜底扫描）。
+    let music_root = store::config::load(&state.paths.get().config_file)
+        .ok()
+        .and_then(|config| config.music_root.map(PathBuf::from));
+    let _ = crate::core::quarantine_files::migrate_existing(&conn, music_root.as_deref());
     database::list_quarantine(&conn).map_err(command_error)
 }
 
-#[tauri::command]
-pub fn restore_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+/// 恢复单条隔离记录（文件移回原路径 + 去隐藏）。文件缺失/路径冲突时返回 Err。
+fn quarantine_restore_one(conn: &rusqlite::Connection, id: i64) -> Result<(), UiMessage> {
     let item: (String, String) = conn
         .query_row(
             "SELECT original_path, quarantine_path FROM quarantine WHERE id=?1",
             [id],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
-        .map_err(command_error)?;
+        .map_err(UiMessage::unknown)?;
     let original = Path::new(&item.0);
     let quarantined = Path::new(&item.1);
     if !quarantined.is_file() {
-        return Err(UiMessage::new("quarantineMissing").to_json());
+        return Err(UiMessage::new("quarantineMissing"));
     }
     if original.exists() {
-        return Err(UiMessage::new("quarantineConflict").to_json());
+        return Err(UiMessage::new("quarantineConflict"));
     }
     if let Some(parent) = original.parent() {
-        fs::create_dir_all(parent).map_err(command_error)?;
+        fs::create_dir_all(parent).map_err(UiMessage::unknown)?;
     }
-    fs::rename(quarantined, original).map_err(command_error)?;
+    fs::rename(quarantined, original).map_err(UiMessage::unknown)?;
+    // 还原隐藏属性（隔离时设置，rename 会把属性带到原路径）。
+    crate::core::quarantine_files::set_hidden(original, false);
     conn.execute("DELETE FROM quarantine WHERE id=?1", [id])
-        .map_err(command_error)?;
+        .map_err(UiMessage::unknown)?;
     Ok(())
 }
 
-#[tauri::command]
-pub fn delete_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), String> {
-    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+/// 彻底删除单条隔离记录。文件已不存在时仅清理记录。
+fn quarantine_delete_one(conn: &rusqlite::Connection, id: i64) -> Result<(), UiMessage> {
     let path: Option<String> = conn
         .query_row(
             "SELECT quarantine_path FROM quarantine WHERE id=?1",
@@ -960,14 +966,61 @@ pub fn delete_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), Stri
             |r| r.get(0),
         )
         .optional()
-        .map_err(command_error)?;
-    let path = path.ok_or_else(|| UiMessage::new("quarantineRecordMissing").to_json())?;
+        .map_err(UiMessage::unknown)?;
+    let path = path.ok_or_else(|| UiMessage::new("quarantineRecordMissing"))?;
     if Path::new(&path).is_file() {
-        fs::remove_file(&path).map_err(command_error)?;
+        fs::remove_file(&path).map_err(UiMessage::unknown)?;
     }
     conn.execute("DELETE FROM quarantine WHERE id=?1", [id])
-        .map_err(command_error)?;
+        .map_err(UiMessage::unknown)?;
     Ok(())
+}
+
+#[tauri::command]
+pub fn restore_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    quarantine_restore_one(&conn, id).map_err(|m| m.to_json())
+}
+
+/// 批量恢复隔离记录：逐条尝试，返回成功条数；单条失败不影响其余。
+#[tauri::command]
+pub fn quarantine_batch_restore(
+    state: State<'_, AppState>,
+    ids: Vec<i64>,
+) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Err(UiMessage::new("quarantineBatchEmpty").to_json());
+    }
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    let mut restored = 0usize;
+    for id in ids {
+        if quarantine_restore_one(&conn, id).is_ok() {
+            restored += 1;
+        }
+    }
+    Ok(restored)
+}
+
+#[tauri::command]
+pub fn delete_quarantine(state: State<'_, AppState>, id: i64) -> Result<(), String> {
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    quarantine_delete_one(&conn, id).map_err(|m| m.to_json())
+}
+
+/// 批量彻底删除隔离记录：逐条尝试，返回成功条数；单条失败不影响其余。
+#[tauri::command]
+pub fn quarantine_batch_delete(state: State<'_, AppState>, ids: Vec<i64>) -> Result<usize, String> {
+    if ids.is_empty() {
+        return Err(UiMessage::new("quarantineBatchEmpty").to_json());
+    }
+    let conn = database::open(&state.paths.get().database_file).map_err(command_error)?;
+    let mut deleted = 0usize;
+    for id in ids {
+        if quarantine_delete_one(&conn, id).is_ok() {
+            deleted += 1;
+        }
+    }
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -1850,26 +1903,265 @@ pub fn get_local_stats(state: State<'_, AppState>) -> Result<database::LocalStat
     Ok(stats)
 }
 
-/// NCM 批量转换汇总结果。
-#[derive(Serialize, Default)]
-#[serde(rename_all = "camelCase")]
-pub struct NcmConvertReport {
-    pub converted: usize,
-    pub skipped: usize,
-    pub failed: usize,
-    pub items: Vec<crate::ncm::ncm::NcmConvertItemResult>,
+/// 目录摘要拼接："（A、B）"，最多 3 个目录，超出记处数；为空返回空串。
+fn finish_dirs(mut dirs: Vec<String>) -> String {
+    dirs.sort();
+    dirs.dedup();
+    if dirs.is_empty() {
+        return String::new();
+    }
+    let total = dirs.len();
+    dirs.truncate(3);
+    let body = if total > 3 {
+        format!("{} 等 {} 处", dirs.join("、"), total)
+    } else {
+        dirs.join("、")
+    };
+    format!("（{body}）")
 }
 
-/// 独立 NCM 转换工具：paths 可混合 .ncm 文件与目录（目录递归）。
-/// keep_source=false 时转换成功后删除源文件；overwrite=true 时无视已有转换标记。
+/// 文件列表 → 各自父目录的摘要（NCM/修复任务）。
+fn dirs_suffix_of_files(files: &[std::path::PathBuf]) -> String {
+    finish_dirs(
+        files
+            .iter()
+            .filter_map(|p| p.parent().map(|d| d.to_string_lossy().into_owned()))
+            .filter(|d| !d.is_empty())
+            .collect(),
+    )
+}
+
+/// 路径字符串列表（目录或文件）→ 父目录/自身摘要（清理任务）。
+fn dirs_suffix_of_paths(paths: &[String]) -> String {
+    finish_dirs(
+        paths
+            .iter()
+            .map(|p| {
+                let path = Path::new(p);
+                match path.parent() {
+                    Some(parent) if !parent.as_os_str().is_empty() => {
+                        parent.to_string_lossy().into_owned()
+                    }
+                    _ => p.clone(),
+                }
+            })
+            .collect(),
+    )
+}
+
+/// 工具任务种类 → AppState 中的状态字段。
+fn tool_task_state<'a>(
+    state: &'a AppState,
+    kind: &str,
+) -> Option<&'a crate::core::tool_task::ToolTaskState> {
+    match kind {
+        "repair" => Some(&state.repair_task),
+        "ncm_convert" => Some(&state.ncm_task),
+        "cleanup_scan" => Some(&state.cleanup_task),
+        _ => None,
+    }
+}
+
+use crate::core::tool_task::ToolStateEvent;
+
+/// 查询工具任务的控制快照（进度 + 条目明细 + 最终结果 JSON）。
 #[tauri::command]
-pub async fn convert_ncm_manual(
+pub fn get_tool_control(
     state: State<'_, AppState>,
+    kind: String,
+) -> Option<crate::core::tool_task::ToolTaskSnapshot> {
+    let task = tool_task_state(&state, &kind)?;
+    let (progress, items, result, running) = task.snapshot();
+    Some(crate::core::tool_task::ToolTaskSnapshot {
+        kind,
+        running,
+        progress,
+        items,
+        result,
+    })
+}
+
+/// 请求取消工具任务。
+#[tauri::command]
+pub fn cancel_tool(state: State<'_, AppState>, kind: String) {
+    if let Some(task) = tool_task_state(&state, &kind) {
+        task.request_cancel();
+    }
+}
+
+/// 启动属性修复后台任务。逐文件结果记入任务详情（sync_changes）。
+#[tauri::command]
+pub async fn start_repair(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    paths: Vec<String>,
+    fix_tags: bool,
+    fix_cover: bool,
+    fix_lyrics: bool,
+    fix_filename: bool,
+    filename_template: Option<String>,
+) -> Result<(), String> {
+    if !fix_tags && !fix_cover && !fix_lyrics && !fix_filename {
+        return Err(UiMessage::new("repairNothingSelected").to_json());
+    }
+    let Some(task) = tool_task_state(&state, "repair") else {
+        return Err(UiMessage::new("repairBusy").to_json());
+    };
+    let Some(guard) = task.try_start() else {
+        return Err(UiMessage::new("repairBusy").to_json());
+    };
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let files = crate::core::repair::expand_inputs(&paths, true);
+    if files.is_empty() {
+        return Err(UiMessage::new("repairNoFiles").to_json());
+    }
+    let opts = crate::core::repair::RepairOptions {
+        fix_tags,
+        fix_cover,
+        fix_lyrics,
+        fix_filename,
+        filename_template: filename_template
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| config.filename_template.clone()),
+    };
+    task.reset(files.len());
+    let database_file = state.paths.get().database_file.clone();
+    let log_id = {
+        let conn = database::open(&database_file).map_err(command_error)?;
+        let dirs_display = paths.join("、");
+        database::log(
+            &conn,
+            "repair",
+            "running",
+            &UiMessage::with_params("repairRunning", vec![dirs_display]).to_json(),
+        )
+        .map_err(command_error)?
+    };
+    let _ = app.emit("tool://state", ToolStateEvent { kind: "repair".into(), running: true });
+
+    let task = task.clone();
+    let cancel = task.cancel_flag();
+    let paused_flag = task.paused_flag();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _guard = guard; // 运行位由后台任务持有，函数返回不释放
+        let api = match NeteaseApi::from_config(&config) {
+            Ok(api) => api,
+            Err(error) => {
+                if let Ok(conn) = database::open(&database_file) {
+                    let _ = database::finish_log(
+                        &conn,
+                        log_id,
+                        "error",
+                        &UiMessage::with_params("unknown", vec![error.to_string()]).to_json(),
+                    );
+                }
+                return;
+            }
+        };
+        let separator = config.artist_separator.clone();
+        let mut canceled = false;
+        for file in &files {
+            // 暂停/取消：文件边界检查。
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    canceled = true;
+                    break;
+                }
+                if paused_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                break;
+            }
+            if canceled {
+                break;
+            }
+            task.begin_file(&file.to_string_lossy());
+            emit_tool_progress(&app, &task);
+            let item = crate::core::repair::repair_file(&api, file, &opts, &separator).await;
+            // 任务详情：逐文件记录（重命名时把新路径带进 note）。
+            if let Ok(conn) = database::open(&database_file) {
+                let note = match (item.error.as_deref(), item.status.as_str()) {
+                    (Some(error), "failed") => Some(error.to_string()),
+                    (Some(_), "repaired") => Some(format!("renamed → {}", item.output.clone().unwrap_or_default())),
+                    _ => None,
+                };
+                let _ = database::record_change(
+                    &conn,
+                    log_id,
+                    0,
+                    "repair",
+                    "to_tags",
+                    &item.status,
+                    None,
+                    Some(
+                        std::path::Path::new(&item.source)
+                            .file_name()
+                            .and_then(|x| x.to_str())
+                            .unwrap_or(&item.source),
+                    ),
+                    item.output.as_deref(),
+                    None,
+                    None,
+                    note.as_deref(),
+                );
+            }
+            task.finish_item(item);
+            emit_tool_progress(&app, &task);
+        }
+        let progress = task.finish(canceled);
+        if let Ok(conn) = database::open(&database_file) {
+            let (status, code) = if canceled {
+                ("canceled", "repairCanceled")
+            } else if progress.failed > 0 {
+                ("error", "repairDone")
+            } else {
+                ("ok", "repairDone")
+            };
+            let _ = database::finish_log(
+                &conn,
+                log_id,
+                status,
+                &UiMessage::with_params(
+                    code,
+                    vec![
+                        progress.ok.to_string(),
+                        progress.skipped.to_string(),
+                        progress.failed.to_string(),
+                        dirs_suffix_of_files(&files),
+                    ],
+                )
+                .to_json(),
+            );
+        }
+        let _ = app.emit("tool://progress", &progress);
+        let _ = app.emit("tool://state", ToolStateEvent { kind: "repair".into(), running: false });
+    });
+    Ok(())
+}
+
+fn emit_tool_progress(app: &AppHandle, task: &crate::core::tool_task::ToolTaskState) {
+    let (progress, _, _, _) = task.snapshot();
+    let _ = app.emit("tool://progress", &progress);
+}
+
+/// 启动 NCM 转换后台任务。逐文件结果记入任务详情。
+#[tauri::command]
+pub async fn start_ncm_convert(
+    state: State<'_, AppState>,
+    app: AppHandle,
     paths: Vec<String>,
     keep_source: bool,
     overwrite: bool,
-) -> Result<NcmConvertReport, String> {
-    let _ = state;
+) -> Result<(), String> {
+    let Some(task) = tool_task_state(&state, "ncm_convert") else {
+        return Err(UiMessage::new("repairBusy").to_json());
+    };
+    let Some(guard) = task.try_start() else {
+        return Err(UiMessage::new("ncmConvertBusy").to_json());
+    };
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
     // 展开为 .ncm 文件列表。
     let mut files: Vec<std::path::PathBuf> = Vec::new();
     for p in &paths {
@@ -1901,20 +2193,299 @@ pub async fn convert_ncm_manual(
     if files.is_empty() {
         return Err(UiMessage::new("ncmNoFiles").to_json());
     }
-    let report = tauri::async_runtime::spawn_blocking(move || {
-        let mut report = NcmConvertReport::default();
-        for file in files {
-            let item = crate::ncm::ncm::convert_file_with_marker(&file, keep_source, overwrite);
-            match item.status.as_str() {
-                "converted" => report.converted += 1,
-                "skipped" => report.skipped += 1,
-                _ => report.failed += 1,
+    task.reset(files.len());
+    let database_file = state.paths.get().database_file.clone();
+    let log_id = {
+        let conn = database::open(&database_file).map_err(command_error)?;
+        let dirs_display = paths.join("、");
+        database::log(
+            &conn,
+            "ncm_convert",
+            "running",
+            &UiMessage::with_params("ncmRunning", vec![dirs_display]).to_json(),
+        )
+        .map_err(command_error)?
+    };
+    let _ = app.emit("tool://state", ToolStateEvent { kind: "ncm_convert".into(), running: true });
+
+    let task = task.clone();
+    let cancel = task.cancel_flag();
+    let paused_flag = task.paused_flag();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _guard = guard; // 运行位由后台任务持有，函数返回不释放
+        let api = match NeteaseApi::from_config(&config) {
+            Ok(api) => api,
+            Err(error) => {
+                if let Ok(conn) = database::open(&database_file) {
+                    let _ = database::finish_log(
+                        &conn,
+                        log_id,
+                        "error",
+                        &UiMessage::with_params("unknown", vec![error.to_string()]).to_json(),
+                    );
+                }
+                return;
             }
-            report.items.push(item);
+        };
+        let mut canceled = false;
+        for file in &files {
+            // 暂停/取消：文件边界检查。
+            loop {
+                if cancel.load(std::sync::atomic::Ordering::SeqCst) {
+                    canceled = true;
+                    break;
+                }
+                if paused_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    continue;
+                }
+                break;
+            }
+            if canceled {
+                break;
+            }
+            task.begin_file(&file.to_string_lossy());
+            emit_tool_progress(&app, &task);
+            let ncm_item =
+                crate::ncm::ncm::convert_file_with_marker(file, keep_source, overwrite);
+            crate::ncm::embed_lyrics_after_convert(&api, config.embed_lyrics, &ncm_item).await;
+            let item = crate::core::repair::RepairItemResult {
+                source: ncm_item.source.clone(),
+                output: ncm_item.output.clone(),
+                status: ncm_item.status.clone(),
+                error: ncm_item.error.clone(),
+            };
+            if let Ok(conn) = database::open(&database_file) {
+                let _ = database::record_change(
+                    &conn,
+                    log_id,
+                    0,
+                    "ncm_convert",
+                    "ncm_decode",
+                    &item.status,
+                    None,
+                    Some(
+                        std::path::Path::new(&item.source)
+                            .file_name()
+                            .and_then(|x| x.to_str())
+                            .unwrap_or(&item.source),
+                    ),
+                    item.output.as_deref(),
+                    None,
+                    None,
+                    item.error.as_deref().filter(|_| item.status == "failed"),
+                );
+            }
+            task.finish_item(item);
+            emit_tool_progress(&app, &task);
         }
-        report
+        let progress = task.finish(canceled);
+        if let Ok(conn) = database::open(&database_file) {
+            let (status, code) = if canceled {
+                ("canceled", "ncmCanceled")
+            } else if progress.failed > 0 {
+                ("error", "ncmDone")
+            } else {
+                ("ok", "ncmDone")
+            };
+            let _ = database::finish_log(
+                &conn,
+                log_id,
+                status,
+                &UiMessage::with_params(
+                    code,
+                    vec![
+                        progress.ok.to_string(),
+                        progress.skipped.to_string(),
+                        progress.failed.to_string(),
+                        dirs_suffix_of_files(&files),
+                    ],
+                )
+                .to_json(),
+            );
+        }
+        let _ = app.emit("tool://progress", &progress);
+        let _ = app.emit("tool://state", ToolStateEvent { kind: "ncm_convert".into(), running: false });
+    });
+    Ok(())
+}
+
+/// 启动重复清理扫描后台任务：结果（完整报告 JSON）存入任务快照，前端据此渲染预览。
+#[tauri::command]
+pub async fn start_cleanup_scan(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    dirs: Vec<String>,
+    recursive: bool,
+    keep_multi_quality: bool,
+) -> Result<(), String> {
+    let Some(task) = tool_task_state(&state, "cleanup_scan") else {
+        return Err(UiMessage::new("repairBusy").to_json());
+    };
+    let Some(guard) = task.try_start() else {
+        return Err(UiMessage::new("cleanupScanBusy").to_json());
+    };
+    let config = store::config::load(&state.paths.get().config_file).map_err(command_error)?;
+    let api = NeteaseApi::from_config(&config).map_err(command_error)?;
+    task.reset(0);
+    let database_file = state.paths.get().database_file.clone();
+    let log_id = {
+        let conn = database::open(&database_file).map_err(command_error)?;
+        let dirs_display = dirs.join("、");
+        database::log(
+            &conn,
+            "cleanup_scan",
+            "running",
+            &UiMessage::with_params("cleanupScanRunning", vec![dirs_display]).to_json(),
+        )
+        .map_err(command_error)?
+    };
+    let _ = app.emit("tool://state", ToolStateEvent { kind: "cleanup_scan".into(), running: true });
+
+    let task = task.clone();
+    let guard = guard;
+    let cancel = task.cancel_flag();
+    let paused_flag = task.paused_flag();
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        let _guard = guard;
+        let progress_cb = |completed: usize, _total: usize, current: &str| {
+            task.bump(completed, 0, 0, completed, current);
+            let _ = app.emit("tool://progress", &task.snapshot().0);
+        };
+        let scan = crate::core::cleanup::scan(
+            &api,
+            &dirs,
+            recursive,
+            keep_multi_quality,
+            &progress_cb,
+            &|| paused_flag.load(std::sync::atomic::Ordering::SeqCst),
+            &|| cancel.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
+        let canceled = cancel.load(std::sync::atomic::Ordering::SeqCst);
+        match scan {
+            Ok(Some(report)) => {
+                let summary = serde_json::to_value(&report).unwrap_or_default();
+                task.set_result(summary);
+                task.finish(canceled);
+                let progress = task.snapshot().0;
+                if let Ok(conn) = database::open(&database_file) {
+                    let (status, code) = if canceled {
+                        ("canceled", "cleanupScanCanceled")
+                    } else {
+                        ("ok", "cleanupScanDone")
+                    };
+                    let _ = database::finish_log(
+                        &conn,
+                        log_id,
+                        status,
+                        &UiMessage::with_params(
+                            code,
+                            vec![
+                                report.scanned_files.to_string(),
+                                report.clean_count.to_string(),
+                                dirs.join("、"),
+                            ],
+                        )
+                        .to_json(),
+                    );
+                }
+                let _ = app.emit("tool://progress", &progress);
+            }
+            Ok(None) => {
+                // 被取消：标记收尾由下方 canceled 分支逻辑处理。
+                task.finish(true);
+                if let Ok(conn) = database::open(&database_file) {
+                    let _ = database::finish_log(
+                        &conn,
+                        log_id,
+                        "canceled",
+                        &UiMessage::new("cleanupScanCanceled").to_json(),
+                    );
+                }
+            }
+            Err(error) => {
+                task.finish(canceled);
+                if let Ok(conn) = database::open(&database_file) {
+                    let _ = database::finish_log(
+                        &conn,
+                        log_id,
+                        "error",
+                        &UiMessage::with_params("cleanupScanFailed", vec![error.to_string()])
+                            .to_json(),
+                    );
+                }
+            }
+        }
+        let _ = app.emit("tool://state", ToolStateEvent { kind: "cleanup_scan".into(), running: false });
+    });
+    Ok(())
+}
+
+/// 执行清理：把扫描建议中 action=clean 的文件移入各自所在文件夹的
+/// .quarantine\cleanup，写入同步日志并把每个文件记入任务详情。
+#[tauri::command]
+pub async fn cleanup_execute(
+    state: State<'_, AppState>,
+    app: AppHandle,
+    paths: Vec<String>,
+) -> Result<usize, String> {
+    if paths.is_empty() {
+        return Err(UiMessage::new("cleanupNothingSelected").to_json());
+    }
+    let database_file = state.paths.get().database_file.clone();
+    let moved: usize = tauri::async_runtime::spawn_blocking(move || -> Result<usize, String> {
+        let mut conn = database::open(&database_file).map_err(command_error)?;
+        conn.busy_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_default();
+        let log_id = database::log(
+            &conn,
+            "cleanup",
+            "running",
+            &UiMessage::new("cleanupRunning").to_json(),
+        )
+        .map_err(command_error)?;
+        let count =
+            crate::core::cleanup::execute(&mut conn, &paths, log_id)
+                .map_err(command_error)?;
+        database::finish_log(
+            &conn,
+            log_id,
+            "ok",
+            &UiMessage::with_params(
+                "cleanupDone",
+                vec![
+                    count.to_string(),
+                    dirs_suffix_of_paths(&paths),
+                ],
+            )
+            .to_json(),
+        )
+        .map_err(command_error)?;
+        Ok(count)
     })
     .await
-    .map_err(|error| UiMessage::with_params("ncmConvertFailed", vec![error.to_string()]).to_json())?;
-    Ok(report)
+    .map_err(|error| UiMessage::with_params("cleanupExecuteFailed", vec![error.to_string()]).to_json())??;
+    let _ = app.emit("tool://state", ToolStateEvent { kind: "cleanup".into(), running: false });
+    Ok(moved)
+}
+
+/// 暂停工具任务（文件边界生效）。
+#[tauri::command]
+pub fn pause_tool(state: State<'_, AppState>, app: AppHandle, kind: String) {
+    if let Some(task) = tool_task_state(&state, &kind) {
+        task.pause();
+        let _ = app.emit("tool://progress", &task.snapshot().0);
+    }
+}
+
+/// 恢复工具任务。
+#[tauri::command]
+pub fn resume_tool(state: State<'_, AppState>, app: AppHandle, kind: String) {
+    if let Some(task) = tool_task_state(&state, &kind) {
+        task.resume();
+        let _ = app.emit("tool://progress", &task.snapshot().0);
+    }
 }

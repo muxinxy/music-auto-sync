@@ -27,6 +27,7 @@ import { formatError } from "../errors";
 import { syncStore } from "../syncStore";
 import { cloudStore } from "../cloudStore";
 import type { CloudListResult, CloudSong, LoginStatus } from "../types";
+import { tablePagination } from "../listConfig";
 
 const AUDIO_FILTERS = [
   { name: "Audio", extensions: ["mp3", "flac", "m4a", "wav", "ogg", "aac"] },
@@ -292,11 +293,7 @@ export default function CloudPage({
             preserveSelectedRowKeys: true,
             selections: true,
           }}
-          pagination={{
-            pageSize: 50,
-            showSizeChanger: false,
-            showTotal: (total, range) => `${range[0]}-${range[1]} / ${total}`,
-          }}
+          pagination={tablePagination}
           locale={{ emptyText: t("cloud.empty") }}
         />
       </Card>

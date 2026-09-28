@@ -9,15 +9,17 @@ import {
   LoginOutlined,
   ReloadOutlined,
   SettingOutlined,
+  ToolOutlined,
 } from "@ant-design/icons";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { useTranslation } from "react-i18next";
 import i18n, { normalizeLanguage } from "./i18n";
 import { api } from "./api";
-import type { CloudTaskRow, LoginStatus, SyncProgress, UiMessage } from "./types";
+import type { CloudTaskRow, LoginStatus, SyncProgress, ToolProgress, UiMessage } from "./types";
 import { translateUi } from "./errors";
 import { syncStore } from "./syncStore";
+import { toolStore } from "./toolStore";
 import { cloudStore } from "./cloudStore";
 import { taskDisplayName } from "./taskName";
 import LoginPage from "./pages/Login";
@@ -25,6 +27,7 @@ import PlaylistsPage from "./pages/Playlists";
 import CloudPage from "./pages/Cloud";
 import SyncPage from "./pages/Sync";
 import QuarantinePage from "./pages/Quarantine";
+import ToolsPage from "./pages/Tools";
 import SettingsPage from "./pages/Settings";
 import AboutPage from "./pages/About";
 
@@ -36,6 +39,7 @@ export type PageKey =
   | "cloud"
   | "sync"
   | "quarantine"
+  | "tools"
   | "settings"
   | "about";
 
@@ -111,8 +115,17 @@ export default function App() {
     });
     // 云盘任务：独立于歌单同步并行运行，走 cloud:// 事件通道。
     // start 携带本轮 run id：日志详情对最近一次云盘任务直接复用内存明细。
+    // 云盘任务：独立于歌单同步并行运行，走 cloud:// 事件通道。
+    // start 携带本轮 run id：日志详情对最近一次云盘任务直接复用内存明细。
     const unlistenCloudStart = listen<number>("cloud://start", (e) => {
       cloudStore.start(e.payload);
+    });
+    // 工具箱后台任务（NCM 转换 / 重复清理扫描 / 属性修复）。
+    const unlistenToolState = listen<{ kind: string; running: boolean }>("tool://state", (e) => {
+      toolStore.onState(e.payload);
+    });
+    const unlistenToolProgress = listen<ToolProgress>("tool://progress", (e) => {
+      toolStore.onProgress(e.payload);
     });
     const unlistenCloudRow = listen<CloudTaskRow>("cloud://row", (e) => {
       cloudStore.upsert(e.payload);
@@ -123,6 +136,27 @@ export default function App() {
     const unlistenCloudProgress = listen<SyncProgress>("cloud://progress", (e) => {
       cloudStore.setProgress(e.payload);
     });
+    // 工具箱任务兜底轮询（2 秒）：事件丢失/页面重挂载时任务卡与日志也能跟上；
+    // 检测到任务由运行转为结束 → 广播 DOM 事件让日志列表刷新。
+    const prevToolRunning: Record<string, boolean> = {};
+    const pollTools = async () => {
+      for (const kind of ["repair", "ncm_convert", "cleanup_scan"]) {
+        try {
+          const control = await api.getToolControl(kind);
+          toolStore.onState({ kind, running: control.running });
+          if (control.running) toolStore.onProgress(control.progress);
+          if (prevToolRunning[kind] && !control.running) {
+            window.dispatchEvent(new Event("tool-task-finished"));
+          }
+          prevToolRunning[kind] = control.running;
+        } catch {
+          // 忽略轮询失败
+        }
+      }
+    };
+    pollTools();
+    const toolTimer = setInterval(pollTools, 2000);
+
     // 轮询同步控制状态（暂停/继续），保持 UI 与后端一致。
     // 任一任务（歌单/云盘）运行期间轮询；空闲时停表，避免常驻每 1 秒一次的 IPC 调用。
     let poll: ReturnType<typeof setInterval> | null = null;
@@ -162,14 +196,17 @@ export default function App() {
     return () => {
       unlistenProgress.then((f) => f());
       unlistenState.then((f) => f());
-      unlistenCloudStart.then((f) => f());
-      unlistenCloudRow.then((f) => f());
+    unlistenCloudStart.then((f) => f());
+    unlistenToolState.then((f) => f());
+    unlistenToolProgress.then((f) => f());
+    unlistenCloudRow.then((f) => f());
       unlistenCloudState.then((f) => f());
       unlistenCloudProgress.then((f) => f());
       window.removeEventListener("theme-changed", onThemeChanged);
       unsubRunning();
       unsubCloudRunning();
       if (poll) clearInterval(poll);
+      clearInterval(toolTimer);
     };
   }, [applyLanguage, refreshLogin]);
 
@@ -211,6 +248,7 @@ export default function App() {
     { key: "cloud", icon: <CloudUploadOutlined />, label: t("app.menu.cloud") },
     { key: "sync", icon: <HistoryOutlined />, label: t("app.menu.sync") },
     { key: "quarantine", icon: <DeleteOutlined />, label: t("app.menu.quarantine") },
+    { key: "tools", icon: <ToolOutlined />, label: t("app.menu.tools") },
     { key: "settings", icon: <SettingOutlined />, label: t("app.menu.settings") },
     { key: "about", icon: <InfoCircleOutlined />, label: t("app.menu.about") },
   ];
@@ -347,6 +385,8 @@ export default function App() {
             <SyncPage />
           ) : page === "quarantine" ? (
             <QuarantinePage />
+          ) : page === "tools" ? (
+            <ToolsPage />
           ) : page === "about" ? (
             <AboutPage />
           ) : (

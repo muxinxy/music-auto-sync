@@ -253,6 +253,91 @@ export interface NcmConvertItemResult {
   output?: string | null;
   status: "converted" | "skipped" | "failed";
   error?: string | null;
+  musicId?: number | null;
+}
+
+export interface CleanupFileItem {
+  path: string;
+  quality: string;
+  qualityKey: string;
+  bitrate: number;
+  size: number;
+  modifiedAt: string;
+  score: number;
+  hasTitle: boolean;
+  hasArtist: boolean;
+  hasAlbum: boolean;
+  hasCover: boolean;
+  hasLyrics: boolean;
+  hasComment: boolean;
+  hasSidecar: boolean;
+  action: "keep" | "clean";
+}
+
+export interface CleanupGroup {
+  song: string;
+  neteaseId: number | null;
+  items: CleanupFileItem[];
+}
+
+export interface CleanupScanReport {
+  scannedFiles: number;
+  identified: number;
+  unresolved: number;
+  duplicateGroups: number;
+  cleanCount: number;
+  cleanBytes: number;
+  groups: CleanupGroup[];
+}
+
+export interface RepairItemResult {
+  source: string;
+  output?: string | null;
+  status: "repaired" | "skipped" | "failed";
+  error?: string | null;
+}
+
+export interface RepairProgress {
+  current: number;
+  total: number;
+  repaired: number;
+  skipped: number;
+  failed: number;
+  currentFile: string;
+  done: boolean;
+  canceled: boolean;
+}
+
+export interface RepairControl {
+  running: boolean;
+  progress: RepairProgress;
+  items: RepairItemResult[];
+}
+
+export interface ToolControl {
+  kind: string;
+  running: boolean;
+  progress: ToolProgress;
+  items: RepairItemResult[];
+  result?: unknown;
+}
+
+export interface ToolProgress {
+  kind: string;
+  current: number;
+  total: number;
+  done: boolean;
+  canceled: boolean;
+  paused: boolean;
+  currentFile: string;
+  ok: number;
+  skipped: number;
+  failed: number;
+}
+
+export interface ToolStateEvent {
+  kind: string;
+  running: boolean;
 }
 
 export interface NcmConvertReport {

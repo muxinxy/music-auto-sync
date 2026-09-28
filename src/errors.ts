@@ -45,3 +45,22 @@ export function translateUi(message: UiMessage): string {
 export function formatError(error: unknown): string {
   return translateUi(uiMessage(error));
 }
+/** 已知的修复/转换条目错误码 → 中文；未知（多为网络原始错误）原样返回。 */
+const ITEM_ERROR_CODES = [
+  "alreadyComplete",
+  "nothingToFix",
+  "tagUnreadable",
+  "songDetailMissing",
+  "targetNameExists",
+];
+
+export function translateItemError(error: string | null | undefined): string {
+  if (!error) return "";
+  if (error.startsWith("parseTrack: ")) {
+    return i18n.t("errors.parseTrack", { 0: error.slice("parseTrack: ".length) });
+  }
+  if (ITEM_ERROR_CODES.includes(error)) {
+    return i18n.t(`errors.${error}`, { defaultValue: error });
+  }
+  return error;
+}

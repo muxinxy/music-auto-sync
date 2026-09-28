@@ -33,6 +33,9 @@ fn build_state() -> Result<AppState, String> {
         cloud_running: AtomicBool::new(false),
         cloud_cancel_requested: Arc::new(AtomicBool::new(false)),
         cloud_pause_requested: Arc::new(AtomicBool::new(false)),
+        repair_task: crate::core::tool_task::ToolTaskState::new("repair"),
+        ncm_task: crate::core::tool_task::ToolTaskState::new("ncm_convert"),
+        cleanup_task: crate::core::tool_task::ToolTaskState::new("cleanup_scan"),
     })
 }
 

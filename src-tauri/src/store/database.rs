@@ -224,6 +224,15 @@ pub fn finish_log(conn: &Connection, id: i64, status: &str, message: &str) -> Re
     Ok(())
 }
 
+/// 应用启动时调用：把上次退出残留的"进行中"日志统一标记为已中断
+/// （单实例下启动时不可能有任务在跑）。返回更新的行数。
+pub fn finish_interrupted_logs(conn: &Connection) -> Result<usize> {
+    Ok(conn.execute(
+        "UPDATE sync_logs SET status='canceled', message='{\"code\":\"taskInterrupted\"}' WHERE status='running'",
+        params![],
+    )?)
+}
+
 /// 日志行先于歌单曲目拉取写入（此时歌单名未知，用 #<id> 占位），拉取成功后回填真实名称。
 pub fn update_log_name(conn: &Connection, id: i64, playlist_name: &str) -> Result<()> {
     conn.execute(

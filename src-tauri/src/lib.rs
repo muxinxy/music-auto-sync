@@ -25,6 +25,10 @@ pub struct AppState {
     pub cloud_running: AtomicBool,
     pub cloud_cancel_requested: Arc<AtomicBool>,
     pub cloud_pause_requested: Arc<AtomicBool>,
+    /// 工具箱后台任务：NCM 转换、重复清理扫描、属性修复，各自独立运行。
+    pub repair_task: crate::core::tool_task::ToolTaskState,
+    pub ncm_task: crate::core::tool_task::ToolTaskState,
+    pub cleanup_task: crate::core::tool_task::ToolTaskState,
 }
 
 pub fn run() {
@@ -33,6 +37,15 @@ pub fn run() {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
+
+    // 单实例下启动时不可能有任务在跑：把上次退出残留的"进行中"日志
+    // （应用被强杀/退出时任务没机会写结束状态）统一标记为已中断。
+    {
+        let app_paths = store::AppPaths::new(paths.clone());
+        if let Ok(conn) = store::database::open(&app_paths.get().database_file) {
+            let _ = store::database::finish_interrupted_logs(&conn);
+        }
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -54,6 +67,9 @@ pub fn run() {
             cloud_running: AtomicBool::new(false),
             cloud_cancel_requested: Arc::new(AtomicBool::new(false)),
             cloud_pause_requested: Arc::new(AtomicBool::new(false)),
+            repair_task: crate::core::tool_task::ToolTaskState::new("repair"),
+            ncm_task: crate::core::tool_task::ToolTaskState::new("ncm_convert"),
+            cleanup_task: crate::core::tool_task::ToolTaskState::new("cleanup_scan"),
         })
         .setup(|app| {
             runtime::tray::install(app.handle())?;
@@ -130,7 +146,20 @@ pub fn run() {
             commands::restore_playlist_snapshot_cmd,
             commands::get_account_stats,
             commands::get_local_stats,
-            commands::convert_ncm_manual,
+            
+            
+            commands::cleanup_execute,
+            commands::start_repair,
+            commands::start_ncm_convert,
+            commands::start_cleanup_scan,
+            commands::get_tool_control,
+            commands::cancel_tool,
+            commands::pause_tool,
+            commands::resume_tool,
+            
+            
+            commands::quarantine_batch_restore,
+            commands::quarantine_batch_delete,
             commands::set_auto_launch,
             commands::clear_sync_history_cmd,
             commands::preview_playlist_restore_cmd,

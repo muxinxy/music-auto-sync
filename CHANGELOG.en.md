@@ -4,6 +4,45 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.9.0] - 2026-09-28
+
+This release adds the Toolbox (NCM conversion, duplicate cleanup, tag repair). All three tools run in the background, appear under "Tasks" and "Logs", and support progress, pause, resume and cancel.
+
+### Added
+
+- **Toolbox page** gathering the three standalone tools: NCM conversion, duplicate cleanup and tag repair.
+- **Duplicate cleanup**: identifies duplicates by NetEase track id; quality is distinguished by extension only (e.g. mp3 / flac) and within one extension only the highest-bitrate copy is kept; ties keep the file with the most complete attributes (comment/cover/lyrics/sidecar), then the newest. Choose folders and whether to include subfolders, preview the keep/clean plan before running, and cleaned files go to the quarantine where they can be restored. Supports select-all-filtered, batch restore and batch delete.
+- **Tag repair**: fixes details (title/artist/album), embedded cover and embedded lyrics from NetEase metadata; optionally renames files using the filename template from Settings. Files whose attributes are already complete (existing cover/lyrics included) are skipped instead of being rewritten.
+- **Background tool tasks**: NCM conversion, cleanup scanning and tag repair all run in the background with live progress in "Current tasks" (pause/resume/cancel). Finished tasks stay visible briefly; per-file results are recorded in the task detail and start/finish are written to the logs.
+- **Quarantine improvements**: search, filtering by folder and by date range, sorting by name/date (asc/desc), plus multi-select batch operations.
+- **Log improvements**: filter by task type (playlist sync / cloud upload / cloud download / NCM conversion / duplicate cleanup scan / duplicate cleanup / tag repair).
+- **Remembered filters and search history**: filters on the playlists, tasks and quarantine pages are remembered locally (kept when you switch pages) and each filter bar has a "Clear filters" button. Search boxes remember the last 8 keywords, shown when the box is focused, with click-to-reuse, per-item delete and clear-all (keywords are recorded automatically after you stop typing, no Enter needed).
+- The About page now shows the app icon and is centred.
+
+### Changed
+
+- **Quarantine files are no longer scanned as music**: quarantined files get a `.quarantined` suffix and the Windows hidden attribute, so the NetEase client and other players no longer index them as normal music. Existing quarantine files (including orphans with no database record) are migrated automatically when the quarantine page is opened.
+- **Unified lists and pagination**: every list/table uses 20 rows per page (switchable 20/50/100), shows the total, and pins pagination to the bottom of the card; list areas fill the window height and scroll internally so pagination stays visible in small windows.
+- Menu "Sync tasks" renamed to "Tasks" and "Sync logs" to "Logs"; the current-task card now also shows toolbox tasks alongside playlist sync and cloud tasks.
+- In the task detail, the "direction" column shows meaningful semantics for tool tasks (local → tags / encrypted → audio / local → quarantine), and the "playlist" column shows the file's folder name (real playlist names are kept for playlist sync).
+- Quarantine files are no longer anchored to the music root: cleaned files move into each folder's own `.quarantine\cleanup`.
+
+### Fixed
+
+- **Covers and comments broke after enabling "Embed lyrics"**: the lyrics write re-encoded existing APIC cover frames as UTF-16 and the 163 key comment as UTF-8, which Windows Explorer then showed as "no cover / empty comment". All ID3v2 write paths now restore the official encoding (enc=0) before saving.
+- **NCM conversion created duplicate copies**: converting a `.ncm` whose audio already existed produced `xxx (2).mp3`; the same song is now adopted instead (no duplicate conversion) and only falls back to a new name when the song cannot be identified — existing files are never overwritten.
+- **NCM conversion output lacked tags**: converted files now get the official-format 163 key comment, embedded cover and basic tags (lyrics embedded online when enabled).
+- **Tool tasks could be started multiple times**: the running guard was released when the command returned, allowing concurrent runs of the same tool; the guard is now held by the background task and a second start reports "a task is already running".
+- **Failed tracks had no visible reason**: failed tracks are now recorded in the task detail (action "failed" plus the specific reason) instead of only in the log text.
+- **Leftover "running" logs**: task logs not finished because the app exited or was killed are now marked "canceled — task interrupted by app exit" on the next start.
+- Remaining English in the Chinese UI: repair result reasons (already complete, target filename exists, ...) and tool task log messages (NCM/cleanup/repair) are now localised.
+- The tag repair dialog no longer shows the previous run's results in a new session; the canceled result list is capped (6 items plus a count of the rest).
+- Long log messages are ellipsised with a hover tooltip; leftover `{3}` placeholders in historical log entries are cleaned up.
+
+### Notes
+
+- If "Embed lyrics" was enabled before, existing files may have corrupted cover frames that Explorer refuses to display: run "Toolbox → Tag repair" with "details + cover" checked to fix them.
+
 ## [0.8.8] - 2026-09-08
 
 ### Fixed

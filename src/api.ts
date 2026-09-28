@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   AccountStats,
   AppInfo,
+  CleanupScanReport,
   CloudDownloadItem,
   CloudListResult,
   CloudUploadPlan,
@@ -16,6 +17,7 @@ import type {
   PlaylistSongsResult,
   QuarantineItem,
   QrCheckResult,
+  ToolControl,
   RunChangeEntry,
   SingleDownloadOptions,
   SyncChangeEntry,
@@ -134,5 +136,34 @@ export const api = {
 
   convertNcmManual: (paths: string[], keepSource: boolean, overwrite: boolean) =>
     invoke<NcmConvertReport>("convert_ncm_manual", { paths, keepSource, overwrite }),
+  cleanupScan: (dirs: string[], recursive: boolean, keepMultiQuality: boolean) =>
+    invoke<CleanupScanReport>("cleanup_scan", { dirs, recursive, keepMultiQuality }),
+  cleanupExecute: (paths: string[]) => invoke<number>("cleanup_execute", { paths }),
+  quarantineBatchRestore: (ids: number[]) => invoke<number>("quarantine_batch_restore", { ids }),
+  quarantineBatchDelete: (ids: number[]) => invoke<number>("quarantine_batch_delete", { ids }),
+  startRepair: (
+    paths: string[],
+    fixTags: boolean,
+    fixCover: boolean,
+    fixLyrics: boolean,
+    fixFilename: boolean,
+    filenameTemplate: string | null
+  ) =>
+    invoke<void>("start_repair", {
+      paths,
+      fixTags,
+      fixCover,
+      fixLyrics,
+      fixFilename,
+      filenameTemplate,
+    }),
+  startNcmConvert: (paths: string[], keepSource: boolean, overwrite: boolean) =>
+    invoke<void>("start_ncm_convert", { paths, keepSource, overwrite }),
+  startCleanupScan: (dirs: string[], recursive: boolean, keepMultiQuality: boolean) =>
+    invoke<void>("start_cleanup_scan", { dirs, recursive, keepMultiQuality }),
+  getToolControl: (kind: string) => invoke<ToolControl>("get_tool_control", { kind }),
+  cancelTool: (kind: string) => invoke<void>("cancel_tool", { kind }),
+  pauseTool: (kind: string) => invoke<void>("pause_tool", { kind }),
+  resumeTool: (kind: string) => invoke<void>("resume_tool", { kind }),
   setAutoLaunch: (enabled: boolean) => invoke<void>("set_auto_launch", { enabled }),
 };

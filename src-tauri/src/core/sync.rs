@@ -254,7 +254,7 @@ async fn sync_one_inner_with_source(
             None => false,
         };
 
-        convert_ncm_files(app, state, &config, &playlist, &mut report, sync_run_id).await?;
+        convert_ncm_files(app, state, &config, &api, &playlist, &mut report, sync_run_id).await?;
 
         // 歌单 → 本地：按模式下载缺失 / 隔离本地多余。
         if mode != "delete_only" {
@@ -500,6 +500,24 @@ async fn sync_tracks(
                 report.failed += 1;
                 report.errors.push(message);
                 if let Some(detail) = detail {
+                    // 失败曲目记入任务详情（sync_changes，action=failed，note=原因 UiMessage JSON），
+                    // 前端“任务详情”按原因翻译渲染。
+                    if let Ok(conn) = database::open(db_file) {
+                        let _ = database::record_change(
+                            &conn,
+                            sync_run_id,
+                            playlist.id,
+                            &playlist.name,
+                            "to_local",
+                            "failed",
+                            Some(detail.track_id),
+                            Some(&detail.track_name),
+                            None,
+                            None,
+                            Some(detail.track_id),
+                            Some(&detail.message.to_json()),
+                        );
+                    }
                     report.error_details.push(detail);
                 }
             }
@@ -856,6 +874,12 @@ fn scan_playlist_folder(
         }
     }
     map
+}
+
+/// 离线识别本地音频的网易 id：旁车 → 标签 163 key/旧文本。零网络。
+/// 供 NCM 转换去重等不能联网的场景复用。
+pub(crate) fn local_audio_netease_id_offline(path: &Path) -> Option<u64> {
+    sidecar_netease_id(path).or_else(|| tag_netease_id(path))
 }
 
 /// 读 .netease.json 旁车里的网易 id（零网络）。
@@ -1514,8 +1538,18 @@ fn quarantine_removed(
             );
             let quarantine_dir = root.join(".quarantine").join(&playlist_folder);
             fs::create_dir_all(&quarantine_dir)?;
-            let target = unique_quarantine_path(&quarantine_dir, &source);
+            // 文件名追加 .quarantined 后缀 + 隐藏属性，防客户端按扩展名收录（见 quarantine_files）。
+            let source_name = source
+                .file_name()
+                .and_then(|x| x.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let target = unique_quarantine_path(
+                &quarantine_dir,
+                &crate::core::quarantine_files::quarantined_filename(&source_name),
+            );
             fs::rename(&source, &target)?;
+            crate::core::quarantine_files::set_hidden(&target, true);
             let lrc = source.with_extension("lrc");
             if lrc.is_file() {
                 let _ = fs::rename(lrc, target.with_extension("lrc"));
@@ -1884,6 +1918,7 @@ async fn convert_ncm_files(
     app: Option<&AppHandle>,
     _state: &AppState,
     config: &Config,
+    api: &NeteaseApi,
     playlist: &PlaylistTracks,
     report: &mut SyncReport,
     sync_run_id: i64,
@@ -1936,25 +1971,18 @@ async fn convert_ncm_files(
                 ),
                 Some(sync_run_id),
             );
-            let output_dir = path.parent().context("NCM 文件缺少上级目录")?;
-            match crate::ncm::ncm::convert(path, output_dir) {
-                Ok(output) => {
-                    let marker = serde_json::json!({
-                        "source": path.to_string_lossy(),
-                        "output": output.path.to_string_lossy(),
-                        "convertedAt": database::now(),
-                        "format": output.metadata.format,
-                    });
-                    fs::write(converted_marker, serde_json::to_vec_pretty(&marker)?)?;
+            let item = crate::ncm::ncm::convert_file_with_marker(path, config.ncm_keep_source, false);
+            match item.status.as_str() {
+                "converted" => {
                     report.ncm_converted += 1;
-                    if !config.ncm_keep_source && path.is_file() {
-                        let _ = fs::remove_file(path);
-                    }
+                    crate::ncm::embed_lyrics_after_convert(api, config.embed_lyrics, &item).await;
                 }
-                Err(error) => {
+                "skipped" => {}
+                _ => {
+                    let error = item.error.unwrap_or_default();
                     report.errors.push(UiMessage::with_params(
                         "ncmConvertFailed",
-                        vec![path.to_string_lossy().into_owned(), error.to_string()],
+                        vec![path.to_string_lossy().into_owned(), error.clone()],
                     ));
                     tracing::warn!(%error, path = %path.display(), "NCM conversion failed");
                 }
@@ -1991,7 +2019,7 @@ pub(crate) fn emit_progress(
     }
 }
 
-fn write_sidecar(path: &Path, playlist_id: u64, track_id: u64) -> Result<()> {
+pub(crate) fn write_sidecar(path: &Path, playlist_id: u64, track_id: u64) -> Result<()> {
     fs::write(
         sidecar_path(path),
         serde_json::json!({ "neteaseId": track_id, "playlistId": playlist_id }).to_string(),
@@ -1999,15 +2027,14 @@ fn write_sidecar(path: &Path, playlist_id: u64, track_id: u64) -> Result<()> {
     Ok(())
 }
 
-fn sidecar_path(path: &Path) -> PathBuf {
+pub(crate) fn sidecar_path(path: &Path) -> PathBuf {
     path.with_extension(format!(
         "{}.netease.json",
         path.extension().and_then(|x| x.to_str()).unwrap_or("mp3")
     ))
 }
 
-fn unique_quarantine_path(dir: &Path, source: &Path) -> PathBuf {
-    let filename = source.file_name().unwrap_or_default().to_string_lossy();
+fn unique_quarantine_path(dir: &Path, filename: &str) -> PathBuf {
     let time = Local::now().format("%Y%m%d-%H%M%S");
     let mut candidate = dir.join(format!("{time}_{filename}"));
     let mut counter = 2;
@@ -2067,6 +2094,8 @@ pub async fn restore_deleted_local_item(
         fs::create_dir_all(parent).map_err(UiMessage::unknown)?;
     }
     fs::rename(&quarantined, &original).map_err(UiMessage::unknown)?;
+    // 还原隐藏属性（隔离时设置，rename 会带过去）。
+    crate::core::quarantine_files::set_hidden(&original, false);
     // 一并还原 .lrc / sidecar（若在隔离时一起移走，这里无对应记录；尽力而为）。
     database::mark_deleted_restored(&conn, deleted_id).map_err(UiMessage::unknown)?;
     conn.execute(
