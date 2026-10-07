@@ -13,16 +13,51 @@ use lofty::tag::Accessor;
 
 use crate::api::{NeteaseApi, Track};
 
-/// 剥离损坏的 ID3v2 标签（lofty 无法解析时）：按 syncsafe 与普通大端两种口径
-/// 计算标签长度，选使后续字节像音频头的那个；剥离后文件可重新解析与写标签。
+/// MP3 帧同步是否合法（同步位 + 版本/层/码率/采样率字段全部非保留值）。
+fn mp3_sync_at(bytes: &[u8], i: usize) -> bool {
+    bytes[i] == 0xFF
+        && (bytes[i + 1] & 0xE0) == 0xE0
+        && (bytes[i + 1] & 0x18) != 0x08      // 版本保留值
+        && (bytes[i + 1] & 0x06) != 0x00      // 层保留值
+        && (bytes[i + 2] & 0xF0) != 0xF0      // 码率 bad
+        && (bytes[i + 2] & 0xF0) != 0x00      // 码率 free
+        && (bytes[i + 2] & 0x0C) != 0x0C      // 采样率保留值
+}
+
+/// 从 `from` 起找第一个像真的 MP3 帧同步：其后一个最大帧长窗口内还要有
+/// 下一个同步（防正文里的偶同步误匹配）。
+fn find_audio_sync(bytes: &[u8], from: usize) -> Option<usize> {
+    let end = (from + 4 * 1024 * 1024).min(bytes.len().saturating_sub(4));
+    let mut i = from;
+    while i < end {
+        if mp3_sync_at(bytes, i) {
+            // MPEG2/2.5 Layer III 最大帧 ~2880 字节。
+            let next_end = (i + 2882).min(bytes.len() - 4);
+            if ((i + 32)..next_end).any(|j| mp3_sync_at(bytes, j)) {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// 剥离无法解析的 ID3v2 标签，让文件恢复可解析。
+///
+/// QQMusic 出品的文件在正常帧之后有 1024 字节 padding + 一段 QMCI 私有数据，
+/// 标签头声明的大小既不等于帧尾也不落在音频头上，lofty 因此整文件解析失败。
+/// 所以候选偏移按序尝试：声明大小（syncsafe/v2.4 与大端/v2.3 两种口径）→
+/// 逐帧走到停下的帧尾 → 帧尾之后第一个合法 MP3 同步。每个候选剥离后都用
+/// lofty 复检，全部失败则还原原文件内容。
 /// 返回是否成功剥离。
 fn strip_broken_id3v2(path: &Path) -> bool {
-    let Ok(mut bytes) = std::fs::read(path) else {
+    let Ok(bytes) = std::fs::read(path) else {
         return false;
     };
     if bytes.len() < 20 || &bytes[..3] != b"ID3" {
         return false;
     }
+    let version = bytes[3];
     let syncsafe = ((bytes[6] as usize & 0x7f) << 21)
         | ((bytes[7] as usize & 0x7f) << 14)
         | ((bytes[8] as usize & 0x7f) << 7)
@@ -31,6 +66,38 @@ fn strip_broken_id3v2(path: &Path) -> bool {
         | ((bytes[7] as usize) << 16)
         | ((bytes[8] as usize) << 8)
         | bytes[9] as usize;
+
+    let mut candidates = vec![syncsafe + 10, plain + 10];
+    // 逐帧走（v2.4 帧长是 syncsafe、v2.3 是大端），停在第一个非法帧头。
+    let mut off = 10usize;
+    while off + 10 <= bytes.len() {
+        let id = &bytes[off..off + 4];
+        if !id.iter().all(u8::is_ascii_alphanumeric) {
+            break;
+        }
+        let size = if version >= 4 {
+            ((bytes[off + 4] as usize & 0x7f) << 21)
+                | ((bytes[off + 5] as usize & 0x7f) << 14)
+                | ((bytes[off + 6] as usize & 0x7f) << 7)
+                | (bytes[off + 7] as usize & 0x7f)
+        } else {
+            ((bytes[off + 4] as usize) << 24)
+                | ((bytes[off + 5] as usize) << 16)
+                | ((bytes[off + 6] as usize) << 8)
+                | bytes[off + 7] as usize
+        };
+        if size == 0 || off + 10 + size > bytes.len() {
+            break;
+        }
+        off += 10 + size;
+    }
+    if off > 10 {
+        candidates.push(off);
+        if let Some(sync) = find_audio_sync(&bytes, off) {
+            candidates.push(sync);
+        }
+    }
+
     let looks_like_audio = |b: &[u8]| {
         b.len() >= 10
             && (b[0] == 0xFF && (b[1] & 0xE0) == 0xE0
@@ -38,14 +105,18 @@ fn strip_broken_id3v2(path: &Path) -> bool {
                 || &b[..4] == b"OggS"
                 || &b[4..8] == *b"ftyp")
     };
-    let size = [syncsafe + 10, plain + 10].into_iter().find(|&s| {
-        s > 10 && s + 8 < bytes.len() && looks_like_audio(&bytes[s..])
-    });
-    let Some(size) = size else {
-        return false;
-    };
-    bytes.drain(..size);
-    std::fs::write(path, &bytes).is_ok()
+    let original = bytes.clone();
+    for &size in candidates.iter() {
+        if size < 20 || size + 8 > bytes.len() || !looks_like_audio(&bytes[size..]) {
+            continue;
+        }
+        if std::fs::write(path, &bytes[size..]).is_ok() && tag_readable(path) {
+            return true;
+        }
+    }
+    // 所有候选都不行：还原原文件，调用方按 tagUnreadable 处理。
+    let _ = std::fs::write(path, original);
+    false
 }
 
 /// 文件标签是否可被 lofty 解析。
@@ -313,4 +384,30 @@ pub fn expand_inputs(paths: &[String], recursive: bool) -> Vec<PathBuf> {
     files.sort();
     files.dedup();
     files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 手动回归：对真实损坏文件（QQMusic QMCI 布局等）的临时副本跑剥离，
+    /// 不动原文件。用法：
+    /// STRIP_PROBE_PATH="<文件路径>" cargo test strip_real_broken_file -- --ignored --nocapture
+    #[test]
+    #[ignore = "需要 STRIP_PROBE_PATH 指向真实文件，默认跳过"]
+    fn strip_real_broken_file() {
+        let source = std::path::PathBuf::from(
+            std::env::var("STRIP_PROBE_PATH").expect("set STRIP_PROBE_PATH"),
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dest = tmp.path().join("probe.mp3");
+        std::fs::copy(&source, &dest).expect("copy");
+        assert!(
+            !tag_readable(&dest),
+            "原始文件应当无法被 lofty 解析（否则选错样本）"
+        );
+        assert!(strip_broken_id3v2(&dest), "剥离应当成功");
+        assert!(tag_readable(&dest), "剥离后应当可解析");
+        println!("OK: {}", dest.display());
+    }
 }

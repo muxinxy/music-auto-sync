@@ -62,6 +62,26 @@ pub struct SyncReport {
     pub finished_at: String,
 }
 
+/// 任务收尾状态（sync_logs.status）：ok / partial / error / canceled。
+/// 有单曲失败但仍有新增/更新/隔离/转换等成功产出时记 partial，
+/// 避免与整体失败（error）在日志里无法区分。
+pub(crate) fn finish_status(report: &SyncReport, run_error: &Option<UiMessage>) -> &'static str {
+    match run_error {
+        Some(error) if error.code == "syncCanceled" => "canceled",
+        Some(_) => "error",
+        None if report.failed == 0 => "ok",
+        None
+            if report.added > 0
+                || report.updated > 0
+                || report.quarantined > 0
+                || report.ncm_converted > 0 =>
+        {
+            "partial"
+        }
+        None => "error",
+    }
+}
+
 pub async fn sync_one(
     app: &AppHandle,
     state: &AppState,
@@ -80,9 +100,31 @@ pub async fn sync_one(
     match result {
         Ok(report) => {
             let _ = app.emit("sync://report", &report);
+            crate::runtime::notify::sync_finished(
+                app,
+                &report.playlist_name,
+                report.added,
+                report.quarantined,
+                report.failed,
+                false,
+                false,
+            );
             Ok(report)
         }
-        Err(error) => Err(ui_from_error(error)),
+        Err(error) => {
+            // 整体失败（无报告可计数）：尽量用配置里的歌单名提示是哪个歌单。
+            let name = store::config::load(&state.paths.get().config_file)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .playlists
+                        .iter()
+                        .find(|p| p.id == playlist_id)
+                        .map(|p| p.name.clone())
+                });
+            crate::runtime::notify::task_failed(app, name.as_deref());
+            Err(ui_from_error(error))
+        }
     }
 }
 
@@ -108,6 +150,7 @@ pub async fn sync_enabled_with_source(
         .map(|p| p.id)
         .collect();
     let mut reports = Vec::new();
+    let mut failed_runs = 0usize;
     for id in ids {
         if is_canceled(state) {
             break;
@@ -122,13 +165,20 @@ pub async fn sync_enabled_with_source(
                 let _ = app.emit("sync://report", &report);
                 reports.push(report);
             }
-            Err(error) => tracing::error!(%error, "playlist sync failed"),
+            Err(error) => {
+                tracing::error!(%error, "playlist sync failed");
+                failed_runs += 1;
+            }
         }
     }
     state.sync_running.store(false, Ordering::SeqCst);
     state.pause_requested.store(false, Ordering::SeqCst);
     let _ = app.emit("sync://state", false);
     crate::runtime::tray::refresh(app);
+    // 批量同步汇总一条通知，避免每个歌单各弹一条。
+    if !reports.is_empty() || failed_runs > 0 {
+        crate::runtime::notify::sync_batch(app, &reports, failed_runs);
+    }
     Ok(reports)
 }
 
@@ -322,7 +372,7 @@ async fn sync_one_inner_with_source(
     match outcome {
         Ok(()) => {
             report.finished_at = database::now();
-            let status = if report.failed == 0 { "ok" } else { "error" };
+            let status = finish_status(&report, &None);
             database::finish_log(
                 &conn,
                 sync_run_id,

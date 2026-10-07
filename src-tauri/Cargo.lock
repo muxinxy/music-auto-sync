@@ -2356,7 +2356,7 @@ dependencies = [
 
 [[package]]
 name = "music-auto-sync"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -2379,6 +2379,7 @@ dependencies = [
  "tauri-plugin-notification",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
+ "tauri-winrt-notification",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -2387,6 +2388,7 @@ dependencies = [
  "urlencoding",
  "walkdir",
  "windows-sys 0.59.0",
+ "winreg",
 ]
 
 [[package]]

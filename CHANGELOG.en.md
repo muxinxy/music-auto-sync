@@ -4,6 +4,27 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.9.1] - 2026-10-07
+
+This release brings system notifications for task results, clearer success/failure semantics, and fixes tag repair for QQMusic-produced files.
+
+### Added
+
+- **System notifications on task finish**: playlist sync, cloud tasks and toolbox background tasks pop a system notification with the task name and success/failure counts; clicking the notification brings up the main window. Can be turned off in Settings → Automation (on by default). The portable build notifies correctly without installation (registers its notification identity automatically).
+- **Tool task details**: NCM conversion / duplicate cleanup / tag repair rows in the "Current task" card now have a "Details" button showing the full per-file result list (file / status / result) with keyword search and status filter; duplicate scan shows its summary report. The list scrolls inside the modal instead of overflowing the screen.
+- The bottom-left status indicator now covers toolbox tasks: it shows "Tool running…" instead of a misleading "Idle".
+
+### Changed
+
+- **New "partial success" task status**: when playlist sync, cloud, tag repair or NCM conversion finishes with some track failures but also successful output (or files that needed no action), the log shows an orange "partial" tag instead of red "failed"; only all-failed runs are marked failed.
+- Action buttons (details / pause / cancel) on each task row in the "Current task" card are right-aligned; the header language and theme switchers got icons.
+
+### Fixed
+
+- **Tag repair reported "tag unreadable" for QQMusic files**: QQMusic-produced MP3s carry a QMCI private data block after the normal tag frames, and the declared tag size does not point at the audio start, so the whole file failed to parse. The strip logic is rewritten: frame walk plus audio-sync search across multiple candidate offsets, re-validating parseability after each candidate and restoring the original file if none works. Such files are now identified and repaired normally.
+- Chinese UI leaked untranslated error codes (e.g. tagUnreadable) in task details: bare error codes written by tool tasks are now translated as item errors.
+- The "Playlist" column showed "-" in tool task details: the source file path is now recorded and the file's folder name is displayed.
+
 ## [0.9.0] - 2026-09-28
 
 This release adds the Toolbox (NCM conversion, duplicate cleanup, tag repair). All three tools run in the background, appear under "Tasks" and "Logs", and support progress, pause, resume and cancel.

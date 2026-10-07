@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { Alert, App as AntApp, Avatar, Button, Layout, Menu, Popconfirm, Select, Space, Tag, theme, Typography } from "antd";
 import {
+  BgColorsOutlined,
   CloudSyncOutlined,
   CloudUploadOutlined,
   DeleteOutlined,
+  GlobalOutlined,
   HistoryOutlined,
   InfoCircleOutlined,
   LoginOutlined,
@@ -64,8 +66,11 @@ export default function App() {
   const syncRunning = useSyncExternalStore(syncStore.subscribeRunning, syncStore.getRunning);
   const syncPaused = useSyncExternalStore(syncStore.subscribeRunning, syncStore.getPaused);
   const cloudRunning = useSyncExternalStore(cloudStore.subscribeRunning, cloudStore.getRunning);
+  // 工具箱任务（NCM 转换/重复清理/属性修复）也要计入全局运行状态，
+  // 否则工具在后台跑时左下角仍显示“空闲”。pollTools 每 2 秒兜底刷新，状态始终新鲜。
+  const toolSnapshot = useSyncExternalStore(toolStore.subscribe, toolStore.getSnapshot);
+  const toolRunning = Object.values(toolSnapshot).some((s) => s.running);
   const sync: SyncEventState = { running: syncRunning, paused: syncPaused };
-  const taskRunning = syncRunning || cloudRunning;
 
   const applyLanguage = useCallback(async () => {
     try {
@@ -268,7 +273,13 @@ export default function App() {
           onClick={(e) => setPage(e.key as PageKey)}
         />
         <div style={{ position: "absolute", bottom: 12, left: 16, color: "#888", fontSize: 12 }}>
-          {taskRunning ? <Tag color="processing">{t("app.syncing")}</Tag> : <Tag>{t("app.idle")}</Tag>}
+          {syncRunning || cloudRunning ? (
+            <Tag color="processing">{t("app.syncing")}</Tag>
+          ) : toolRunning ? (
+            <Tag color="processing">{t("app.toolRunning")}</Tag>
+          ) : (
+            <Tag>{t("app.idle")}</Tag>
+          )}
         </div>
       </Sider>
       <Layout>
@@ -302,9 +313,10 @@ export default function App() {
             <Select<string>
               size="small"
               variant="borderless"
-              style={{ width: 84 }}
+              style={{ width: 104 }}
               value={prefLanguage}
               onChange={changeLanguagePref}
+              prefix={<GlobalOutlined style={{ color: token.colorPrimary }} />}
               options={[
                 { value: "zh-CN", label: "中文" },
                 { value: "en", label: "EN" },
@@ -313,9 +325,10 @@ export default function App() {
             <Select<string>
               size="small"
               variant="borderless"
-              style={{ width: 96 }}
+              style={{ width: 116 }}
               value={prefTheme}
               onChange={changeThemePref}
+              prefix={<BgColorsOutlined style={{ color: token.colorPrimary }} />}
               options={[
                 { value: "system", label: t("app.themeSystemShort") },
                 { value: "light", label: t("app.themeLightShort") },

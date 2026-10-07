@@ -703,6 +703,15 @@ pub async fn sync_cloud(
     let _ = app.emit("cloud://state", false);
     crate::runtime::tray::refresh(app);
     let _ = app.emit("cloud://report", &report);
+    crate::runtime::notify::sync_finished(
+        app,
+        &report.playlist_name,
+        report.added,
+        report.quarantined,
+        report.failed,
+        run_error.as_ref().is_some_and(|e| e.code == "syncCanceled"),
+        run_error.as_ref().is_some_and(|e| e.code != "syncCanceled"),
+    );
     // 云盘列表缓存已过期（有上传/秒传变更），让 UI 下次读取拿最新。
     state.api_cache.invalidate_namespace("user_cloud");
     clear_disk_cache(&state.paths.get().cache_dir);
@@ -908,12 +917,7 @@ async fn sync_cloud_inner(
         });
     }
     report.finished_at = database::now();
-    let status = match &run_error {
-        Some(error) if error.code == "syncCanceled" => "canceled",
-        Some(_) => "error",
-        None if report.failed == 0 => "ok",
-        None => "error",
-    };
+    let status = super::sync::finish_status(&report, &run_error);
     // 日志正文：失败/取消写明原因（如未设音乐根目录），成功写计数摘要。
     let log_message = match &run_error {
         Some(error) => error.to_json(),
@@ -1026,6 +1030,15 @@ pub async fn download_cloud_items(
     let _ = app.emit("cloud://state", false);
     crate::runtime::tray::refresh(app);
     let _ = app.emit("cloud://report", &report);
+    crate::runtime::notify::sync_finished(
+        app,
+        &report.playlist_name,
+        report.added,
+        report.quarantined,
+        report.failed,
+        run_error.as_ref().is_some_and(|e| e.code == "syncCanceled"),
+        run_error.as_ref().is_some_and(|e| e.code != "syncCanceled"),
+    );
     match run_error {
         Some(message) => Err(message),
         None => Ok(report),
@@ -1248,12 +1261,7 @@ async fn download_items_inner(
     }
 
     report.finished_at = database::now();
-    let status = match &run_error {
-        Some(error) if error.code == "syncCanceled" => "canceled",
-        Some(_) => "error",
-        None if report.failed == 0 => "ok",
-        None => "error",
-    };
+    let status = super::sync::finish_status(&report, &run_error);
     let log_message = match &run_error {
         Some(error) => error.to_json(),
         None => UiMessage::with_params(

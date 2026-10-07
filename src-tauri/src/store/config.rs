@@ -85,6 +85,9 @@ pub struct Config {
     pub close_to_tray: bool,
     #[serde(default = "default_true")]
     pub use_random_cn_ip: bool,
+    /// 任务结束（歌单同步/云盘/工具箱）时发系统通知。
+    #[serde(default = "default_true")]
+    pub notify_on_task_done: bool,
     pub ncm_convert: bool,
     #[serde(default)]
     pub ncm_scan_dirs: Vec<String>,
@@ -152,6 +155,7 @@ impl Default for Config {
             auto_launch: false,
             close_to_tray: true,
             use_random_cn_ip: false,
+            notify_on_task_done: true,
             ncm_convert: true,
             ncm_scan_dirs: vec![],
             ncm_keep_source: true,

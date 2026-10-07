@@ -54,6 +54,11 @@ const ITEM_ERROR_CODES = [
   "targetNameExists",
 ];
 
+/** 条目错误是否是可翻译的错误码（裸码或 parseTrack 前缀），供变更明细渲染分流。 */
+export function isItemErrorCode(error: string): boolean {
+  return ITEM_ERROR_CODES.includes(error) || error.startsWith("parseTrack: ");
+}
+
 export function translateItemError(error: string | null | undefined): string {
   if (!error) return "";
   if (error.startsWith("parseTrack: ")) {

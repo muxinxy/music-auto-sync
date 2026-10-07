@@ -72,6 +72,9 @@ pub fn run() {
             cleanup_task: crate::core::tool_task::ToolTaskState::new("cleanup_scan"),
         })
         .setup(|app| {
+            // 便携版无快捷方式，AUMID 不注册的话 WinRT 通知静默失败。
+            #[cfg(target_os = "windows")]
+            runtime::notify::register_aumid(app.handle());
             runtime::tray::install(app.handle())?;
             runtime::scheduler::start(app.handle().clone());
 

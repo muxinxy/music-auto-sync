@@ -1,2 +1,5 @@
 [build]
 target = "x86_64-pc-windows-msvc"
+# 全核（12 逻辑核）并行 rustc 会让机器明显卡顿，限制到一半左右。
+# 赶时间可用 `cargo build -j 12` 或删掉本行临时放开。
+jobs = 6

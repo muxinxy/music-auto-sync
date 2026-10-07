@@ -52,6 +52,7 @@ const defaultConfig: Config = {
   autoLaunch: false,
   closeToTray: true,
   useRandomCnIp: false,
+  notifyOnTaskDone: true,
   ncmConvert: true,
   ncmScanDirs: [],
   ncmKeepSource: true,
@@ -348,6 +349,14 @@ export default function SettingsPage() {
             valuePropName="checked"
             label={t("settings.cbRandomCnIp")}
             extra={t("settings.cbRandomCnIpExtra")}
+          >
+            <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
+          </Form.Item>
+          <Form.Item
+            name="notifyOnTaskDone"
+            valuePropName="checked"
+            label={t("settings.cbNotifyTaskDone")}
+            extra={t("settings.cbNotifyTaskDoneExtra")}
           >
             <Switch checkedChildren={t("settings.on")} unCheckedChildren={t("settings.off")} />
           </Form.Item>

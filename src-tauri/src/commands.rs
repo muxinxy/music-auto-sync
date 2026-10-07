@@ -2101,7 +2101,7 @@ pub async fn start_repair(
                             .and_then(|x| x.to_str())
                             .unwrap_or(&item.source),
                     ),
-                    item.output.as_deref(),
+                    Some(item.source.as_str()),
                     None,
                     None,
                     note.as_deref(),
@@ -2112,10 +2112,15 @@ pub async fn start_repair(
         }
         let progress = task.finish(canceled);
         if let Ok(conn) = database::open(&database_file) {
+            // 有单曲失败但其余文件成功或无需处理时记 partial，避免与整体失败混淆。
             let (status, code) = if canceled {
                 ("canceled", "repairCanceled")
             } else if progress.failed > 0 {
-                ("error", "repairDone")
+                if progress.ok > 0 || progress.skipped > 0 {
+                    ("partial", "repairDone")
+                } else {
+                    ("error", "repairDone")
+                }
             } else {
                 ("ok", "repairDone")
             };
@@ -2136,6 +2141,15 @@ pub async fn start_repair(
             );
         }
         let _ = app.emit("tool://progress", &progress);
+        crate::runtime::notify::tool_finished(
+            &app,
+            "repair",
+            progress.ok,
+            progress.skipped,
+            progress.failed,
+            canceled,
+            false,
+        );
         let _ = app.emit("tool://state", ToolStateEvent { kind: "repair".into(), running: false });
     });
     Ok(())
@@ -2271,7 +2285,7 @@ pub async fn start_ncm_convert(
                             .and_then(|x| x.to_str())
                             .unwrap_or(&item.source),
                     ),
-                    item.output.as_deref(),
+                    Some(item.source.as_str()),
                     None,
                     None,
                     item.error.as_deref().filter(|_| item.status == "failed"),
@@ -2282,10 +2296,15 @@ pub async fn start_ncm_convert(
         }
         let progress = task.finish(canceled);
         if let Ok(conn) = database::open(&database_file) {
+            // 有单曲失败但其余文件成功或无需处理时记 partial，避免与整体失败混淆。
             let (status, code) = if canceled {
                 ("canceled", "ncmCanceled")
             } else if progress.failed > 0 {
-                ("error", "ncmDone")
+                if progress.ok > 0 || progress.skipped > 0 {
+                    ("partial", "ncmDone")
+                } else {
+                    ("error", "ncmDone")
+                }
             } else {
                 ("ok", "ncmDone")
             };
@@ -2306,6 +2325,15 @@ pub async fn start_ncm_convert(
             );
         }
         let _ = app.emit("tool://progress", &progress);
+        crate::runtime::notify::tool_finished(
+            &app,
+            "ncm_convert",
+            progress.ok,
+            progress.skipped,
+            progress.failed,
+            canceled,
+            false,
+        );
         let _ = app.emit("tool://state", ToolStateEvent { kind: "ncm_convert".into(), running: false });
     });
     Ok(())
@@ -2365,6 +2393,7 @@ pub async fn start_cleanup_scan(
         )
         .await;
         let canceled = cancel.load(std::sync::atomic::Ordering::SeqCst);
+        let task_failed = scan.is_err();
         match scan {
             Ok(Some(report)) => {
                 let summary = serde_json::to_value(&report).unwrap_or_default();
@@ -2419,6 +2448,16 @@ pub async fn start_cleanup_scan(
                 }
             }
         }
+        let progress = task.snapshot().0;
+        crate::runtime::notify::tool_finished(
+            &app,
+            "cleanup_scan",
+            progress.ok,
+            progress.skipped,
+            progress.failed,
+            canceled,
+            task_failed,
+        );
         let _ = app.emit("tool://state", ToolStateEvent { kind: "cleanup_scan".into(), running: false });
     });
     Ok(())

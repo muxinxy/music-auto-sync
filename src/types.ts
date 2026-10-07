@@ -36,6 +36,7 @@ export interface Config {
   autoLaunch: boolean;
   closeToTray: boolean;
   useRandomCnIp: boolean;
+  notifyOnTaskDone: boolean;
   ncmConvert: boolean;
   ncmScanDirs?: string[];
   ncmKeepSource: boolean;

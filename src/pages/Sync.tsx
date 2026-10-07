@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState, useSyncExternalStore } from "react";
 import type { ReactNode } from "react";
 import {
+  Alert,
   Button,
   Card,
   DatePicker,
@@ -26,10 +27,20 @@ import i18n from "../i18n";
 import { api } from "../api";
 import { syncStore } from "../syncStore";
 import { cloudStore } from "../cloudStore";
-import { formatError, translateUi } from "../errors";
+import { formatError, isItemErrorCode, translateItemError, translateUi } from "../errors";
 import { taskDisplayName } from "../taskName";
 import { toolStore, type ToolState } from "../toolStore";
-import type { CloudTaskRow, RunChangeEntry, SyncErrorDetail, SyncProgress, SyncReport, UiMessage } from "../types";
+import type {
+  CleanupScanReport,
+  CloudTaskRow,
+  RepairItemResult,
+  RunChangeEntry,
+  SyncErrorDetail,
+  SyncProgress,
+  SyncReport,
+  ToolControl,
+  UiMessage,
+} from "../types";
 import { listPagination, tablePagination } from "../listConfig";
 import SearchWithHistory from "../SearchWithHistory";
 import { loadFilters, saveFilters } from "../filterMemory";
@@ -68,6 +79,15 @@ function renderMessage(raw: string): string {
 
 /** 已翻译消息缓存：同一 JSON 字符串多次渲染只解析翻译一次。 */
 const messageCache = new Map<string, string>();
+
+/**
+ * 变更明细的失败原因：工具任务记的是裸错误码（如 tagUnreadable），走条目翻译；
+ * 其余是 UiMessage JSON 或原始文本，走通用翻译。
+ */
+function renderFailureNote(note: string): string {
+  if (isItemErrorCode(note)) return translateItemError(note);
+  return renderMessage(note);
+}
 
 function actionLabel(action: string): string {
   const map: Record<string, string> = {
@@ -373,6 +393,8 @@ export default function SyncPage() {
             const tag =
               l.status === "ok" ? (
                 <Tag color="success">{t("syncPage.statusSuccess")}</Tag>
+              ) : l.status === "partial" ? (
+                <Tag color="warning">{t("syncPage.statusPartial")}</Tag>
               ) : l.status === "error" ? (
                 <Tag color="error">{t("syncPage.statusFailed")}</Tag>
               ) : l.status === "canceled" ? (
@@ -723,6 +745,8 @@ function CurrentTaskCard({
     </Popconfirm>
   );
 
+  const [toolDetailKind, setToolDetailKind] = useState<string | null>(null);
+
   const cloudActive = cloudRunning && cloudProgress;
   const playlistActive = running && progress;
   const toolSnapshot = useSyncExternalStore(toolStore.subscribe, toolStore.getSnapshot);
@@ -770,42 +794,47 @@ function CurrentTaskCard({
                     failed: p.failed,
                   })}
                 </Typography.Text>
-                {!hasDone && (
-                <Space style={{ marginTop: 6 }} wrap>
-                  <Button
-                    size="small"
-                    onClick={async () => {
-                      try {
-                        if (paused) {
-                          await api.resumeTool(kind);
-                        } else {
-                          await api.pauseTool(kind);
-                        }
-                      } catch (e) {
-                        antMessage.error(formatError(e));
-                      }
-                    }}
-                  >
-                    {paused ? t("app.resume") : t("app.pause")}
+                <Space style={{ marginTop: 6, width: "100%", justifyContent: "flex-end" }} wrap>
+                  <Button size="small" onClick={() => setToolDetailKind(kind)}>
+                    {t("cloud.taskDetail")}
                   </Button>
-                  <Popconfirm
-                    title={t("app.cancelConfirm")}
-                    okText={t("app.cancel")}
-                    cancelText={t("playlists.cancel")}
-                    onConfirm={async () => {
-                      try {
-                        await api.cancelTool(kind);
-                      } catch (e) {
-                        antMessage.error(formatError(e));
-                      }
-                    }}
-                  >
-                    <Button size="small" danger>
-                      {t("app.cancelTask")}
-                    </Button>
-                  </Popconfirm>
+                  {!hasDone && (
+                    <>
+                      <Button
+                        size="small"
+                        onClick={async () => {
+                          try {
+                            if (paused) {
+                              await api.resumeTool(kind);
+                            } else {
+                              await api.pauseTool(kind);
+                            }
+                          } catch (e) {
+                            antMessage.error(formatError(e));
+                          }
+                        }}
+                      >
+                        {paused ? t("app.resume") : t("app.pause")}
+                      </Button>
+                      <Popconfirm
+                        title={t("app.cancelConfirm")}
+                        okText={t("app.cancel")}
+                        cancelText={t("playlists.cancel")}
+                        onConfirm={async () => {
+                          try {
+                            await api.cancelTool(kind);
+                          } catch (e) {
+                            antMessage.error(formatError(e));
+                          }
+                        }}
+                      >
+                        <Button size="small" danger>
+                          {t("app.cancelTask")}
+                        </Button>
+                      </Popconfirm>
+                    </>
+                  )}
                 </Space>
-                )}
               </div>
             );
           })}
@@ -852,8 +881,201 @@ function CurrentTaskCard({
       ) : (
         <Typography.Text type="secondary">{t("syncPage.noTask")}</Typography.Text>
       )}
+      {toolDetailKind && (
+        <ToolDetailModal kind={toolDetailKind} onClose={() => setToolDetailKind(null)} />
+      )}
     </Card>
   );
+}
+
+/** 工具任务详情弹窗：逐文件结果全量展示（工具弹窗里只截前几条），清理扫描展示汇总报告。 */
+function ToolDetailModal({ kind, onClose }: { kind: string; onClose: () => void }) {
+  const { t } = useTranslation();
+  const [control, setControl] = useState<ToolControl | null>(null);
+  const [keyword, setKeyword] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | null = null;
+    const load = async () => {
+      try {
+        const c = await api.getToolControl(kind);
+        if (cancelled) return;
+        setControl(c);
+        if (!c.running && timer) {
+          clearInterval(timer);
+          timer = null;
+        }
+      } catch {
+        // 忽略轮询失败
+      }
+    };
+    load();
+    timer = setInterval(load, 1000);
+    return () => {
+      cancelled = true;
+      if (timer) clearInterval(timer);
+    };
+  }, [kind]);
+
+  const progress = control?.progress;
+  const items: RepairItemResult[] = control?.items ?? [];
+  // 清理扫描没有逐文件结果，最终报告在 result 里（与 CleanupToolModal 同一结构）。
+  const scanReport =
+    control?.result && typeof control.result === "object" && "groups" in control.result
+      ? (control.result as CleanupScanReport)
+      : null;
+
+  // 条目状态归并为 ok/skipped/failed 三组（repaired/converted/ok 都算成功）。
+  const statusGroup = (status: string): string =>
+    status === "repaired" || status === "converted" || status === "ok"
+      ? "ok"
+      : status === "skipped"
+        ? "skipped"
+        : "failed";
+
+  const filteredItems = items.filter((item) => {
+    if (statusFilter && statusGroup(item.status) !== statusFilter) return false;
+    const kw = keyword.trim().toLowerCase();
+    if (kw && !`${item.source} ${item.output ?? ""} ${item.error ?? ""}`.toLowerCase().includes(kw)) {
+      return false;
+    }
+    return true;
+  });
+
+  const columns: ColumnsType<RepairItemResult> = [
+    {
+      title: t("tools.detailFile"),
+      dataIndex: "source",
+      ellipsis: true,
+      render: (source: string) => (
+        <Typography.Text style={{ fontSize: 12 }} ellipsis={{ tooltip: source }}>
+          {source}
+        </Typography.Text>
+      ),
+    },
+    {
+      title: t("tools.detailStatus"),
+      dataIndex: "status",
+      width: 96,
+      render: (status: string) => {
+        const label =
+          statusGroup(status) === "ok"
+            ? status === "repaired"
+              ? t("syncPage.action.repaired")
+              : status === "converted"
+                ? t("syncPage.action.converted")
+                : t("syncPage.statusSuccess")
+            : statusGroup(status) === "skipped"
+              ? t("syncPage.action.skipped")
+              : t("syncPage.action.failed");
+        const color =
+          statusGroup(status) === "ok" ? "green" : statusGroup(status) === "skipped" ? "default" : "red";
+        return <Tag color={color}>{label}</Tag>;
+      },
+    },
+    {
+      title: t("tools.detailResult"),
+      ellipsis: true,
+      render: (_: unknown, r) => {
+        const text =
+          r.status === "failed" || r.status === "skipped"
+            ? translateItemError(r.error) || t("tools.repairUnidentified")
+            : (r.output ?? "");
+        return text ? (
+          <Typography.Text type={r.status === "failed" ? "danger" : "secondary"} style={{ fontSize: 12 }}>
+            {text}
+          </Typography.Text>
+        ) : null;
+      },
+    },
+  ];
+
+  return (
+    <Modal
+      title={`${taskDisplayName(kind)} · ${t("cloud.taskDetail")}`}
+      open
+      footer={null}
+      onCancel={onClose}
+      width={880}
+    >
+      <Space direction="vertical" style={{ width: "100%" }} size={12}>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          {t("tools.repairProgress", {
+            current: progress?.current ?? 0,
+            total: progress?.total ?? 0,
+            repaired: progress?.ok ?? 0,
+            skipped: progress?.skipped ?? 0,
+            failed: progress?.failed ?? 0,
+          })}
+        </Typography.Text>
+        {scanReport && (
+          <Alert
+            type={scanReport.cleanCount > 0 ? "warning" : "success"}
+            showIcon
+            message={
+              scanReport.cleanCount > 0
+                ? t("settings.cleanupSummaryFound", {
+                    scanned: scanReport.scannedFiles,
+                    groups: scanReport.duplicateGroups,
+                    count: scanReport.cleanCount,
+                    size: formatBytes(scanReport.cleanBytes),
+                  })
+                : t("settings.cleanupSummaryNone", { scanned: scanReport.scannedFiles })
+            }
+            description={
+              scanReport.unresolved > 0
+                ? t("settings.cleanupUnresolvedTip", { count: scanReport.unresolved })
+                : undefined
+            }
+          />
+        )}
+        {items.length > 0 ? (
+          <>
+            <Space style={{ flexWrap: "wrap" }}>
+              <Input.Search
+                placeholder={t("syncPage.filterKeyword")}
+                allowClear
+                style={{ width: 220 }}
+                onSearch={setKeyword}
+                onChange={(e) => !e.target.value && setKeyword("")}
+              />
+              <Select
+                style={{ width: 140 }}
+                placeholder={t("syncPage.filterStatus")}
+                allowClear
+                value={statusFilter || undefined}
+                onChange={(v) => setStatusFilter(v ?? "")}
+                options={[
+                  { value: "ok", label: t("syncPage.statusSuccess") },
+                  { value: "skipped", label: t("syncPage.action.skipped") },
+                  { value: "failed", label: t("syncPage.action.failed") },
+                ]}
+              />
+            </Space>
+            <Table
+              size="small"
+              columns={columns}
+              dataSource={filteredItems}
+              rowKey={(_, index) => String(index)}
+              scroll={{ y: "calc(100vh - 460px)" }}
+              pagination={{ ...tablePagination, showSizeChanger: false }}
+            />
+          </>
+        ) : (
+          !scanReport && <Typography.Text type="secondary">{t("syncPage.runEmpty")}</Typography.Text>
+        )}
+      </Space>
+    </Modal>
+  );
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GB`;
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${bytes} B`;
 }
 
 /** 单个任务的进度行：阶段标签 + 进度条 + 行内操作按钮。 */
@@ -882,7 +1104,7 @@ function TaskProgressRow({
         percent={progress.total ? Math.round((progress.current / progress.total) * 100) : 0}
         status={paused ? "normal" : "active"}
       />
-      <Space style={{ marginTop: 6 }} wrap>
+      <Space style={{ marginTop: 6, width: "100%", justifyContent: "flex-end" }} wrap>
         {children}
       </Space>
     </div>
@@ -1052,7 +1274,7 @@ function RunChangesTable({ runId }: { runId: number }) {
           </div>
           {c.action === "failed" && c.note && (
             <Typography.Text type="danger" style={{ fontSize: 12 }}>
-              {renderMessage(c.note)}
+              {renderFailureNote(c.note)}
             </Typography.Text>
           )}
         </div>

@@ -1,6 +1,6 @@
 [package]
 name = "music-auto-sync"
-version = "0.9.0"
+version = "0.9.1"
 description = "Portable NetEase Cloud Music playlist synchronizer"
 license = "MIT"
 authors = ["muxinxy"]
@@ -44,9 +44,20 @@ md5 = "0.7"
 # 隔离文件隐藏属性（仅 Windows）。
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem"] }
+# 系统通知 AUMID 注册（HKCU）：便携版无开始菜单快捷方式，WinRT toast 需要注册过的 AUMID 才会显示。
+winreg = "0.55"
+# 直接用 toast 的 on_activated 回调实现"点击通知聚焦应用"（插件未暴露该能力）。
+tauri-winrt-notification = "0.7"
+
+[profile.dev]
+# 只保留行号表、去掉完整调试信息：cargo check/test 产物体积缩小数倍、编译更快，
+# panic 回溯仍能定位到行。需要完整调试信息时临时加 `--config 'profile.dev.debug=true'`。
+debug = "line-tables-only"
 
 [profile.release]
 panic = "abort"
+# 剥离调试信息：收小 exe 与 target/release 体积。
+strip = "debuginfo"
 
 [dev-dependencies]
 tempfile = "3"
