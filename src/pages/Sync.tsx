@@ -232,7 +232,13 @@ export default function SyncPage() {
       </Modal>
 
       {reports.length > 0 && (
-        <Card title={t("syncPage.recentResults")} style={{ marginBottom: 16, flexShrink: 0 }} size="small">
+        <Card
+          title={t("syncPage.recentResults")}
+          style={{ marginBottom: 16, flexShrink: 0 }}
+          size="small"
+          // 限高内滚：最近结果最多保留 20 条，不限高会把下方日志卡挤出屏幕。
+          styles={{ body: { maxHeight: "min(220px, 30vh)", overflowY: "auto" } }}
+        >
           <List
             size="small"
             dataSource={reports}
@@ -242,63 +248,60 @@ export default function SyncPage() {
                 message: d.message,
               }));
               const hasDetails = details.length > 0;
+              const rowExpanded = expanded === r.startedAt && hasDetails;
               return (
-                <List.Item
-                  actions={[
-                    r.playlistName === "cloud" ? (
+                <List.Item style={{ display: "block", padding: "5px 0" }}>
+                  {/* 手动布局：详情按钮放在固定宽度的时间列左侧——
+                      原先按钮在 actions 槽会把时间戳挤左，导致上下行时间不对齐。 */}
+                  <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <Typography.Text style={{ flex: 1, minWidth: 0 }} ellipsis>
+                      {t("syncPage.resultLine", {
+                        name: taskDisplayName(r.playlistName),
+                        added: r.added,
+                        converted: r.ncmConverted,
+                        quarantined: r.quarantined,
+                        failed: r.failed,
+                      })}
+                    </Typography.Text>
+                    {r.playlistName === "cloud" ? (
                       <Button
-                        key="detail"
                         size="small"
                         type="link"
+                        style={{ flexShrink: 0 }}
                         onClick={() => setCloudDetailOpen(true)}
                       >
                         {t("cloud.taskDetail")}
                       </Button>
                     ) : hasDetails ? (
                       <Button
-                        key="view"
                         size="small"
                         type="link"
-                        onClick={() => {
-                          setExpanded(expanded === r.startedAt ? null : r.startedAt);
-                        }}
+                        style={{ flexShrink: 0 }}
+                        onClick={() => setExpanded(rowExpanded ? null : r.startedAt)}
                       >
                         {t("syncPage.viewDetails", { count: r.failed })}
                       </Button>
-                    ) : null,
-                  ]}
-                >
-                  <List.Item.Meta
-                    title={
-                      <Typography.Text>
-                        {t("syncPage.resultLine", {
-                          name: taskDisplayName(r.playlistName),
-                          added: r.added,
-                          converted: r.ncmConverted,
-                          quarantined: r.quarantined,
-                          failed: r.failed,
-                        })}
-                      </Typography.Text>
-                    }
-                    description={
-                      expanded === r.startedAt && hasDetails ? (
-                        <List
-                          size="small"
-                          dataSource={details}
-                          renderItem={(d) => (
-                            <List.Item style={{ border: "none", padding: "2px 0" }}>
-                              <Typography.Text type="danger" style={{ fontSize: 12 }}>
-                                {taskDisplayName(d.trackName)}：{translateUi(d.message)}
-                              </Typography.Text>
-                            </List.Item>
-                          )}
-                        />
-                      ) : undefined
-                    }
-                  />
-                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    {r.finishedAt}
-                  </Typography.Text>
+                    ) : null}
+                    <Typography.Text
+                      type="secondary"
+                      style={{ fontSize: 12, width: 150, textAlign: "right", flexShrink: 0 }}
+                    >
+                      {r.finishedAt}
+                    </Typography.Text>
+                  </div>
+                  {rowExpanded && (
+                    <div style={{ paddingLeft: 8, marginTop: 2 }}>
+                      {details.map((d, i) => (
+                        <Typography.Paragraph
+                          key={i}
+                          type="danger"
+                          style={{ fontSize: 12, marginBottom: 0 }}
+                        >
+                          {taskDisplayName(d.trackName)}：{translateUi(d.message)}
+                        </Typography.Paragraph>
+                      ))}
+                    </div>
+                  )}
                 </List.Item>
               );
             }}

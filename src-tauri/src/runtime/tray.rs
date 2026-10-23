@@ -68,17 +68,18 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
     let show = MenuItem::with_id(app, "show", show_label, true, None::<&str>)?;
     let sync = MenuItem::with_id(app, "sync", sync_label, true, None::<&str>)?;
     let quit = MenuItem::with_id(app, "quit", quit_label, true, None::<&str>)?;
-    // 暂停/继续/取消仅在任务进行时显示（避免空任务点击导致异常）。
+    // 暂停/继续/取消仅在任务进行时显示（避免空任务点击导致异常）；
+    // “立即同步”相反：任务进行中不显示（此时点击只会被 syncBusy 拒绝）。
     let menu = if !running {
         Menu::with_items(app, &[&show, &sync, &quit])?
     } else if paused {
         let resume = MenuItem::with_id(app, "resume", resume_label, true, None::<&str>)?;
         let cancel = MenuItem::with_id(app, "cancel", cancel_label, true, None::<&str>)?;
-        Menu::with_items(app, &[&show, &sync, &resume, &cancel, &quit])?
+        Menu::with_items(app, &[&show, &resume, &cancel, &quit])?
     } else {
         let pause = MenuItem::with_id(app, "pause", pause_label, true, None::<&str>)?;
         let cancel = MenuItem::with_id(app, "cancel", cancel_label, true, None::<&str>)?;
-        Menu::with_items(app, &[&show, &sync, &pause, &cancel, &quit])?
+        Menu::with_items(app, &[&show, &pause, &cancel, &quit])?
     };
 
     let mut tray = TrayIconBuilder::with_id("main-tray")
@@ -110,7 +111,13 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             "sync" => {
                 let app = app.clone();
                 tauri::async_runtime::spawn(async move {
+                    // 菜单是弹出瞬间的快照：点击时任务可能已经开始，避免重复触发。
                     let state = app.state::<AppState>();
+                    if state.sync_running.load(std::sync::atomic::Ordering::SeqCst)
+                        || state.cloud_running.load(std::sync::atomic::Ordering::SeqCst)
+                    {
+                        return;
+                    }
                     if let Err(error) = sync::sync_enabled_with_source(&app, &state, "tray").await {
                         tracing::warn!(%error, "tray synchronization failed");
                     }

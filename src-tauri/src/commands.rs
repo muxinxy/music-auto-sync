@@ -36,6 +36,14 @@ fn command_error(error: impl std::fmt::Display) -> String {
     UiMessage::unknown(error).to_json()
 }
 
+/// 首次为歌单建同步设置条目时的名称：优先用前端传来的真实歌单名，
+/// 缺失/为空才退回"歌单 <id>"占位（同步拉到曲目后会自动回填真实名）。
+fn playlist_setting_name(name: Option<String>, id: u64) -> String {
+    name.map(|n| n.trim().to_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| format!("歌单 {id}"))
+}
+
 fn api_error_class(error: &anyhow::Error) -> String {
     error
         .downcast_ref::<crate::api::ApiCallError>()
@@ -508,6 +516,8 @@ pub fn set_playlist_overwrite(
     state: State<'_, AppState>,
     id: u64,
     overwrite: bool,
+    // 首次为该歌单建条目时由前端带上歌单名，避免留"歌单 <id>"占位。
+    name: Option<String>,
 ) -> Result<(), String> {
     let paths = state.paths.get();
     let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
@@ -516,7 +526,7 @@ pub fn set_playlist_overwrite(
     } else {
         config.playlists.push(PlaylistSyncSetting {
             id,
-            name: format!("歌单 {id}"),
+            name: playlist_setting_name(name, id),
             enabled: false,
             folder_override: None,
             quality_override: None,
@@ -533,6 +543,7 @@ pub fn set_playlist_enabled(
     state: State<'_, AppState>,
     id: u64,
     enabled: bool,
+    name: Option<String>,
 ) -> Result<(), String> {
     let paths = state.paths.get();
     let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
@@ -541,7 +552,7 @@ pub fn set_playlist_enabled(
     } else {
         config.playlists.push(PlaylistSyncSetting {
             id,
-            name: format!("歌单 {id}"),
+            name: playlist_setting_name(name, id),
             enabled,
             folder_override: None,
             quality_override: None,
@@ -575,6 +586,7 @@ pub fn set_playlist_sync_policy(
     id: u64,
     mode: Option<String>,
     upload_manual: Option<bool>,
+    name: Option<String>,
 ) -> Result<(), String> {
     let paths = state.paths.get();
     let mut config = store::config::load(&paths.config_file).map_err(command_error)?;
@@ -587,7 +599,7 @@ pub fn set_playlist_sync_policy(
     } else {
         config.playlists.push(PlaylistSyncSetting {
             id,
-            name: format!("歌单 {id}"),
+            name: playlist_setting_name(name, id),
             enabled: false,
             folder_override: None,
             quality_override: None,

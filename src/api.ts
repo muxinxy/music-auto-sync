@@ -53,10 +53,10 @@ export const api = {
     options: SingleDownloadOptions
   ) =>
     invoke<string>("download_song_with_options", { playlistId, trackId, options }),
-  setPlaylistEnabled: (id: number, enabled: boolean) =>
-    invoke<void>("set_playlist_enabled", { id, enabled }),
-  setPlaylistOverwrite: (id: number, overwrite: boolean) =>
-    invoke<void>("set_playlist_overwrite", { id, overwrite }),
+  setPlaylistEnabled: (id: number, enabled: boolean, name?: string) =>
+    invoke<void>("set_playlist_enabled", { id, enabled, name }),
+  setPlaylistOverwrite: (id: number, overwrite: boolean, name?: string) =>
+    invoke<void>("set_playlist_overwrite", { id, overwrite, name }),
 
   syncPlaylist: (id: number) => invoke<SyncReport>("sync_playlist", { id }),
   syncAll: () => invoke<SyncReport[]>("sync_all"),
@@ -102,8 +102,9 @@ export const api = {
   setPlaylistSyncPolicy: (
     id: number,
     mode: string | null,
-    uploadManual: boolean | null
-  ) => invoke<void>("set_playlist_sync_policy", { id, mode, uploadManual }),
+    uploadManual: boolean | null,
+    name?: string
+  ) => invoke<void>("set_playlist_sync_policy", { id, mode, uploadManual, name }),
   getPlaylistSettings: (id: number) =>
     invoke<{
       playlistId: number;

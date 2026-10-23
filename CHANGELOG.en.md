@@ -4,6 +4,20 @@
 
 This file records user-facing releases following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and [Semantic Versioning](https://semver.org/).
 
+## [0.9.2] - 2026-10-24
+
+This release fixes playlist naming and layout issues on the Tasks page, and tidies up the tray menu while tasks are running.
+
+### Changed
+
+- The tray menu no longer shows "Sync now" while a playlist sync or cloud task is running (clicking it previously only produced a busy notice); it reappears when tasks finish, and a stale menu snapshot can no longer start a second task.
+
+### Fixed
+
+- **The Tasks page showed a playlist id instead of its name**: toggling switches on a playlist that had no settings entry left a "Playlist <id>" placeholder name behind, which the task view then displayed. The enable / overwrite / sync-policy commands now record the real playlist name; existing placeholders heal automatically the next time that playlist syncs.
+- **"Recent results" squeezed out the log area**: up to 20 result rows with no height cap pushed the log card off-screen where it could not be scrolled to. Recent results are now height-capped with internal scrolling, keeping the log card always visible.
+- **Misaligned timestamps in "Recent results"**: the "view details" button shifted its row's timestamp left, breaking column alignment. The time column is now fixed-width and right-aligned with the button placed to its left; rows are tighter and long playlist names truncate to one line.
+
 ## [0.9.1] - 2026-10-07
 
 This release brings system notifications for task results, clearer success/failure semantics, and fixes tag repair for QQMusic-produced files.

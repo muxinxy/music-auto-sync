@@ -262,6 +262,7 @@ async fn sync_one_inner_with_source(
     let playlist = api.playlist_tracks(playlist_id).await?;
     // 日志行当时用 #<id> 占位（歌单名未知），拉到曲目后回填真实名称。
     database::update_log_name(&conn, sync_run_id, &playlist.name)?;
+    heal_placeholder_name(&paths.config_file, playlist_id, &playlist.name);
     let quality = setting
         .and_then(|x| x.quality_override.as_deref())
         .unwrap_or(&config.quality);
@@ -2040,6 +2041,24 @@ async fn convert_ncm_files(
         }
     }
     Ok(())
+}
+
+/// config 歌单条目的占位名回填：旧版本在未配置过的歌单上切换开关时，条目会以
+/// "歌单 <id>"/"#<id>" 落库（当时拿不到歌单名），任务卡片与失败通知会显示它。
+/// 拉到真实歌单名后修复一次，此后显示恢复正常。
+fn heal_placeholder_name(config_file: &Path, playlist_id: u64, real_name: &str) {
+    let Ok(mut config) = store::config::load(config_file) else {
+        return;
+    };
+    let Some(setting) = config.playlists.iter_mut().find(|p| p.id == playlist_id) else {
+        return;
+    };
+    let placeholder =
+        setting.name.is_empty() || setting.name == format!("#{playlist_id}") || setting.name == format!("歌单 {playlist_id}");
+    if placeholder && setting.name != real_name {
+        setting.name = real_name.to_owned();
+        let _ = store::config::save(config_file, &config);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

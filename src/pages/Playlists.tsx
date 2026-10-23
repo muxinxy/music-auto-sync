@@ -325,7 +325,12 @@ export default function PlaylistsPage({ login, sync }: Props) {
     if (!detailId || !detailPolicy) return;
     const mode = detailPolicy.mode === "" ? null : detailPolicy.mode;
     try {
-      await api.setPlaylistSyncPolicy(detailId, mode, detailPolicy.uploadManual);
+      await api.setPlaylistSyncPolicy(
+        detailId,
+        mode,
+        detailPolicy.uploadManual,
+        playlists.find((p) => p.id === detailId)?.name ?? songs?.playlistName
+      );
       antMessage.success(t("settings.saved"));
       // 重新拉取列表并回填保存后的实际覆盖值（仅改本地 config 策略，无需穿透远端缓存）。
       const fresh = await api.listPlaylists(false);
@@ -583,12 +588,13 @@ export default function PlaylistsPage({ login, sync }: Props) {
     const ids = [...selectedPlaylists];
     try {
       for (const id of ids) {
+        const name = playlists.find((p) => p.id === id)?.name;
         if (operation === "sync") {
           await api.syncPlaylist(id);
         } else if (operation === "enabled" || operation === "disabled") {
-          await api.setPlaylistEnabled(id, operation === "enabled");
+          await api.setPlaylistEnabled(id, operation === "enabled", name);
         } else {
-          await api.setPlaylistOverwrite(id, operation === "overwrite");
+          await api.setPlaylistOverwrite(id, operation === "overwrite", name);
         }
       }
       antMessage.success(`${ids.length} ${t("playlists.selectedCount", { count: ids.length })}`);
@@ -639,7 +645,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
                 checked={allOverwrite}
                 onChange={async (value) => {
                   for (const playlist of playlists) {
-                    await api.setPlaylistOverwrite(playlist.id, value);
+                    await api.setPlaylistOverwrite(playlist.id, value, playlist.name);
                   }
                   load(true);
                 }}
@@ -764,7 +770,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
                     size="small"
                     checked={p.overwrite}
                     onChange={async (v) => {
-                      await api.setPlaylistOverwrite(p.id, v);
+                      await api.setPlaylistOverwrite(p.id, v, p.name);
                       load(true);
                     }}
                     checkedChildren={t("playlists.overwriteShort")}
@@ -784,7 +790,7 @@ export default function PlaylistsPage({ login, sync }: Props) {
                     checkedChildren={t("settings.on")}
                     unCheckedChildren={t("settings.off")}
                     onChange={async (v) => {
-                      await api.setPlaylistEnabled(p.id, v);
+                      await api.setPlaylistEnabled(p.id, v, p.name);
                       load(true);
                     }}
                   />,
